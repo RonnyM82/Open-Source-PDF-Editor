@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+
+# Build / packaging output
+build/
+dist/
+# Staged third-party binaries (tesseract runtime) — populated by
+# scripts/stage_tesseract.ps1 from the local install; never committed.
+vendor/
+
+# Virtual environment
+.venv/
+
+# Claude Code personal/local settings (shared settings would be .claude/settings.json)
+.claude/settings.local.json
+
+# Sample PDFs: ignore everything in samples/ by default (so no local/real PDF is
+# ever committed by accident), but track the three SANITISED public samples.
+# Note: samples/* (not samples/) so the directory isn't excluded — git cannot
+# re-include a file whose parent directory is ignored.
+samples/*
+!samples/sample_quote.pdf
+!samples/sample_cad_drawing.pdf
+!samples/sample_invoice_ocr.pdf
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+
+# Development/AI working docs — kept local, never published.
+CLAUDE.md
+docs/PLAN.md
+PUBLIC_RELEASE.md

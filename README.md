@@ -1,0 +1,192 @@
+# PDF Editor
+
+A standalone, open-source PDF **viewer + editor for Windows** — read, navigate,
+print, manipulate pages, and edit text/images in place, in a themed desktop app.
+
+Built with Python 3.13, **PyMuPDF** (PDF engine), **PySide6** (GUI), themed with
+**qt-material** (Material dark/light) with **QtAwesome** icons, and packaged with
+**PyInstaller**. Licensed under **AGPL-3.0** (see [Licensing](#licensing-agpl-30)
+below — PyMuPDF is AGPL, so the combined work is too). Contributor-facing design
+notes live in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+> **Just want to run it?** Grab the prebuilt Windows installer from the
+> [**Releases**](../../releases) page — no build step required. See
+> [Install](#install-windows-setup-installer).
+
+## Architecture in one line
+
+`src/pdfcore/` is a headless engine (pure Python + PyMuPDF, **no Qt**);
+`src/pdfapp/` is a thin PySide6 UI that imports `pdfcore` and renders. The engine
+is fully testable with pytest, no GUI required.
+
+## Features
+
+**Viewer:** open PDFs (incl. password-protected) in tabs, render pages, navigate,
+zoom (fit-page / fit-width / ±, Ctrl+wheel), a thumbnail sidebar, and print
+(colour/BW, paper size, per-page orientation, preview). Note: saving a
+password-protected file writes the output unencrypted.
+
+**Page manipulation:** rotate, delete, reorder (move up/down), insert pages from
+another file, merge several PDFs, split into ranges — plus Save / Save As with an
+atomic save-over-the-open-file.
+
+**Content editing:** documents open **read-only** — flip the Edit mode toggle
+(pencil, Ctrl+E) to make a document editable; the status bar always shows which
+mode you're in. In edit mode, everything editable is outlined by default
+("Show editable areas" — toggle it off for a cleaner view), and hovering shows
+the details (outline + cursor, with the exact gestures named in the status
+bar). Click text or an image to select it — drag the selection to move it,
+drag an image's corner handle to resize, press Delete to remove a selected
+image. Double-click text to edit the whole paragraph in place —
+Ctrl+double-click edits just one line, and a toolbar toggle swaps those
+defaults (Enter / Ctrl+Enter commits, Esc cancels).
+A style toolbar sets font, size, colour, bold / italic / underline and
+super/subscript — per selection, down to a single character. Right-click
+anything for the same actions as menus: edit, highlight, replace/delete an
+image, or insert text/images exactly where you clicked. Every edit is
+undoable — snapshot-based undo/redo per document — and Help → "Editing
+gestures" lists every interaction.
+
+| Action | Shortcut | Action | Shortcut |
+|---|---|---|---|
+| Open | Ctrl+O | Rotate CW / CCW | Ctrl+R / Ctrl+Shift+R |
+| Save / Save As | Ctrl+S / Ctrl+Shift+S | Move page up / down | Ctrl+Shift+↑ / ↓ |
+| Next / Prev page | PgDn / PgUp | Delete page | Ctrl+Delete |
+| First / Last page | Ctrl+Home / End | Fit page / width | Ctrl+0 / Ctrl+1 |
+| Zoom in / out | Ctrl+= / Ctrl+- | Print | Ctrl+P |
+| Undo / Redo | Ctrl+Z / Ctrl+Y | Edit mode | Ctrl+E |
+
+Full text reflow, form filling, and digital signatures are out of scope.
+
+**Search & Extract Text:** find text across the document (Ctrl+F) and Tools →
+Extract text. Both work on normal PDFs and, for pages with **no text layer**
+(scans, or text exported as vector outlines), fall back to OCR — pages are OCR'd
+into word boxes with confidences on demand. These are read-only features; no OCR
+text layer is written back into the document. OCR requires a local Tesseract
+install in development (see Setup); packaged builds bundle it.
+
+**Sample documents:** the [`samples/`](samples/) folder ships three fabricated
+sample PDFs to try features on — a quote (text layer, for editing), a CAD drawing
+(vector text), and a no-text-layer invoice (for OCR / Extract Text). They contain
+no real data.
+
+## Setup (Windows, PowerShell)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+
+# Optional — OCR features and their tests (tests skip without it):
+winget install -e --id UB-Mannheim.TesseractOCR
+```
+
+The Tesseract binary and its `tessdata` models are **not** Python packages —
+in development they come from the install above; packaged builds bundle them
+as application assets.
+
+## Run
+
+```powershell
+python -m pdfapp
+```
+
+## Test
+
+```powershell
+.\scripts\test.ps1      # pytest
+.\scripts\lint.ps1      # ruff check + ruff format --check
+```
+
+## Package (standalone Windows build)
+
+```powershell
+.\scripts\package.ps1   # PyInstaller one-folder build -> dist\pdf-editor\ (+ .zip)
+```
+
+This produces a one-folder bundle (`dist\pdf-editor\`) containing `pdf-editor.exe`
+and its dependencies, including the Tesseract OCR runtime (staged automatically
+from the local install — the Setup step above is required to build). Distribute
+the zipped folder. The build is unsigned, so on
+first launch Windows SmartScreen may show "Windows protected your PC" — click
+**More info → Run anyway**.
+
+## Install (Windows setup installer)
+
+**Easiest — download a prebuilt installer.** Go to the
+[**Releases**](../../releases) page and download `pdf-editor-setup-<version>.exe`.
+Running it installs **per user** (to `%LOCALAPPDATA%\Programs\PDF Editor`, **no
+admin / UAC prompt**), adds a Start-menu shortcut, and registers PDF Editor as an
+available PDF handler. The installer is **unsigned**, so Windows SmartScreen may
+show "Windows protected your PC" on first run — click **More info → Run anyway**.
+To make double-click open PDFs in it, see
+[Set as default](#set-pdf-editor-as-your-default-pdf-viewer). Uninstall from
+**Settings → Apps → Installed apps** (removes the app and all its registry keys).
+
+### Build the installer yourself
+
+To build the setup `.exe` from source instead, you need
+[Inno Setup](https://jrsoftware.org/isinfo.php) once:
+
+```powershell
+winget install -e --id JRSoftware.InnoSetup   # one-time; provides the compiler
+```
+
+> **Inno Setup licensing:** version 6.5+ prints a "Non-commercial use only"
+> compiler banner and *requests* (does not require) commercial users to buy a
+> [licence](https://jrsoftware.org/isorder.php) — its open-source licence still
+> permits internal/commercial use. Version 6.4.3 is the last banner-free release.
+> The banner is compiler-console only; it never appears in the produced installer.
+
+Then build the bundle and wrap it into a setup installer:
+
+```powershell
+.\scripts\package.ps1          # PyInstaller onedir -> dist\pdf-editor\
+.\scripts\build_installer.ps1  # -> dist\pdf-editor-setup-<version>.exe
+```
+
+Run the resulting `dist\pdf-editor-setup-<version>.exe`. It installs **per user**
+(to `%LOCALAPPDATA%\Programs\PDF Editor`, **no admin / UAC prompt**), adds a
+Start-menu shortcut, and registers PDF Editor as an available PDF handler. Being
+unsigned, the setup triggers the same SmartScreen "More info → Run anyway" as the
+raw exe. Re-running a newer installer **upgrades in place** — one install, no
+duplicate shortcut, old files removed. Uninstall from **Settings → Apps →
+Installed apps** (it removes the app and all its registry keys).
+
+### Set PDF Editor as your default PDF viewer
+
+Windows 10/11 do **not** let an app make itself the default PDF handler — that's
+a deliberate anti-hijacking rule, so the installer can only *register* the app,
+never seize the default. To make double-click open PDF Editor, choose it
+yourself: the installer's final screen has a **"Set PDF Editor as the default PDF
+app"** checkbox that deep-links to Windows Settings, or open **Settings → Apps →
+Default apps**, find **PDF Editor** (or `.pdf`), and pick it. Until you do,
+Explorer keeps showing the current default app's icon on `.pdf` files; PDF
+Editor's distinct document icon (separate from the app icon) appears on them
+only once PDF Editor is the chosen default.
+
+Once set, double-clicking a PDF (or right-click → **Open with → PDF Editor**)
+opens it directly in the app. PDF Editor is single-instance: if it's already
+open, the file appears as a **new tab** in the existing window rather than
+launching a second copy.
+
+## Licensing (AGPL-3.0)
+
+This app bundles **PyMuPDF**, which is licensed under the GNU **AGPL-3.0**.
+Because AGPL-3.0 is copyleft, **the combined work is distributed under AGPL-3.0**
+(see [LICENSE](LICENSE)) — and any fork or redistribution inherits the same
+licence. If you distribute a binary of this app (or a derivative), you must make
+the complete corresponding source available to your recipients under AGPL-3.0.
+For binaries released from this project, **that corresponding source is this
+repository.**
+
+It also bundles **PySide6** (LGPL-3.0), **qt-material** (BSD-2-Clause, + the
+bundled Roboto font, Apache-2.0), **QtAwesome** (MIT, + Material Design Icons,
+Apache-2.0), and **Jinja2** (BSD-3-Clause), plus — for OCR — **pytesseract**
+(Apache-2.0) and **Pillow** (MIT-CMU), which drive the external **Tesseract OCR**
+engine (Apache-2.0) shipped as a bundled asset in packaged builds. Full
+third-party attribution and licences are in [NOTICE](NOTICE).
+
+This is a desktop application, not a network service, so the AGPL's section 13
+network-interaction clause is not triggered; the standard copyleft obligations of
+AGPL-3.0 still apply to distribution.

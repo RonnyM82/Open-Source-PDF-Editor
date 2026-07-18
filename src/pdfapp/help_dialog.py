@@ -1,0 +1,119 @@
+"""Help → "Editing gestures" cheat sheet (U7).
+
+A static themed dialog listing every gesture and mode — built LAST in the
+U-series so it documents everything. qt-material styles it app-wide and the
+dialog is short-lived (S5 convention: state baked at construction). No
+persistence mechanism exists, so there are no first-run coach marks by
+design; this dialog and the hover hints are the teaching surfaces.
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QScrollArea, QVBoxLayout
+
+_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "Modes",
+        [
+            (
+                "Edit mode (Ctrl+E)",
+                "Documents open read-only; the pencil toggle enables editing for this document",
+            ),
+            ("Show editable areas", "Outlines every editable paragraph and image on the page"),
+            (
+                "Double-click edits paragraph",
+                "Sets what a plain double-click edits — one line, or the whole paragraph",
+            ),
+        ],
+    ),
+    (
+        "Text",
+        [
+            ("Hover", "Outlines the paragraph under the cursor; the status bar names the moves"),
+            ("Click", "Selects the paragraph — then drag the selection to move it"),
+            ("Double-click", "Edits the line (or the paragraph, per the toggle)"),
+            ("Ctrl+double-click", "Edits the other one — a momentary override"),
+            ("Ctrl+drag", "Moves the paragraph directly, no selection needed"),
+            ("Ctrl+click / Shift+click", "Adds the box to a multi-selection (click again removes)"),
+            ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
+            ("Right-click (multi-selected)", "Merge the selected text boxes into one"),
+            ("Right-click", "Edit text · Edit paragraph · Highlight this text"),
+        ],
+    ),
+    (
+        "In an editor",
+        [
+            ("Enter / Ctrl+Enter", "Commits a line edit / applies a paragraph edit"),
+            ("Esc", "Cancels the edit"),
+            ("Style toolbar", "Formats the selected characters (bold two words, colour one)"),
+            ("Drag right edge / corner", "Sets the paragraph wrap width / resizes the box"),
+        ],
+    ),
+    (
+        "Images",
+        [
+            ("Click", "Selects the image (corner handles appear)"),
+            ("Drag selected", "The body moves it · a corner resizes it (aspect kept)"),
+            ("Delete", "Removes the selected image"),
+            ("Double-click", "Replaces the image with a new file"),
+            ("Ctrl+drag", "Moves or resizes directly, no selection needed"),
+            ("Right-click", "Replace image · Delete image"),
+        ],
+    ),
+    (
+        "Insert & highlight",
+        [
+            (
+                "Insert text / image",
+                "Arms click-to-place — a chip shows what to do next; Esc cancels",
+            ),
+            ("Highlight text", "Arms a window drag across the text; Esc cancels"),
+            ("Right-click the background", "Insert text, an image, or a comment at that spot"),
+            (
+                "Insert comment / callout",
+                "Review markup — never prints unless chosen at print time",
+            ),
+            ("On a comment", "Double-click edits · Ctrl+drag moves · Delete removes"),
+        ],
+    ),
+    (
+        "General",
+        [
+            ("Ctrl+F", "Finds text anywhere in the document (OCR offered for scanned pages)"),
+            ("Esc", "Cancels an armed mode, then clears the selection, then closes search"),
+            ("Ctrl+Z / Ctrl+Y", "Undo / redo any edit"),
+            ("Ctrl+wheel", "Zooms the page"),
+            ("Scroll at a page edge", "Continues to the next or previous page"),
+        ],
+    ),
+]
+
+
+def gestures_html() -> str:
+    parts: list[str] = []
+    for title, rows in _SECTIONS:
+        parts.append(f"<h3>{title}</h3><table cellspacing='0' cellpadding='3'>")
+        for gesture, meaning in rows:
+            parts.append(f"<tr><td><b>{gesture}</b>&nbsp;&nbsp;</td><td>{meaning}</td></tr>")
+        parts.append("</table>")
+    return "".join(parts)
+
+
+class GestureHelpDialog(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Editing gestures")
+        label = QLabel(gestures_html(), self)
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setContentsMargins(8, 4, 8, 4)
+        scroll = QScrollArea(self)
+        scroll.setWidget(label)
+        scroll.setWidgetResizable(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(scroll)
+        layout.addWidget(buttons)
+        self.resize(600, 540)

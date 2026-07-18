@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-editor"
+version = "0.1.3"
+description = "Standalone PDF viewer + editor for Windows"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    "pymupdf==1.28.0",
+    "PySide6==6.11.1",
+    "qt-material==2.17",
+    "QtAwesome==1.4.2",
+    # OCR (O-series): pytesseract wraps an EXTERNAL tesseract.exe — the binary
+    # and its tessdata are bundled assets (see CLAUDE.md), not pip packages.
+    "pytesseract==0.3.13",
+    "Pillow==12.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.15.20",
+    "pyinstaller==6.21.0",
+]
+
+# GUI launcher (no console window on Windows): `pdf-editor` after install.
+[project.gui-scripts]
+pdf-editor = "pdfapp.app:main"
+
+# src-layout: packages live under src/
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"

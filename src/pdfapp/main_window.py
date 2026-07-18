@@ -1,0 +1,1510 @@
+"""Main application window — thin chrome around a tab of DocumentViews.
+
+Owns actions, menus, toolbar, and file-level flows (open / merge / split /
+save-as dialogs). Per-document state and operations live in DocumentView; the
+window delegates action triggers to the *active* view (the current tab) and
+reflects that view's state in the toolbar and title via `_sync_chrome()`.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QMimeData, QSize, Qt
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextCharFormat,
+    QUndoGroup,
+)
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QColorDialog,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFontComboBox,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QSpinBox,
+    QTabWidget,
+    QToolBar,
+    QToolButton,
+)
+
+from pdfapp import diagnostics, icons, theme
+from pdfapp.document_view import DocumentView
+from pdfapp.font_files import font_choice
+from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
+from pdfcore import pages
+from pdfcore.document import PdfDocument
+from pdfcore.textedit import (
+    FLAG_BOLD,
+    FLAG_ITALIC,
+    SCRIPT_NORMAL,
+    SCRIPT_SUB,
+    SCRIPT_SUPER,
+    TextStyle,
+)
+
+# Family + weight/slant -> engine font choice. Lives in font_files (shared
+# with DocumentView's rich-commit conversion); aliased for existing tests.
+_font_choice = font_choice
+
+
+def _weight_format(bold: bool) -> QTextCharFormat:
+    fmt = QTextCharFormat()
+    fmt.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+    return fmt
+
+
+def _flag_format(kind: str, on: bool) -> QTextCharFormat:
+    fmt = QTextCharFormat()
+    if kind == "italic":
+        fmt.setFontItalic(on)
+    elif kind == "underline":
+        fmt.setFontUnderline(on)
+    return fmt
+
+
+def _parse_page_ranges(text: str) -> list[tuple[int, int]]:
+    """Parse a 1-based range string like "1-3, 4, 5-8" into 0-based (start, end).
+
+    Raises ValueError on empty input or non-integer parts.
+    """
+    ranges: list[tuple[int, int]] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a) - 1, int(b) - 1
+        else:
+            start = end = int(part) - 1
+        ranges.append((start, end))
+    if not ranges:
+        raise ValueError("no page ranges given")
+    return ranges
+
+
+def _dropped_pdf_paths(mime: QMimeData) -> list[Path]:
+    """Local ``.pdf`` file paths carried by a drag's mime data (order preserved).
+
+    Drag-and-drop hands us URLs; keep only local files with a ``.pdf`` suffix so
+    a stray text/link drag — or a non-PDF file — is silently declined.
+    """
+    if not mime.hasUrls():
+        return []
+    paths: list[Path] = []
+    for url in mime.urls():
+        if url.isLocalFile():
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() == ".pdf":
+                paths.append(path)
+    return paths
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("PDF Editor")
+        self.resize(1000, 800)
+        # Drop a PDF onto the window to open it, exactly like File > Open.
+        self.setAcceptDrops(True)
+
+        self._thumbs_visible = True
+        self._last_hover_hint = ""
+        self._print_options = PrintOptions()
+        # One stack per document (owned by its DocumentView); the group routes
+        # Undo/Redo to the active tab's stack.
+        self._undo_group = QUndoGroup(self)
+
+        self._tabs = QTabWidget(self)
+        self._tabs.setDocumentMode(True)
+        self._tabs.setMovable(True)
+        self._tabs.setTabsClosable(True)
+        # Kill the tab bar's native "base" frame — a grey 1px line the Fusion
+        # style draws UNDER the tabs (QSS can't reach it; it peeked out past
+        # the last tab as an RGB-120 hairline).
+        self._tabs.tabBar().setDrawBase(False)
+        self._tabs.currentChanged.connect(lambda _idx: self._sync_chrome())
+        self._tabs.tabCloseRequested.connect(self._close_tab)
+        self.setCentralWidget(self._tabs)
+
+        self._build_actions()
+        self._build_menu()
+        self._build_toolbar()
+        self._build_style_toolbar()
+        self._assign_icons()
+        # Permanent read-only/editing indicator for the ACTIVE tab (U0).
+        self._mode_label = QLabel("", self)
+        self.statusBar().addPermanentWidget(self._mode_label)
+        self._sync_chrome()
+
+        # Follow theme switches however they are triggered (menu, tests):
+        # keep the toggle in sync and re-pull themed chrome per open view.
+        theme.on_change(self._on_theme_changed)
+
+    # --- active view ----------------------------------------------------
+    @property
+    def active_view(self) -> DocumentView | None:
+        widget = self._tabs.currentWidget()
+        return widget if isinstance(widget, DocumentView) else None
+
+    def _views(self) -> list[DocumentView]:
+        return [self._tabs.widget(i) for i in range(self._tabs.count())]
+
+    # --- construction ---------------------------------------------------
+    def _build_actions(self) -> None:
+        self._open_action = QAction("&Open…", self)
+        self._open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self._open_action.triggered.connect(self.open_file_dialog)
+
+        self._merge_action = QAction("&Merge PDFs…", self)
+        self._merge_action.triggered.connect(self.merge_documents)
+
+        self._split_action = QAction("&Split PDF…", self)
+        self._split_action.triggered.connect(self.split_document)
+
+        self._save_action = QAction("&Save", self)
+        self._save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self._save_action.triggered.connect(self.save)
+
+        self._save_as_action = QAction("Save &As…", self)
+        self._save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
+        self._save_as_action.triggered.connect(self.save_as)
+
+        self._print_action = QAction("&Print…", self)
+        self._print_action.setShortcut(QKeySequence.StandardKey.Print)
+        self._print_action.triggered.connect(self.print_current)
+
+        self._prev_action = QAction("&Previous page", self)
+        self._prev_action.setShortcut(QKeySequence.StandardKey.MoveToPreviousPage)
+        self._prev_action.triggered.connect(self.prev_page)
+
+        self._next_action = QAction("&Next page", self)
+        self._next_action.setShortcut(QKeySequence.StandardKey.MoveToNextPage)
+        self._next_action.triggered.connect(self.next_page)
+
+        self._first_action = QAction("&First page", self)
+        self._first_action.setShortcut(QKeySequence.StandardKey.MoveToStartOfDocument)
+        self._first_action.triggered.connect(self.first_page)
+
+        self._last_action = QAction("&Last page", self)
+        self._last_action.setShortcut(QKeySequence.StandardKey.MoveToEndOfDocument)
+        self._last_action.triggered.connect(self.last_page)
+
+        self._zoom_in_action = QAction("Zoom &in", self)
+        self._zoom_in_action.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        self._zoom_in_action.triggered.connect(self.zoom_in)
+
+        self._zoom_out_action = QAction("Zoom &out", self)
+        self._zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        self._zoom_out_action.triggered.connect(self.zoom_out)
+
+        self._fit_page_action = QAction("Fit &page", self)
+        self._fit_page_action.setShortcut("Ctrl+0")
+        self._fit_page_action.triggered.connect(self.fit_page)
+
+        self._fit_width_action = QAction("Fit &width", self)
+        self._fit_width_action.setShortcut("Ctrl+1")
+        self._fit_width_action.triggered.connect(self.fit_width)
+
+        self._zoom_actions = (
+            self._zoom_in_action,
+            self._zoom_out_action,
+            self._fit_page_action,
+            self._fit_width_action,
+        )
+
+        self._thumbs_action = QAction("&Thumbnails", self)
+        self._thumbs_action.setCheckable(True)
+        self._thumbs_action.setChecked(True)
+        self._thumbs_action.toggled.connect(self._toggle_thumbnails)
+
+        # Checked = dark (the default). Not persisted — no settings mechanism
+        # exists, so every launch starts dark (deliberate, restyle S3).
+        self._dark_theme_action = QAction("Dar&k theme", self)
+        self._dark_theme_action.setCheckable(True)
+        self._dark_theme_action.setChecked(theme.current_mode() == theme.DARK)
+        self._dark_theme_action.toggled.connect(self._on_dark_theme_toggled)
+
+        # Per-document read-only/edit switch (U0). Documents open READ-ONLY;
+        # checked = the ACTIVE tab is editable. _sync_chrome reflects the
+        # active view's mode; the toggle handler drives it.
+        self._edit_mode_action = QAction("&Edit mode", self)
+        self._edit_mode_action.setCheckable(True)
+        self._edit_mode_action.setShortcut("Ctrl+E")
+        self._edit_mode_action.toggled.connect(self._on_edit_mode_toggled)
+
+        # "Show editable areas" (U5): outline every paragraph/image on the
+        # page. Per-document, edit-mode only, default OFF (decided).
+        self._show_areas_action = QAction("Show editable &areas", self)
+        self._show_areas_action.setCheckable(True)
+        self._show_areas_action.toggled.connect(self._on_show_areas_toggled)
+
+        # Double-click sub-mode (U8): checked = a plain double-click edits
+        # the whole PARAGRAPH (Ctrl then edits one line); unchecked = the
+        # historic line-first default. Per-document, edit-mode only. The
+        # checked state IS the visible indicator (plus the hover hints).
+        self._dblclick_para_action = QAction("Dou&ble-click edits paragraph", self)
+        self._dblclick_para_action.setCheckable(True)
+        self._dblclick_para_action.toggled.connect(self._on_dblclick_para_toggled)
+
+        self._undo_action = self._undo_group.createUndoAction(self, "&Undo")
+        self._undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+
+        self._redo_action = self._undo_group.createRedoAction(self, "&Redo")
+        self._redo_action.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+
+        self._rotate_cw_action = QAction("Rotate &clockwise", self)
+        self._rotate_cw_action.setShortcut("Ctrl+R")
+        self._rotate_cw_action.triggered.connect(self.rotate_clockwise)
+
+        self._rotate_ccw_action = QAction("Rotate counter-clock&wise", self)
+        self._rotate_ccw_action.setShortcut("Ctrl+Shift+R")
+        self._rotate_ccw_action.triggered.connect(self.rotate_counterclockwise)
+
+        self._move_up_action = QAction("Move page &up", self)
+        self._move_up_action.setShortcut("Ctrl+Shift+Up")
+        self._move_up_action.triggered.connect(self.move_page_up)
+
+        self._move_down_action = QAction("Move page &down", self)
+        self._move_down_action.setShortcut("Ctrl+Shift+Down")
+        self._move_down_action.triggered.connect(self.move_page_down)
+
+        self._delete_action = QAction("&Delete page", self)
+        self._delete_action.setShortcut("Ctrl+Delete")
+        self._delete_action.triggered.connect(self.delete_current_page)
+
+        self._insert_action = QAction("&Insert pages from file…", self)
+        self._insert_action.triggered.connect(self.insert_pages_from_file)
+
+        # Help → the U7 gestures cheat sheet. Never gated — read-only users
+        # need it to learn that Edit mode exists.
+        self._gestures_action = QAction("Editing &gestures…", self)
+        self._gestures_action.triggered.connect(self.show_gesture_help)
+
+        # Help → reveal the diagnostics log so a user hitting a bug can find the
+        # file to send back (logs are local + never auto-uploaded).
+        self._show_log_action = QAction("Show &diagnostics log", self)
+        self._show_log_action.triggered.connect(self.show_diagnostics_log)
+
+        # Tools → Extract text (X1): a READ feature — enabled whenever a
+        # document is open, never edit-gated (extraction mutates nothing).
+        self._extract_text_action = QAction("Extract &text…", self)
+        self._extract_text_action.triggered.connect(self.extract_text)
+
+        # Edit → Find (SR2): the other READ feature — never edit-gated.
+        # Search is ALWAYS case-insensitive (by design; no toggle exists).
+        self._find_action = QAction("&Find…", self)
+        self._find_action.setShortcut(QKeySequence.StandardKey.Find)
+        self._find_action.triggered.connect(self.find_in_document)
+
+        # Checkable (U4): checked while the mode is armed; clicking a checked
+        # action cancels it. _sync_chrome keeps them truthful.
+        self._insert_text_action = QAction("Insert te&xt…", self)
+        self._insert_text_action.setCheckable(True)
+        self._insert_text_action.triggered.connect(self.insert_text)
+
+        self._insert_image_action = QAction("Insert i&mage…", self)
+        self._insert_image_action.setCheckable(True)
+        self._insert_image_action.triggered.connect(self.insert_image)
+
+        self._highlight_action = QAction("High&light text", self)
+        self._highlight_action.setCheckable(True)
+        self._highlight_action.triggered.connect(self.highlight_text)
+
+        self._insert_comment_action = QAction("Insert &comment…", self)
+        self._insert_comment_action.setCheckable(True)
+        self._insert_comment_action.triggered.connect(self.insert_comment)
+
+        self._insert_callout_action = QAction("Insert c&allout…", self)
+        self._insert_callout_action.setCheckable(True)
+        self._insert_callout_action.triggered.connect(self.insert_callout)
+
+        self._page_edit_actions = (
+            self._rotate_cw_action,
+            self._rotate_ccw_action,
+            self._move_up_action,
+            self._move_down_action,
+            self._delete_action,
+            self._insert_action,
+            self._insert_text_action,
+            self._insert_image_action,
+            self._highlight_action,
+            self._insert_comment_action,
+            self._insert_callout_action,
+        )
+
+        # One icon set (icons.py) + a tooltip on every icon button. Icons are
+        # (re-)baked by _assign_icons() at build time and on each theme change
+        # (glyph colour follows the mode). The style toolbar extends this map.
+        self._icon_keys: dict[QAction, str] = {
+            self._open_action: "open",
+            self._merge_action: "merge",
+            self._split_action: "split",
+            self._save_action: "save",
+            self._save_as_action: "save_as",
+            self._print_action: "print",
+            self._prev_action: "prev_page",
+            self._next_action: "next_page",
+            self._first_action: "first_page",
+            self._last_action: "last_page",
+            self._zoom_in_action: "zoom_in",
+            self._zoom_out_action: "zoom_out",
+            self._fit_page_action: "fit_page",
+            self._fit_width_action: "fit_width",
+            self._thumbs_action: "thumbnails",
+            self._dark_theme_action: "dark_theme",
+            self._edit_mode_action: "edit_mode",
+            self._show_areas_action: "reveal_areas",
+            self._dblclick_para_action: "dblclick_paragraph",
+            self._gestures_action: "help",
+            self._extract_text_action: "extract_text",
+            self._find_action: "search",
+            self._undo_action: "undo",
+            self._redo_action: "redo",
+            self._rotate_cw_action: "rotate_cw",
+            self._rotate_ccw_action: "rotate_ccw",
+            self._move_up_action: "move_up",
+            self._move_down_action: "move_down",
+            self._delete_action: "delete_page",
+            self._insert_action: "insert_pages",
+            self._insert_text_action: "insert_text",
+            self._insert_image_action: "insert_image",
+            self._highlight_action: "highlight",
+            self._insert_comment_action: "insert_comment",
+            self._insert_callout_action: "insert_callout",
+        }
+        tooltips = {
+            self._open_action: "Open a PDF (Ctrl+O)",
+            self._merge_action: "Merge several PDFs into one file",
+            self._split_action: "Split a PDF into page ranges",
+            self._save_action: "Save (Ctrl+S)",
+            self._save_as_action: "Save as a new file (Ctrl+Shift+S)",
+            self._print_action: "Print (Ctrl+P)",
+            self._prev_action: "Previous page (Page Up)",
+            self._next_action: "Next page (Page Down)",
+            self._first_action: "First page (Ctrl+Home)",
+            self._last_action: "Last page (Ctrl+End)",
+            self._zoom_in_action: "Zoom in (Ctrl++)",
+            self._zoom_out_action: "Zoom out (Ctrl+-)",
+            self._fit_page_action: "Fit the whole page in the window (Ctrl+0)",
+            self._fit_width_action: "Fit the page width (Ctrl+1)",
+            self._thumbs_action: "Show or hide the thumbnail sidebar",
+            self._dark_theme_action: "Toggle dark / light theme",
+            self._edit_mode_action: "Edit mode — allow changing this document (Ctrl+E)",
+            self._show_areas_action: "Show editable areas — outline everything editable",
+            self._dblclick_para_action: (
+                "Double-click edits the whole paragraph (Ctrl+double-click then edits"
+                " one line); off: the reverse"
+            ),
+            self._undo_action: "Undo (Ctrl+Z)",
+            self._redo_action: "Redo (Ctrl+Y)",
+            self._rotate_cw_action: "Rotate page clockwise (Ctrl+R)",
+            self._rotate_ccw_action: "Rotate page counter-clockwise (Ctrl+Shift+R)",
+            self._move_up_action: "Move page up (Ctrl+Shift+Up)",
+            self._move_down_action: "Move page down (Ctrl+Shift+Down)",
+            self._delete_action: "Delete page (Ctrl+Delete)",
+            self._insert_action: "Insert pages from another PDF",
+            self._gestures_action: "Every editing gesture on one page",
+            self._extract_text_action: "Extract the document's text (OCR for scanned pages)",
+            self._find_action: "Find in document (Ctrl+F)",
+            self._insert_text_action: "Insert text — then click the page to place it",
+            self._insert_image_action: "Insert an image — then click the page to place it",
+            self._highlight_action: "Highlight text — drag a window over it",
+            self._insert_comment_action: (
+                "Add a review comment — markup that doesn't print unless chosen at print time"
+            ),
+            self._insert_callout_action: (
+                "Add a callout comment — click the target, then place the box"
+            ),
+        }
+        for action, tip in tooltips.items():
+            action.setToolTip(tip)
+
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+        file_menu.addAction(self._open_action)
+        file_menu.addAction(self._save_action)
+        file_menu.addAction(self._save_as_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self._print_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self._merge_action)
+        file_menu.addAction(self._split_action)
+
+        go_menu = self.menuBar().addMenu("&Go")
+        for action in (
+            self._prev_action,
+            self._next_action,
+            self._first_action,
+            self._last_action,
+        ):
+            go_menu.addAction(action)
+
+        view_menu = self.menuBar().addMenu("&View")
+        for action in self._zoom_actions:
+            view_menu.addAction(action)
+        view_menu.addSeparator()
+        view_menu.addAction(self._thumbs_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self._dark_theme_action)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+        edit_menu.addAction(self._find_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self._edit_mode_action)
+        edit_menu.addAction(self._show_areas_action)
+        edit_menu.addAction(self._dblclick_para_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self._undo_action)
+        edit_menu.addAction(self._redo_action)
+        edit_menu.addSeparator()
+        for action in self._page_edit_actions:
+            edit_menu.addAction(action)
+
+        # Kept as an attribute (like _window_menu): shiboken invalidates
+        # transient wrappers fetched back via QAction.menu(), so tests and
+        # future additions use this handle instead.
+        self._tools_menu = self.menuBar().addMenu("&Tools")
+        self._tools_menu.addAction(self._extract_text_action)
+
+        # Populated from the open tabs by _rebuild_window_menu().
+        self._window_menu = self.menuBar().addMenu("&Window")
+
+        help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(self._gestures_action)
+        help_menu.addAction(self._show_log_action)
+
+    # --- theme ------------------------------------------------------------
+    def _on_dark_theme_toggled(self, checked: bool) -> None:
+        app = QApplication.instance()
+        mode = theme.DARK if checked else theme.LIGHT
+        if app is not None and theme.current_mode() != mode:
+            theme.apply_theme(app, mode)
+
+    def _on_theme_changed(self, mode: str) -> None:
+        # No-op re-entry: setChecked fires the toggle handler, which sees
+        # current_mode() already equals the target and does nothing.
+        self._dark_theme_action.setChecked(mode == theme.DARK)
+        self._assign_icons()  # glyph colour follows the mode
+        for view in self._views():
+            view.refresh_theme()
+
+    def _assign_icons(self) -> None:
+        """(Re-)bake themed icons for every action — build time + theme change."""
+        for action, key in self._icon_keys.items():
+            action.setIcon(icons.icon(key))
+
+    def _build_toolbar(self) -> None:
+        toolbar = QToolBar("Navigation", self)
+        toolbar.setIconSize(QSize(20, 20))  # match the style toolbar
+        toolbar.addAction(self._prev_action)
+
+        # A quiet "N / total" cluster: the spinbox is a plain centred number
+        # field (no up/down buttons — the chevrons and PgUp/PgDn step pages;
+        # type a number + Enter to jump). Styled via theme.py's addendum.
+        self._page_spin = QSpinBox(self)
+        self._page_spin.setObjectName("page_spin")
+        self._page_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._page_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._page_spin.setToolTip("Current page — type a number and press Enter to jump")
+        self._page_spin.setMinimum(1)
+        self._page_spin.setMaximum(1)
+        self._page_spin.setEnabled(False)
+        self._page_spin.valueChanged.connect(self._on_spin_changed)
+        toolbar.addWidget(self._page_spin)
+
+        self._page_total_label = QLabel("/ 0", self)
+        self._page_total_label.setObjectName("page_total")
+        toolbar.addWidget(self._page_total_label)
+
+        toolbar.addAction(self._next_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._zoom_out_action)
+        toolbar.addAction(self._zoom_in_action)
+        toolbar.addAction(self._fit_page_action)
+        toolbar.addAction(self._fit_width_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._edit_mode_action)
+        # Insert text/image are the frequent editing entry points, so they get
+        # the toolbar slots (E11.4, user request); the reveal-all and
+        # double-click sub-mode TOGGLES moved to menu-only (less used).
+        toolbar.addAction(self._insert_text_action)
+        toolbar.addAction(self._insert_image_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._rotate_ccw_action)
+        toolbar.addAction(self._rotate_cw_action)
+        toolbar.addAction(self._move_up_action)
+        toolbar.addAction(self._move_down_action)
+        toolbar.addAction(self._delete_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._extract_text_action)
+        self.addToolBar(toolbar)
+
+    def _build_style_toolbar(self) -> None:
+        """The text-style toolbar: font, size, bold, underline, colour, scripts.
+
+        Drives inserted/replacement text. Opening a span/paragraph editor
+        populates it from the clicked text; commit applies the (possibly
+        adjusted) style. Base-14 family picks stay non-embedded; any other
+        system font is embedded as a subset (deliberate choice — see
+        CLAUDE.md font rule).
+        """
+        bar = QToolBar("Text style", self)
+        bar.setObjectName("text_style_toolbar")
+        bar.setIconSize(QSize(20, 20))  # match the navigation toolbar
+
+        self._font_combo = QFontComboBox(self)
+        self._font_combo.setCurrentFont(QFont("Arial"))
+        self._font_combo.setToolTip("Font for inserted or replacement text")
+        # The combo's font DATABASE may substitute a family it doesn't know
+        # (e.g. a document font that isn't installed) — remember the family we
+        # populated from so an untouched combo round-trips the ORIGINAL name;
+        # a manual user pick clears the override.
+        self._style_family_override: str | None = None
+        self._populating_style = False
+        self._font_combo.currentFontChanged.connect(self._on_font_combo_changed)
+        bar.addWidget(self._font_combo)
+
+        self._size_spin = QDoubleSpinBox(self)
+        self._size_spin.setRange(4.0, 96.0)
+        self._size_spin.setValue(9.0)  # launch default: the quotes' body size
+        self._size_spin.setDecimals(1)
+        self._size_spin.setSuffix(" pt")
+        self._size_spin.setToolTip("Text size — type a value or use the arrows")
+        # Typing "12" must not apply 1pt then 12pt: fire only on Enter/arrows.
+        self._size_spin.setKeyboardTracking(False)
+        bar.addWidget(self._size_spin)
+
+        self._bold_action = QAction("Bold", self)
+        self._bold_action.setCheckable(True)
+        self._bold_action.setToolTip("Bold (Ctrl+B)")
+        self._bold_action.setShortcut(QKeySequence.StandardKey.Bold)
+        bar.addAction(self._bold_action)
+
+        self._italic_action = QAction("Italic", self)
+        self._italic_action.setCheckable(True)
+        self._italic_action.setToolTip("Italic (Ctrl+I)")
+        self._italic_action.setShortcut(QKeySequence.StandardKey.Italic)
+        bar.addAction(self._italic_action)
+
+        self._underline_action = QAction("Underline", self)
+        self._underline_action.setCheckable(True)
+        self._underline_action.setToolTip(
+            "Underline (Ctrl+U — drawn as a line; PDF has no underline fonts)"
+        )
+        self._underline_action.setShortcut(QKeySequence.StandardKey.Underline)
+        bar.addAction(self._underline_action)
+
+        self._super_action = QAction("Superscript", self)
+        self._super_action.setCheckable(True)
+        self._super_action.setToolTip("Superscript")
+        self._sub_action = QAction("Subscript", self)
+        self._sub_action.setCheckable(True)
+        self._sub_action.setToolTip("Subscript")
+        self._super_action.toggled.connect(lambda on: on and self._sub_action.setChecked(False))
+        self._sub_action.toggled.connect(lambda on: on and self._super_action.setChecked(False))
+        bar.addAction(self._super_action)
+        bar.addAction(self._sub_action)
+
+        self._text_color = QColor(0, 0, 0)
+        self._color_button = QToolButton(self)
+        self._color_button.setToolTip("Text colour")
+        self._color_button.clicked.connect(self._pick_text_color)
+        self._update_color_swatch()
+        bar.addWidget(self._color_button)
+
+        # The live colour swatch stays a painted pixmap (it IS the meaning);
+        # everything else joins the one icon set.
+        self._icon_keys.update(
+            {
+                self._bold_action: "bold",
+                self._italic_action: "italic",
+                self._underline_action: "underline",
+                self._super_action: "superscript",
+                self._sub_action: "subscript",
+            }
+        )
+
+        # No style control may steal keyboard focus from an open in-place
+        # editor — otherwise clicking one would move focus off the editor and
+        # break the commit-on-Enter flow (and, before the focus-out fix, it
+        # cancelled the edit outright). Mouse clicks still drive every control.
+        style_actions = (
+            self._bold_action,
+            self._italic_action,
+            self._underline_action,
+            self._super_action,
+            self._sub_action,
+        )
+        for widget in (self._font_combo, self._color_button):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # The size spin ACCEPTS focus (click into it and type a size) — the
+        # open editor stays open (overlays never cancel on focus-out), and
+        # editingFinished hands focus straight back to it.
+        self._size_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self._size_spin.editingFinished.connect(self._refocus_open_editor)
+        for action in style_actions:
+            button = bar.widgetForAction(action)
+            if button is not None:
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # With an editor OPEN, toolbar changes format the current selection
+        # (make just these words bold); with none open they set the style for
+        # the next insert. Guarded so populate-from-context doesn't echo back.
+        self._bold_action.toggled.connect(lambda on: self._apply_to_selection(_weight_format(on)))
+        self._italic_action.toggled.connect(
+            lambda on: self._apply_to_selection(_flag_format("italic", on))
+        )
+        self._underline_action.toggled.connect(
+            lambda on: self._apply_to_selection(_flag_format("underline", on))
+        )
+        self._super_action.toggled.connect(lambda _on: self._apply_script_to_selection())
+        self._sub_action.toggled.connect(lambda _on: self._apply_script_to_selection())
+        self._size_spin.valueChanged.connect(self._apply_size_to_selection)
+        self._font_combo.currentFontChanged.connect(self._apply_family_to_selection)
+
+        self.addToolBar(bar)
+        self._capture_global_style()  # launch state IS the initial defaults
+
+    def _refocus_open_editor(self) -> None:
+        """After typing a size, put the caret back in the in-place editor."""
+        if (view := self.active_view) is not None:
+            view.focus_open_editor()
+
+    def _apply_to_selection(self, fmt: QTextCharFormat) -> None:
+        if self._populating_style:
+            return
+        if (view := self.active_view) is not None:
+            view.apply_format_to_editor(fmt)
+        self._maybe_capture_global_style()  # no editor -> a default change
+
+    def _apply_script_to_selection(self) -> None:
+        if self._populating_style:
+            return
+        fmt = QTextCharFormat()
+        if self._super_action.isChecked():
+            fmt.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSuperScript)
+        elif self._sub_action.isChecked():
+            fmt.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
+        else:
+            fmt.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignNormal)
+        if (view := self.active_view) is not None:
+            view.apply_format_to_editor(fmt)
+        self._maybe_capture_global_style()
+
+    def _apply_size_to_selection(self, size_pt: float) -> None:
+        if self._populating_style:
+            return
+        if (view := self.active_view) is not None:
+            view.apply_size_pt_to_editor(size_pt)
+        self._maybe_capture_global_style()
+
+    def _apply_family_to_selection(self, font: QFont) -> None:
+        if self._populating_style:
+            return
+        family_font = QFont()
+        family_font.setFamily(font.family())
+        fmt = QTextCharFormat()
+        fmt.setFont(
+            family_font,
+            QTextCharFormat.FontPropertiesInheritanceBehavior.FontPropertiesSpecifiedOnly,
+        )
+        if (view := self.active_view) is not None:
+            view.apply_format_to_editor(fmt)
+        self._maybe_capture_global_style()
+
+    def _pick_text_color(self) -> None:
+        color = QColorDialog.getColor(self._text_color, self, "Text colour")
+        if color.isValid():
+            self._text_color = color
+            self._update_color_swatch()
+            fmt = QTextCharFormat()
+            fmt.setForeground(color)
+            self._apply_to_selection(fmt)
+
+    def _update_color_swatch(self, mixed: bool = False) -> None:
+        """The colour button's pixmap IS its state: the current colour, or —
+        when the selection spans several colours — a neutral crossed swatch
+        (the swatch's version of a blanked field / unchecked toggle)."""
+        self._color_swatch_mixed = mixed
+        swatch = QPixmap(16, 16)
+        if mixed:
+            swatch.fill(QColor(255, 255, 255))
+            painter = QPainter(swatch)
+            painter.setPen(QPen(QColor(128, 128, 128)))
+            painter.drawRect(0, 0, 15, 15)
+            painter.drawLine(2, 13, 13, 2)
+            painter.end()
+        else:
+            swatch.fill(self._text_color)
+        self._color_button.setIcon(swatch)
+
+    def _on_font_combo_changed(self, _font) -> None:
+        if not self._populating_style:
+            self._style_family_override = None  # deliberate user choice wins
+
+    def current_text_style(self) -> tuple[TextStyle, QFont]:
+        """The toolbar state as an engine TextStyle plus a preview QFont."""
+        family = self._style_family_override or self._font_combo.currentFont().family()
+        bold = self._bold_action.isChecked()
+        italic = self._italic_action.isChecked()
+        code, fontfile, resolved = _font_choice(family, bold, italic)
+        if not resolved:
+            self.statusBar().showMessage(
+                f"No font file found for {family} — using Helvetica.", 8000
+            )
+        if self._super_action.isChecked():
+            script = SCRIPT_SUPER
+        elif self._sub_action.isChecked():
+            script = SCRIPT_SUB
+        else:
+            script = SCRIPT_NORMAL
+        color = (
+            (self._text_color.red() << 16)
+            | (self._text_color.green() << 8)
+            | self._text_color.blue()
+        )
+        style = TextStyle(
+            code=code,
+            fontfile=fontfile,
+            size=float(self._size_spin.value()),
+            color=color,
+            underline=self._underline_action.isChecked(),
+            script=script,
+        )
+        preview = QFont(self._font_combo.currentFont())
+        preview.setBold(bold)
+        preview.setItalic(italic)
+        preview.setUnderline(style.underline)
+        return style, preview
+
+    def _set_size_field(self, size) -> None:
+        if size is None:
+            self._size_spin.setSuffix("")  # clear() keeps the suffix — drop it
+            self._size_spin.clear()  # display-only: blank until next change
+        else:
+            self._size_spin.setSuffix(" pt")
+            self._size_spin.setValue(float(size))
+            self._size_spin.lineEdit().setText(self._size_spin.textFromValue(float(size)) + " pt")
+
+    def _on_selection_format_changed(self, fmt: dict) -> None:
+        """Track the open editor's selection in the toolbar (E10.6 + E11.3):
+        uniform values show as the actual size / checked toggle; MIXED
+        values blank the field / uncheck the toggle. Reflection never
+        re-applies (guard) and never touches the GLOBAL insert defaults."""
+        self._populating_style = True
+        try:
+            self._set_size_field(fmt.get("size"))
+            self._bold_action.setChecked(bool(fmt.get("bold")))
+            self._italic_action.setChecked(bool(fmt.get("italic")))
+            self._underline_action.setChecked(bool(fmt.get("underline")))
+            # Scripts and colour follow the SAME rules (user request,
+            # 2026-07-18): uniform selection shows its state, mixed (None)
+            # unchecks both script toggles / neutralises the swatch.
+            script = fmt.get("script")
+            self._super_action.setChecked(script == SCRIPT_SUPER)
+            self._sub_action.setChecked(script == SCRIPT_SUB)
+            color = fmt.get("color")
+            if color is None:
+                self._update_color_swatch(mixed=True)
+            else:
+                self._text_color = QColor((color >> 16) & 255, (color >> 8) & 255, color & 255)
+                self._update_color_swatch()
+        finally:
+            self._populating_style = False
+
+    def _capture_global_style(self) -> None:
+        """Snapshot the controls as the GLOBAL insert defaults — called when
+        they change with NO editor open (a deliberate default change)."""
+        if self._super_action.isChecked():
+            script = SCRIPT_SUPER
+        elif self._sub_action.isChecked():
+            script = SCRIPT_SUB
+        else:
+            script = SCRIPT_NORMAL
+        self._global_style = {
+            "bold": self._bold_action.isChecked(),
+            "italic": self._italic_action.isChecked(),
+            "underline": self._underline_action.isChecked(),
+            "script": script,
+            "size": float(self._size_spin.value()),
+            "family": self._font_combo.currentFont().family(),
+            "color": QColor(self._text_color),
+        }
+
+    def _maybe_capture_global_style(self) -> None:
+        view = self.active_view
+        if view is None or not view.has_open_editor:
+            self._capture_global_style()
+
+    def _on_editor_closed(self) -> None:
+        """An editor session ended: restore the GLOBAL defaults to the
+        controls (selection reflection must not bleed into the next
+        insert's style — E11.3, user request)."""
+        style = getattr(self, "_global_style", None)
+        if style is None:
+            return
+        self._populating_style = True
+        try:
+            self._bold_action.setChecked(style["bold"])
+            self._italic_action.setChecked(style["italic"])
+            self._underline_action.setChecked(style["underline"])
+            self._super_action.setChecked(style["script"] == SCRIPT_SUPER)
+            self._sub_action.setChecked(style["script"] == SCRIPT_SUB)
+            self._set_size_field(style["size"])
+            self._font_combo.setCurrentFont(QFont(style["family"]))
+            self._text_color = QColor(style["color"])
+            self._update_color_swatch()
+        finally:
+            self._populating_style = False
+
+    def _populate_style_from(self, info) -> None:
+        """Reflect a clicked span/paragraph in the toolbar (edit flows)."""
+        code = info.base14 or ""
+        if code.startswith("ti"):
+            family = "Times New Roman"
+        elif code.startswith("co"):
+            family = "Courier New"
+        elif code.startswith("he"):
+            family = "Arial"
+        else:
+            family = info.font  # embedded/unmapped: best-effort family name
+        self._populating_style = True
+        try:
+            self._font_combo.setCurrentFont(QFont(family))
+            # Reflection, not user intent: EVERYTHING here stays under the
+            # guard — an unguarded setChecked fired the apply handler before
+            # the editor registered as open and clobbered the GLOBAL defaults
+            # (caught by the E11.3 independence test).
+            self._size_spin.setValue(float(info.size))
+            self._bold_action.setChecked(bool(info.flags & FLAG_BOLD))
+            self._italic_action.setChecked(bool(info.flags & FLAG_ITALIC))
+            self._text_color = QColor(
+                (info.color >> 16) & 255, (info.color >> 8) & 255, info.color & 255
+            )
+            self._update_color_swatch()
+            # Underline/scripts are not detectable from extracted text.
+            self._underline_action.setChecked(False)
+            self._super_action.setChecked(False)
+            self._sub_action.setChecked(False)
+        finally:
+            self._populating_style = False
+        self._style_family_override = family
+        shown = self._font_combo.currentFont().family()
+        if shown.lower() != family.lower():
+            # The preview substitutes an installed family; the COMMIT still
+            # resolves the original name (falling back honestly if it can't).
+            self.statusBar().showMessage(
+                f"Font {family} isn't installed — {shown} is shown while editing.", 8000
+            )
+
+    # --- open flow ------------------------------------------------------
+    def open_file_dialog(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open PDF", "", "PDF files (*.pdf);;All files (*)"
+        )
+        if path_str:
+            self.open_path(Path(path_str))
+
+    def open_path(self, path: Path) -> None:
+        # Focus an already-open tab for the same file rather than duplicating it.
+        existing = self._find_tab(path)
+        if existing is not None:
+            self._tabs.setCurrentWidget(existing)
+            return
+
+        try:
+            doc = PdfDocument.open(path)
+        except Exception as exc:  # noqa: BLE001 - surface any open error to the user
+            diagnostics.log_event(f"open failed: {path.name}: {exc}")
+            QMessageBox.critical(self, "Open failed", f"Could not open:\n{path}\n\n{exc}")
+            return
+
+        if doc.needs_pass and not self._prompt_password(doc, path):
+            doc.close()
+            return
+
+        self._add_view(DocumentView(doc))
+        # A breadcrumb so a later hang/crash log shows what was open (no-op until
+        # diagnostics.install has run, i.e. never in tests).
+        diagnostics.log_event(f"opened {path.name} ({doc.page_count} pages)")
+
+    # --- single-instance external open ----------------------------------
+    def handle_external_open(self, paths: list[str]) -> None:
+        """Open files forwarded by a second launch as tabs, then surface us.
+
+        Wired to `single_instance.SingleInstanceServer`: when the app is already
+        running, a new `pdf-editor.exe "<file>"` (double-click / "Open with")
+        routes here instead of starting a second window. Empty `paths` = a bare
+        re-launch (Start-menu / no file): just raise the window.
+        """
+        for p in paths:
+            self.open_path(Path(p))
+        self.bring_to_front()
+
+    def bring_to_front(self) -> None:
+        """Restore + raise + activate the window (used by single-instance).
+
+        On Windows, ``activateWindow()`` from a background process only
+        FLASHES the taskbar icon — the OS refuses the focus change unless the
+        foreground process granted it. The forwarding secondary grants that
+        right (``AllowSetForegroundWindow`` in ``single_instance``) and the
+        explicit ``SetForegroundWindow`` here claims it.
+        """
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+            except Exception:
+                pass  # cosmetic — never let chrome break the open itself
+
+    # --- drag-and-drop open ---------------------------------------------
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        # Accept only when the drag carries at least one local PDF, so the
+        # cursor shows a valid drop target and dropEvent then fires.
+        if _dropped_pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = _dropped_pdf_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # Same entry point as File > Open: focus an already-open tab, prompt
+        # for a password if needed, add a tab per dropped document.
+        for path in paths:
+            self.open_path(path)
+
+    def _add_view(self, view: DocumentView) -> None:
+        view.set_thumbnails_visible(self._thumbs_visible)
+        view.stateChanged.connect(lambda v=view: self._on_view_state_changed(v))
+        view.editWarning.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
+        view.hoverHintChanged.connect(self._show_hover_hint)
+        view.styleContextChanged.connect(self._populate_style_from)
+        view.selectionFormatChanged.connect(self._on_selection_format_changed)
+        view.editorClosed.connect(self._on_editor_closed)
+        view.style_provider = self.current_text_style
+        self._undo_group.addStack(view.undo_stack)
+        index = self._tabs.addTab(view, view.title)
+        if view.path is not None:
+            self._tabs.setTabToolTip(index, str(view.path))
+        self._tabs.setCurrentIndex(index)
+
+    def _find_tab(self, path: Path) -> DocumentView | None:
+        target = path.resolve()
+        for view in self._views():
+            if view.path is not None and view.path.resolve() == target:
+                return view
+        return None
+
+    def _show_hover_hint(self, hint: str) -> None:
+        """Persistent hover hint (U2b). Clearing only removes OUR hint —
+        never an 8s warning that landed after it (moving the cursor off an
+        element must not eat "font can't be matched exactly")."""
+        bar = self.statusBar()
+        if hint:
+            self._last_hover_hint = hint
+            bar.showMessage(hint)
+        elif bar.currentMessage() == self._last_hover_hint:
+            bar.clearMessage()
+
+    def _on_view_state_changed(self, view: DocumentView) -> None:
+        index = self._tabs.indexOf(view)
+        if index >= 0:
+            self._tabs.setTabText(index, view.title + (" *" if view.dirty else ""))
+        if view is self.active_view:
+            self._sync_chrome()
+
+    # --- close handling -------------------------------------------------
+    def _close_tab(self, index: int) -> None:
+        view = self._tabs.widget(index)
+        if not isinstance(view, DocumentView):
+            return
+        if not self._confirm_close(view):
+            return
+        self._undo_group.removeStack(view.undo_stack)
+        self._tabs.removeTab(index)
+        view.close_document()
+        view.deleteLater()
+        self._sync_chrome()  # refresh chrome + Window menu; empty state if last
+
+    def _confirm_close(self, view: DocumentView) -> bool:
+        """Ask about unsaved changes. Returns False only if the user cancels."""
+        if not view.dirty:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Unsaved changes",
+            f"Save changes to {view.title}?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            return view.save()
+        return True  # Discard
+
+    def _prompt_password(self, doc: PdfDocument, path: Path) -> bool:
+        """Prompt until the password authenticates or the user cancels."""
+        while True:
+            pw, ok = QInputDialog.getText(
+                self,
+                "Password required",
+                f"Enter password for:\n{path.name}",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return False
+            if doc.authenticate(pw):
+                return True
+            QMessageBox.warning(self, "Wrong password", "That password did not work. Try again.")
+
+    # --- delegations to the active view ---------------------------------
+    def go_to_page(self, index: int) -> None:
+        if (v := self.active_view) is not None:
+            v.go_to_page(index)
+
+    def next_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.next_page()
+
+    def prev_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.prev_page()
+
+    def first_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.first_page()
+
+    def last_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.last_page()
+
+    def _on_spin_changed(self, value: int) -> None:
+        if (v := self.active_view) is not None:
+            v.go_to_page(value - 1)
+
+    def zoom_in(self) -> None:
+        if (v := self.active_view) is not None:
+            v.zoom_in()
+
+    def zoom_out(self) -> None:
+        if (v := self.active_view) is not None:
+            v.zoom_out()
+
+    def fit_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.fit_page()
+
+    def fit_width(self) -> None:
+        if (v := self.active_view) is not None:
+            v.fit_width()
+
+    def rotate_clockwise(self) -> None:
+        if (v := self.active_view) is not None:
+            v.rotate_clockwise()
+
+    def rotate_counterclockwise(self) -> None:
+        if (v := self.active_view) is not None:
+            v.rotate_counterclockwise()
+
+    def move_page_up(self) -> None:
+        if (v := self.active_view) is not None:
+            v.move_page_up()
+
+    def move_page_down(self) -> None:
+        if (v := self.active_view) is not None:
+            v.move_page_down()
+
+    def delete_current_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.delete_current_page()
+
+    def insert_text(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action == "text":
+                v.cancel_armed_mode()  # clicking the checked action cancels
+            else:
+                v.begin_insert_text()
+            self._sync_chrome()  # a cancelled dialog must not leave a stale check
+
+    def insert_image(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action == "image":
+                v.cancel_armed_mode()
+            else:
+                v.begin_insert_image()
+            self._sync_chrome()
+
+    def insert_comment(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action == "comment":
+                v.cancel_armed_mode()
+            else:
+                v.begin_insert_comment()
+            self._sync_chrome()
+
+    def insert_callout(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action in ("callout_target", "callout_box"):
+                v.cancel_armed_mode()
+            else:
+                v.begin_insert_callout()
+            self._sync_chrome()
+
+    def highlight_text(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action == "highlight":
+                v.cancel_armed_mode()
+            else:
+                v.begin_highlight()
+            self._sync_chrome()
+
+    def insert_pages_from_file(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Insert pages from PDF", "", "PDF files (*.pdf);;All files (*)"
+        )
+        if path_str:
+            view.insert_from_path(Path(path_str), view.current_page + 1)
+
+    def _on_edit_mode_toggled(self, checked: bool) -> None:
+        if (v := self.active_view) is not None and v.edit_mode != checked:
+            v.set_edit_mode(checked)
+
+    def _on_show_areas_toggled(self, checked: bool) -> None:
+        if (v := self.active_view) is not None and v.show_editable_areas != checked:
+            v.set_show_editable_areas(checked)
+
+    def _on_dblclick_para_toggled(self, checked: bool) -> None:
+        if (v := self.active_view) is not None and v.dblclick_paragraph != checked:
+            v.set_dblclick_paragraph(checked)
+
+    def show_gesture_help(self):
+        """Open the gestures cheat sheet; returns the dialog (exec'd only
+        when actually on screen — offscreen tests inspect the return)."""
+        from pdfapp.help_dialog import GestureHelpDialog
+
+        dialog = GestureHelpDialog(self)
+        if self.isVisible():
+            dialog.exec()
+        return dialog
+
+    def show_diagnostics_log(self) -> bool:
+        """Help → reveal the diagnostics log so the user can send it back. If no
+        log exists yet, point them at where it will be. Returns True if a log was
+        revealed (offscreen tests inspect the return; the info box only exec's
+        when actually on screen)."""
+        if diagnostics.reveal_log():
+            return True
+        if self.isVisible():
+            QMessageBox.information(
+                self,
+                "Diagnostics log",
+                "No diagnostics log has been written yet.\n\n"
+                f"It will appear here once the app records something:\n{diagnostics.log_path()}",
+            )
+        return False
+
+    def find_in_document(self) -> None:
+        """Edit → Find (Ctrl+F): open the ACTIVE tab's search bar (SR2)."""
+        view = self.active_view
+        if view is not None:
+            view.open_search()
+
+    def extract_text(self):
+        """Tools → Extract text (X2: whole document by default, per-page
+        native/OCR routing, cancellable progress). Returns the dialog;
+        exec'd only when on screen (offscreen tests inspect it)."""
+        from pdfapp.extract_support import build_extract_dialog
+
+        view = self.active_view
+        if view is None:
+            return None
+        title = f"Extracted text — {self._tabs.tabText(self._tabs.currentIndex())}"
+        dialog = build_extract_dialog(self, title, lambda scope: self._run_extraction(view, scope))
+        if self.isVisible():
+            dialog.exec()
+        return dialog
+
+    def _run_extraction(self, view: DocumentView, scope: str) -> str:
+        """One extraction pass for the dialog's runner (X2).
+
+        Flow: cheap text-layer scan → tesseract-missing warning path /
+        bulk-OCR confirm gate (declining skips OCR, never aborts) →
+        cancellable bulk OCR through the view's shared cache →
+        section collection with honest empty-page labels.
+        """
+        from pdfapp import extract_support
+        from pdfcore import ocr
+        from pdfcore.textsource import format_extracted_text
+
+        doc = view.document
+        if scope == extract_support.SCOPE_CURRENT:
+            pages = [view.current_page]
+        else:
+            pages = list(range(doc.page_count))
+        no_layer = [n for n in pages if not doc.has_text_layer(n)]
+
+        words_by_page: dict = {}
+        note = None
+        if no_layer:
+            if not ocr.tesseract_available():
+                self.statusBar().showMessage(
+                    f"Tesseract is not installed — {len(no_layer)} scanned page(s) "
+                    "are listed as empty (OCR not available).",
+                    8000,
+                )
+            else:
+                wants_ocr = True
+                if len(no_layer) >= extract_support.BULK_OCR_WARN_AT:
+                    wants_ocr = extract_support.confirm_bulk_ocr(self, len(no_layer))
+                if wants_ocr:
+                    # Re-entrancy guard: the progress dialog pumps events, so
+                    # a second Extract click must find the action disabled.
+                    self._extract_text_action.setEnabled(False)
+                    try:
+                        result = extract_support.run_bulk_ocr(
+                            self, doc, no_layer, view.ocr_word_cache, label="Extracting text (OCR)…"
+                        )
+                    finally:
+                        self._extract_text_action.setEnabled(True)
+                    words_by_page = result.words_by_page
+                    if result.tesseract_missing:
+                        self.statusBar().showMessage(
+                            "OCR stopped: the Tesseract runtime is unavailable.", 8000
+                        )
+                    if result.cancelled:
+                        skipped = len(no_layer) - len(words_by_page)
+                        note = (
+                            f"[Extraction cancelled — {skipped} scanned page(s) "
+                            "were not OCR'd and are listed as not attempted.]"
+                        )
+
+        sections, _ = extract_support.collect_sections(doc, pages, ocr_words_for=words_by_page.get)
+        text = format_extracted_text(sections)
+        return f"{text}\n\n{note}" if note else text
+
+    def _toggle_thumbnails(self, checked: bool) -> None:
+        self._thumbs_visible = checked
+        for view in self._views():
+            view.set_thumbnails_visible(checked)
+
+    # --- save -----------------------------------------------------------
+    def save(self) -> None:
+        view = self.active_view
+        if view is not None and view.save():
+            self.statusBar().showMessage(f"Saved {view.path}")
+
+    def save_as(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        out_str, _ = QFileDialog.getSaveFileName(self, "Save PDF as", "", "PDF files (*.pdf)")
+        if out_str and view.save_as_path(Path(out_str)):
+            self.statusBar().showMessage(f"Saved {out_str}")
+
+    def print_current(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        dialog = PrintDialog(self._print_options, self)
+        dialog.previewRequested.connect(lambda: show_preview(self, view.document, dialog.options()))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._print_options = dialog.options()  # remember the choices
+            print_document(self, view.document, self._print_options)
+
+    # --- file-level operations (produce new files) ----------------------
+    def merge_documents(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select PDFs to merge (in order)", "", "PDF files (*.pdf);;All files (*)"
+        )
+        if not paths:
+            return
+        out_str, _ = QFileDialog.getSaveFileName(
+            self, "Save merged PDF as", "", "PDF files (*.pdf)"
+        )
+        if out_str:
+            self._merge_files([Path(p) for p in paths], Path(out_str))
+
+    def _merge_files(self, paths: list[Path], out: Path) -> None:
+        try:
+            pages.merge(paths, out)
+        except Exception as exc:  # noqa: BLE001 - surface any merge error
+            QMessageBox.critical(self, "Merge failed", f"Could not merge PDFs:\n\n{exc}")
+            return
+        self.open_path(out)
+
+    def split_document(self) -> None:
+        src_str, _ = QFileDialog.getOpenFileName(
+            self, "Select a PDF to split", "", "PDF files (*.pdf);;All files (*)"
+        )
+        if not src_str:
+            return
+        text, ok = QInputDialog.getText(self, "Split ranges", "Page ranges (e.g. 1-3, 4, 5-8):")
+        if not ok or not text.strip():
+            return
+        try:
+            ranges = _parse_page_ranges(text)
+        except ValueError:
+            QMessageBox.warning(self, "Split", "Could not parse those page ranges.")
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder")
+        if out_dir:
+            self._split_file(Path(src_str), ranges, Path(out_dir))
+
+    def _split_file(self, src: Path, ranges: list[tuple[int, int]], out_dir: Path) -> None:
+        try:
+            outputs = pages.split(src, ranges, out_dir)
+        except Exception as exc:  # noqa: BLE001 - surface any split error
+            QMessageBox.critical(self, "Split failed", f"Could not split:\n\n{exc}")
+            return
+        self.statusBar().showMessage(f"Split into {len(outputs)} file(s) in {out_dir}")
+
+    # --- chrome sync ----------------------------------------------------
+    def _sync_chrome(self) -> None:
+        view = self.active_view
+        has = view is not None
+        edit_on = view.edit_mode if view is not None else False
+        self._undo_group.setActiveStack(view.undo_stack if view is not None else None)
+        count = view.page_count if view is not None else 0
+        current = view.current_page if view is not None else 0
+        at_start = current <= 0
+        at_end = current >= count - 1
+
+        self._prev_action.setEnabled(has and not at_start)
+        self._first_action.setEnabled(has and not at_start)
+        self._next_action.setEnabled(has and not at_end)
+        self._last_action.setEnabled(has and not at_end)
+
+        self._page_spin.setEnabled(has)
+        # Block signals so syncing the spinbox doesn't re-trigger navigation.
+        self._page_spin.blockSignals(True)
+        self._page_spin.setMaximum(max(1, count))
+        self._page_spin.setValue(current + 1)
+        self._page_spin.blockSignals(False)
+        self._page_total_label.setText(f"/ {count}")
+
+        for action in self._zoom_actions:
+            action.setEnabled(has)
+        # Mutating actions require edit mode (U0); read-only is a clean viewer.
+        for action in self._page_edit_actions:
+            action.setEnabled(has and edit_on)
+        # A PDF must keep at least one page.
+        self._delete_action.setEnabled(has and edit_on and count > 1)
+        self._move_up_action.setEnabled(has and edit_on and not at_start)
+        self._move_down_action.setEnabled(has and edit_on and not at_end)
+        # Undo/redo also park in read-only — a restore mutates the document.
+        # Safe to overrule the QUndoGroup: it re-enables only on stack
+        # activity, which user actions can't produce read-only — and a
+        # programmatic push re-syncs this chrome right after (stateChanged).
+        self._undo_action.setEnabled(edit_on and view is not None and view.undo_stack.canUndo())
+        self._redo_action.setEnabled(edit_on and view is not None and view.undo_stack.canRedo())
+        self._edit_mode_action.setEnabled(has)
+        self._edit_mode_action.blockSignals(True)
+        self._edit_mode_action.setChecked(edit_on)
+        self._edit_mode_action.blockSignals(False)
+        # Armed one-shot modes show as checked on their launching action (U4).
+        armed = view.armed_action if view is not None else None
+        self._insert_text_action.setChecked(armed == "text")
+        self._insert_image_action.setChecked(armed == "image")
+        self._highlight_action.setChecked(armed == "highlight")
+        self._insert_comment_action.setChecked(armed == "comment")
+        self._insert_callout_action.setChecked(armed in ("callout_target", "callout_box"))
+        # Reveal-all (U5): per-document, meaningful only in edit mode.
+        self._show_areas_action.setEnabled(has and edit_on)
+        self._show_areas_action.blockSignals(True)
+        self._show_areas_action.setChecked(bool(has and view.show_editable_areas))
+        self._show_areas_action.blockSignals(False)
+        # Double-click sub-mode (U8): the checked state IS the indicator.
+        self._dblclick_para_action.setEnabled(has and edit_on)
+        self._dblclick_para_action.blockSignals(True)
+        self._dblclick_para_action.setChecked(bool(has and view.dblclick_paragraph))
+        self._dblclick_para_action.blockSignals(False)
+        self._mode_label.setText(("Editing" if edit_on else "Read-only") if has else "")
+        self._save_action.setEnabled(has)
+        self._save_as_action.setEnabled(has)
+        self._print_action.setEnabled(has)
+        # Read features (X1/SR2): available whenever a document is open, even
+        # read-only — deliberately NOT in _page_edit_actions.
+        self._extract_text_action.setEnabled(has)
+        self._find_action.setEnabled(has)
+
+        self._thumbs_action.setEnabled(has)
+        self._thumbs_action.blockSignals(True)
+        self._thumbs_action.setChecked(view.thumbnails_visible if has else self._thumbs_visible)
+        self._thumbs_action.blockSignals(False)
+
+        if not has:
+            self.statusBar().showMessage("Open a PDF to begin.")
+        self._rebuild_window_menu()
+        self._update_title()
+
+    def _rebuild_window_menu(self) -> None:
+        """List the open documents; selecting one activates its tab."""
+        self._window_menu.clear()
+        active = self.active_view
+        views = self._views()
+        if not views:
+            placeholder = self._window_menu.addAction("No documents open")
+            placeholder.setEnabled(False)
+            return
+        for index, view in enumerate(views):
+            action = self._window_menu.addAction(view.title)
+            action.setCheckable(True)
+            action.setChecked(view is active)
+            action.triggered.connect(
+                lambda _checked=False, idx=index: self._tabs.setCurrentIndex(idx)
+            )
+
+    def _update_title(self) -> None:
+        view = self.active_view
+        if view is None:
+            self.setWindowTitle("PDF Editor")
+            return
+        star = " *" if view.dirty else ""
+        self.setWindowTitle(f"PDF Editor — {view.title}{star}")
+
+    # --- lifecycle ------------------------------------------------------
+    def closeEvent(self, event) -> None:
+        # Prompt for each dirty document before the window closes. Only when
+        # actually shown to a user — offscreen tests never call show(), so this
+        # stays non-blocking there.
+        if self.isVisible():
+            for view in self._views():
+                self._tabs.setCurrentWidget(view)  # show which doc we're asking about
+                if not self._confirm_close(view):
+                    event.ignore()
+                    return
+        event.accept()

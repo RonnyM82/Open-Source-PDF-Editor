@@ -1,0 +1,88 @@
+PDF Editor
+Copyright (C) 2026 PDF Editor contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See the LICENSE file for the full text.
+
+This product bundles the following third-party components:
+
+- PyMuPDF  (https://github.com/pymupdf/PyMuPDF)
+    License: GNU AGPL-3.0
+    A Python binding for MuPDF (© Artifex Software, Inc.). Because PyMuPDF is
+    AGPL-3.0, this combined work is distributed under AGPL-3.0.
+
+- pymupdfb
+    License: GNU AGPL-3.0
+    The native MuPDF binaries shipped alongside PyMuPDF.
+
+- PySide6 / Qt for Python  (https://www.qt.io/qt-for-python)
+    License: GNU LGPL-3.0
+    Qt is © The Qt Company Ltd and other contributors.
+
+- qt-material  (https://github.com/dunderlab/qt-material)
+    License: BSD-2-Clause
+    Material-design stylesheet for Qt applications; provides the app theme.
+    Bundles the Roboto font family (Apache-2.0).
+
+- Jinja2 / MarkupSafe  (https://palletsprojects.com/)
+    License: BSD-3-Clause
+    Template engine used by qt-material (transitive dependencies, bundled in
+    the frozen build).
+
+- QtAwesome  (https://github.com/spyder-ide/qtawesome)
+    License: MIT
+    Icon fonts for Qt applications; provides the app's icon set. Bundles
+    icon fonts under their own licences, including Material Design Icons
+    (Apache-2.0, the set this app uses), Font Awesome (SIL OFL 1.1),
+    Elusive Icons (SIL OFL 1.1), Phosphor (MIT), Remix Icon (Apache-2.0)
+    and Microsoft Codicons (CC BY 4.0).
+
+- QtPy  (https://github.com/spyder-ide/qtpy)
+    License: MIT
+    Qt-binding abstraction used by QtAwesome (transitive dependency,
+    bundled in the frozen build).
+
+- pytesseract  (https://github.com/madmaze/pytesseract)
+    License: Apache-2.0
+    Python wrapper used for OCR text extraction; invokes the external
+    Tesseract OCR engine as a subprocess.
+
+- Pillow  (https://python-pillow.github.io/)
+    License: MIT-CMU
+    Imaging library used to hand rendered pages to the OCR engine.
+
+- Tesseract OCR  (https://github.com/tesseract-ocr/tesseract)
+    License: Apache-2.0
+    The OCR engine itself — an external program, not a Python package.
+    Packaged builds bundle the Windows runtime (UB-Mannheim build
+    5.4.0.20240606): tesseract.exe, libtesseract, and the English model
+    data (eng.traineddata, tessdata_fast — Apache-2.0) as application
+    assets; development machines use a local installation instead.
+    The bundled runtime's third-party libraries (its verified dependency
+    closure) and their licences:
+      Leptonica (Leptonica License, BSD-2-Clause-style); libjpeg-turbo
+      (IJG + BSD + zlib); libpng (PNG Reference Library licence); libtiff
+      (libtiff/MIT-style licence); zlib; libdeflate (MIT); libwebp and
+      libsharpyuv (BSD-3-Clause); giflib (MIT); OpenJPEG (BSD-2-Clause);
+      LERC (Apache-2.0); jbigkit (GPL-2.0-or-later — verified wording;
+      compatible with this product's AGPL-3.0); libarchive (BSD-2-Clause);
+      OpenSSL libcrypto 3 (Apache-2.0); xz / liblzma (0BSD); bzip2
+      (BSD-style); lz4 (BSD-2-Clause); zstd (BSD-3-Clause); BLAKE2 libb2
+      (CC0); expat (MIT); GNU libiconv (LGPL-2.1-or-later, dynamically
+      linked); MinGW-w64 runtime — libstdc++/libgcc (GPL-3.0 WITH GCC
+      Runtime Library Exception) and libwinpthread (MIT/BSD-style).
+    The installer's training tools and their UI/text-rendering stack
+    (ICU, GLib, Pango, Cairo, fontconfig, FreeType, HarfBuzz, …) are NOT
+    bundled.
+
+Source availability
+-------------------
+The complete corresponding source code for this program is this public
+repository. Anyone who receives a binary of this program (or a derivative) is
+entitled under AGPL-3.0 to the corresponding source; publishing it here satisfies
+that obligation, as well as PySide6's LGPL-3.0 obligation. This is a desktop
+application, not a network service, so no AGPL section 13 network-interaction
+obligation is triggered; the ordinary AGPL-3.0 copyleft terms apply to
+distribution, and any fork or redistribution inherits AGPL-3.0.
