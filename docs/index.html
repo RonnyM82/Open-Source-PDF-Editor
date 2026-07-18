@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Editor — Free, Open-Source PDF Viewer &amp; Editor for Windows</title>
+<meta name="description" content="PDF Editor is a free, open-source PDF viewer and editor for Windows. View PDFs, edit text and images in place, OCR scanned documents, merge/split pages, and print — fully offline, no account, no subscription.">
+<meta name="keywords" content="free pdf editor, open source pdf editor, pdf editor windows, pdf viewer, edit pdf text, pdf ocr, merge pdf, split pdf, offline pdf editor, pymupdf, pyside6">
+<link rel="canonical" href="https://ronnym82.github.io/Open-Source-PDF-Editor/">
+
+<!-- Open Graph / Twitter -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="PDF Editor — Free, Open-Source PDF Viewer & Editor for Windows">
+<meta property="og:description" content="View, edit, OCR, merge/split and print PDFs on Windows. Free, open-source, fully offline.">
+<meta property="og:url" content="https://ronnym82.github.io/Open-Source-PDF-Editor/">
+<meta property="og:image" content="https://ronnym82.github.io/Open-Source-PDF-Editor/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="PDF Editor — Free, Open-Source PDF Viewer & Editor for Windows">
+<meta name="twitter:description" content="View, edit, OCR, merge/split and print PDFs on Windows. Free, open-source, fully offline.">
+<meta name="twitter:image" content="https://ronnym82.github.io/Open-Source-PDF-Editor/og-image.png">
+
+<!-- Structured data: SoftwareApplication -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "PDF Editor",
+  "operatingSystem": "Windows",
+  "applicationCategory": "UtilitiesApplication",
+  "description": "Free, open-source PDF viewer and editor for Windows. View PDFs, edit text and images in place, OCR scanned documents, merge/split/reorder pages, highlight, comment, and print — fully offline.",
+  "url": "https://github.com/RonnyM82/Open-Source-PDF-Editor",
+  "downloadUrl": "https://github.com/RonnyM82/Open-Source-PDF-Editor/releases/latest",
+  "softwareVersion": "0.1.3",
+  "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+<!-- Structured data: FAQ -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Is PDF Editor free?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. PDF Editor is free and open-source under the AGPL-3.0 licence. There is no paid tier and no subscription." } },
+    { "@type": "Question", "name": "Does PDF Editor work offline?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. It is a desktop application that runs entirely on your computer. No PDF is uploaded anywhere, which makes it suitable for confidential documents." } },
+    { "@type": "Question", "name": "Which operating systems are supported?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Windows (x64) is packaged and tested. The code is Python/PySide6, so building from source on other platforms may work, but only Windows ships an installer." } },
+    { "@type": "Question", "name": "Can it edit text in an existing PDF?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. In edit mode you click text to change it in place, and you can move, resize, replace, or delete images too." } },
+    { "@type": "Question", "name": "Can it read scanned PDFs with no text layer?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes. It includes built-in OCR (a bundled Tesseract engine) so you can search and extract text from scanned or outlined-text PDFs." } },
+    { "@type": "Question", "name": "Can it merge and split PDFs?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Yes — merge several PDFs, split into page ranges, and rotate, delete, reorder, or insert pages." } }
+  ]
+}
+</script>
+
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+  a { color: #60a5fa; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+  header { text-align: center; padding: 64px 20px 32px; }
+  .mark { display:inline-block; width:64px; height:64px; border:6px solid #60a5fa; position:relative; border-radius:8px; }
+  .mark::before,.mark::after{content:"";position:absolute;background:#60a5fa;}
+  .mark::before{left:24px;top:10px;width:8px;height:32px;}
+  .mark::after{left:10px;top:24px;width:32px;height:8px;}
+  h1 { font-size: 2.4rem; margin: 20px 0 8px; }
+  .tag { font-size: 1.2rem; color: #cbd5e1; margin: 0 auto 8px; max-width: 640px; }
+  .sub { color: #94a3b8; }
+  .cta { margin: 28px 0 8px; }
+  .btn { display:inline-block; background:#2563eb; color:#fff; text-decoration:none;
+         padding:12px 22px; border-radius:10px; font-weight:600; margin:6px; }
+  .btn.secondary { background:#1e293b; color:#e2e8f0; border:1px solid #334155; }
+  .note { font-size:.9rem; color:#94a3b8; }
+  section { padding: 28px 0; border-top: 1px solid #1e293b; }
+  h2 { font-size: 1.5rem; }
+  img.shot { width:100%; border-radius:10px; border:1px solid #1e293b; margin: 10px 0; }
+  ul.feat { list-style:none; padding:0; display:grid; grid-template-columns:1fr; gap:10px; }
+  @media(min-width:640px){ ul.feat{ grid-template-columns:1fr 1fr; } }
+  ul.feat li { background:#111c33; border:1px solid #1e293b; border-radius:10px; padding:12px 14px; }
+  details { background:#111c33; border:1px solid #1e293b; border-radius:10px; padding:12px 16px; margin:10px 0; }
+  summary { cursor:pointer; font-weight:600; }
+  footer { text-align:center; color:#94a3b8; padding: 40px 20px; font-size:.9rem; }
+  .chips span { display:inline-block; background:#1e293b; border:1px solid #334155;
+                border-radius:999px; padding:4px 12px; margin:4px; font-size:.85rem; }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <div class="mark" aria-hidden="true"></div>
+  <h1>PDF Editor</h1>
+  <p class="tag">A <strong>free, open-source PDF viewer &amp; editor for Windows</strong>.</p>
+  <p class="sub">View · edit text &amp; images · OCR scanned PDFs · merge / split · highlight &amp; comment · print — fully offline.</p>
+  <div class="cta">
+    <a class="btn" href="https://github.com/RonnyM82/Open-Source-PDF-Editor/releases/latest">Download for Windows</a>
+    <a class="btn secondary" href="https://github.com/RonnyM82/Open-Source-PDF-Editor">View on GitHub</a>
+  </div>
+  <p class="note">Unsigned installer — on first run choose “More info → Run anyway”. Windows x64.</p>
+</header>
+
+<main class="wrap">
+  <section>
+    <img class="shot" src="screenshots/screenshot-viewer.png" alt="PDF Editor viewing a PDF document on Windows in dark theme">
+    <img class="shot" src="screenshots/screenshot-editing.png" alt="Editing PDF text and images in place, with editable regions outlined">
+  </section>
+
+  <section>
+    <h2>What it does</h2>
+    <ul class="feat">
+      <li>📄 View &amp; navigate PDFs in tabs, with zoom, thumbnails and printing</li>
+      <li>✏️ Edit existing <strong>text and images</strong> directly on the page</li>
+      <li>🔎 <strong>OCR</strong> scanned / image-only PDFs (bundled Tesseract) to search &amp; extract text</li>
+      <li>🗂️ Merge, split, rotate, delete, reorder and insert pages</li>
+      <li>🖍️ Highlights and review comments; snapshot undo/redo</li>
+      <li>🔒 100% offline &amp; private — nothing is uploaded</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Frequently asked questions</h2>
+    <details open><summary>Is PDF Editor free?</summary><p>Yes — free and open-source under AGPL-3.0. No paid tier, no subscription.</p></details>
+    <details><summary>Does it work offline?</summary><p>Yes. It runs entirely on your computer; no PDF is uploaded anywhere.</p></details>
+    <details><summary>Can it edit text in an existing PDF?</summary><p>Yes — click text to edit it in place, and move/resize/replace/delete images.</p></details>
+    <details><summary>Can it read scanned PDFs?</summary><p>Yes — built-in OCR (bundled Tesseract) makes scanned/outlined PDFs searchable.</p></details>
+    <details><summary>Which platforms are supported?</summary><p>Windows (x64) is packaged and tested. Building from source elsewhere may work but isn’t packaged.</p></details>
+    <details><summary>Is it an Adobe Acrobat replacement?</summary><p>It covers everyday view/edit/organise/print + OCR. It does not do form filling, digital signatures, or full text reflow.</p></details>
+  </section>
+
+  <section>
+    <h2>Built with</h2>
+    <p class="chips"><span>PyMuPDF</span><span>PySide6 / Qt</span><span>Tesseract OCR</span><span>Python 3.13</span><span>AGPL-3.0</span></p>
+  </section>
+</main>
+
+<footer>
+  Free &amp; open-source · AGPL-3.0 ·
+  <a href="https://github.com/RonnyM82/Open-Source-PDF-Editor">github.com/RonnyM82/Open-Source-PDF-Editor</a>
+</footer>
+</body>
+</html>

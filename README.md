@@ -1,17 +1,32 @@
-# PDF Editor
+# PDF Editor — free, open-source PDF viewer & editor for Windows
 
-A standalone, open-source PDF **viewer + editor for Windows** — read, navigate,
-print, manipulate pages, and edit text/images in place, in a themed desktop app.
+**PDF Editor is a free, open-source PDF viewer and editor for Windows.** View and
+navigate PDFs, edit text and images directly on the page, OCR scanned documents,
+merge / split / reorder pages, add highlights and comments, and print — in a fast,
+themed desktop app that runs fully offline. No account, no subscription, no cloud.
+
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)
+[![Latest release](https://img.shields.io/github/v/release/RonnyM82/Open-Source-PDF-Editor)](../../releases/latest)
+[![CI](https://github.com/RonnyM82/Open-Source-PDF-Editor/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/github/license/RonnyM82/Open-Source-PDF-Editor)](LICENSE)
+![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 
 Built with Python 3.13, **PyMuPDF** (PDF engine), **PySide6** (GUI), themed with
-**qt-material** (Material dark/light) with **QtAwesome** icons, and packaged with
-**PyInstaller**. Licensed under **AGPL-3.0** (see [Licensing](#licensing-agpl-30)
-below — PyMuPDF is AGPL, so the combined work is too). Contributor-facing design
-notes live in [ARCHITECTURE.md](ARCHITECTURE.md).
+**qt-material** (Material dark/light) and **QtAwesome** icons, packaged with
+**PyInstaller**. Contributor-facing design notes are in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Just want to run it?** Grab the prebuilt Windows installer from the
+> **Just want to run it?** Download the prebuilt Windows installer from the
 > [**Releases**](../../releases) page — no build step required. See
 > [Install](#install-windows-setup-installer).
+
+## Screenshots
+
+| Viewer (dark theme) | Editing text & images in place |
+|---|---|
+| ![PDF Editor viewing a PDF on Windows](docs/screenshots/screenshot-viewer.png) | ![Editing PDF text and images with editable regions outlined](docs/screenshots/screenshot-editing.png) |
+
+![PDF Editor viewing a CAD drawing in light theme](docs/screenshots/screenshot-cad.png)
 
 ## Architecture in one line
 
@@ -69,6 +84,54 @@ install in development (see Setup); packaged builds bundle it.
 sample PDFs to try features on — a quote (text layer, for editing), a CAD drawing
 (vector text), and a no-text-layer invoice (for OCR / Extract Text). They contain
 no real data.
+
+## Why PDF Editor?
+
+- **Free and open-source** (AGPL-3.0) — no licence fees, no subscription, no account.
+- **Fully offline and private** — everything happens on your machine; nothing is
+  uploaded to a cloud service, unlike browser-based PDF tools.
+- **Real in-place editing** — change existing PDF **text and images** on the page,
+  not just add annotations on top.
+- **Built-in OCR** — read and search **scanned or image-only PDFs** with a bundled
+  Tesseract engine.
+- **Fast native desktop app** — powered by PyMuPDF, with a modern dark/light UI.
+
+Scope note: this is a focused viewer/editor, not a full Adobe Acrobat replacement —
+form filling, digital signatures, and full text reflow are intentionally out of
+scope.
+
+## FAQ
+
+**Is PDF Editor free?**
+Yes — it's free and open-source under the AGPL-3.0 licence. There is no paid tier.
+
+**Does it work offline?**
+Yes. It's a desktop application that runs entirely on your computer. No PDF is ever
+uploaded anywhere, which makes it a good fit for confidential documents.
+
+**Which operating systems are supported?**
+Windows (x64) — that's what the installer targets. The code is Python/PySide6, so
+building from source on other platforms may work, but only Windows is packaged and
+tested.
+
+**Can it edit the text in an existing PDF?**
+Yes. In edit mode you click text to edit it in place (single line or a whole
+paragraph), and you can move, resize, replace, or delete images too.
+
+**Can it read scanned PDFs / PDFs with no text layer?**
+Yes. It has built-in OCR (a bundled Tesseract engine) so you can search and extract
+text from scanned or outlined-text documents.
+
+**Can it merge, split, or reorder pages?**
+Yes — merge several PDFs, split into page ranges, and rotate / delete / reorder /
+insert pages.
+
+**How do I make it my default PDF viewer on Windows?**
+See [Set PDF Editor as your default PDF viewer](#set-pdf-editor-as-your-default-pdf-viewer).
+
+**Is it a replacement for Adobe Acrobat?**
+It covers everyday viewing, editing, page organisation, printing, and OCR. It does
+**not** do AcroForm filling, digital signatures, or full document reflow.
 
 ## Setup (Windows, PowerShell)
 
