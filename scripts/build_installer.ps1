@@ -20,15 +20,8 @@ if (-not (Test-Path $bundleExe)) {
 }
 
 # --- Version: single source of truth = pyproject.toml [project].version ---
-# Top-level `version = "x.y.z"` (column 0); dependency specifiers live inside
-# arrays and won't match this anchored pattern.
-$pyproject = Join-Path $root "pyproject.toml"
-$verMatch = Select-String -Path $pyproject -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
-if (-not $verMatch) {
-    Write-Error "Could not read [project].version from $pyproject"
-    exit 1
-}
-$version = $verMatch.Matches[0].Groups[1].Value
+. "$PSScriptRoot\_version.ps1"
+$version = Get-AppVersion
 Write-Host "Version (from pyproject.toml): $version"
 
 # --- Locate ISCC.exe (the Inno Setup compiler) ---

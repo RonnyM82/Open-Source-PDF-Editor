@@ -24,10 +24,23 @@ def clean_diagnostics(tmp_path, monkeypatch):
 
 
 def test_log_path_uses_localappdata(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)  # dev run: not portable
     monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\x\AppData\Local")
     p = diagnostics.log_path()
     assert p.name == "diagnostics.log"
     assert "PDF Editor" in str(p)
+
+
+def test_log_path_is_exe_relative_in_portable_mode(tmp_path, monkeypatch):
+    # Portable build: log lives beside the exe (data\), never in the profile.
+    from pdfapp import portable
+
+    exe = tmp_path / "pdf-editor.exe"
+    exe.write_bytes(b"")
+    (tmp_path / portable.MARKER_NAME).write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    assert diagnostics.log_path() == tmp_path / "data" / "diagnostics.log"
 
 
 def test_install_writes_session_banner_with_screens(qapp, clean_diagnostics):

@@ -21,11 +21,26 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $bundle = Join-Path $root "dist\pdf-editor"
-$zip = Join-Path $root "dist\pdf-editor.zip"
-if (Test-Path $bundle) {
-    Compress-Archive -Path (Join-Path $bundle "*") -DestinationPath $zip -Force
-    Write-Host "Packaged: $zip"
-} else {
+if (-not (Test-Path $bundle)) {
     Write-Error "Expected bundle not found at $bundle"
     exit 1
+}
+
+# Portable distribution: the SAME onedir bundle plus a marker file that makes
+# the app run in "leaves no trace" mode (writes its log to a data\ folder next
+# to the exe instead of the user profile — see pdfapp/portable.py). The marker
+# is dropped in only for the zip and removed afterwards, so the installer build
+# (which copies dist\pdf-editor\*) never ships it. Zipping the FOLDER (not its
+# contents) makes the archive extract into a clean pdf-editor\ directory.
+. "$PSScriptRoot\_version.ps1"
+$version = Get-AppVersion
+$zip = Join-Path $root "dist\pdf-editor-portable-$version.zip"
+$marker = Join-Path $bundle "pdf-editor.portable"
+try {
+    New-Item -ItemType File -Path $marker -Force | Out-Null
+    Compress-Archive -Path $bundle -DestinationPath $zip -Force
+    Write-Host "Packaged portable build: $zip"
+} finally {
+    # Keep dist\pdf-editor\ pristine for scripts\build_installer.ps1.
+    Remove-Item -Force $marker -ErrorAction SilentlyContinue
 }

@@ -53,10 +53,13 @@ _MAX_LOG_BYTES = 1_000_000
 
 
 def log_path() -> Path:
-    """Where the diagnostics log lives — a per-user, always-writable spot that
-    survives in a frozen build (no writing next to a Program Files exe)."""
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
-    return Path(base) / "PDF Editor" / "diagnostics.log"
+    """Where the diagnostics log lives. Installed/dev: a per-user,
+    always-writable spot (no writing next to a Program Files exe). Portable: a
+    ``data/`` folder next to the exe, so a copy on a USB stick leaves nothing on
+    the host. Both branches live in :func:`pdfapp.portable.data_dir`."""
+    from pdfapp import portable
+
+    return portable.data_dir() / "diagnostics.log"
 
 
 def _rotate_if_large(path: Path) -> None:

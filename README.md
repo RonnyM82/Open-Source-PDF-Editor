@@ -16,9 +16,12 @@ Built with Python 3.13, **PyMuPDF** (PDF engine), **PySide6** (GUI), themed with
 **PyInstaller**. Contributor-facing design notes are in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Just want to run it?** Download the prebuilt Windows installer from the
-> [**Releases**](../../releases) page — no build step required. See
-> [Install](#install-windows-setup-installer).
+> **Just want to run it?** Grab a prebuilt Windows build from the
+> [**Releases**](../../releases) page — no build step required. Two options:
+> the **installer** (`pdf-editor-setup-<version>.exe`, see
+> [Install](#install-windows-setup-installer)) or the **portable ZIP**
+> (`pdf-editor-portable-<version>.zip` — no install, see
+> [Portable](#portable-no-install)).
 
 ## Screenshots
 
@@ -169,10 +172,27 @@ python -m pdfapp
 
 This produces a one-folder bundle (`dist\pdf-editor\`) containing `pdf-editor.exe`
 and its dependencies, including the Tesseract OCR runtime (staged automatically
-from the local install — the Setup step above is required to build). Distribute
-the zipped folder. The build is unsigned, so on
-first launch Windows SmartScreen may show "Windows protected your PC" — click
-**More info → Run anyway**.
+from the local install — the Setup step above is required to build). It also
+zips that bundle into the portable distribution
+`dist\pdf-editor-portable-<version>.zip` (see [Portable](#portable-no-install)).
+The build is unsigned, so on first launch Windows SmartScreen may show "Windows
+protected your PC" — click **More info → Run anyway**.
+
+## Portable (no install)
+
+Prefer not to install anything? Download `pdf-editor-portable-<version>.zip` from
+the [**Releases**](../../releases) page, extract it anywhere (a folder, a USB
+stick), and run `pdf-editor.exe` inside the extracted `pdf-editor\` folder. No
+installer, no admin, no registry changes.
+
+The portable build is **self-contained**: it keeps its diagnostics log in a
+`data\` folder next to the exe rather than in your user profile, so it leaves
+nothing behind on the host machine. OCR is bundled just like the installed
+build, and it's still single-instance (opening a second PDF reuses the running
+window). Being unsigned, it triggers the same SmartScreen "More info → Run
+anyway" on first launch. To make double-clicking PDFs open this copy, use the
+[installer](#install-windows-setup-installer) instead — the portable build
+deliberately registers nothing.
 
 ## Install (Windows setup installer)
 
@@ -215,6 +235,21 @@ unsigned, the setup triggers the same SmartScreen "More info → Run anyway" as 
 raw exe. Re-running a newer installer **upgrades in place** — one install, no
 duplicate shortcut, old files removed. Uninstall from **Settings → Apps →
 Installed apps** (it removes the app and all its registry keys).
+
+### Making a release
+
+Bump `version` in `pyproject.toml` (the single source of truth), then build both
+artifacts and attach **both** to the GitHub Release:
+
+```powershell
+.\scripts\package.ps1          # -> dist\pdf-editor\  +  dist\pdf-editor-portable-<version>.zip
+.\scripts\build_installer.ps1  # -> dist\pdf-editor-setup-<version>.exe
+```
+
+Upload `dist\pdf-editor-portable-<version>.zip` **and**
+`dist\pdf-editor-setup-<version>.exe` to the release so every release ships both
+the portable and installer builds. `package.ps1` versions the zip and drops the
+portable marker into it automatically; the installer bundle stays marker-free.
 
 ### Set PDF Editor as your default PDF viewer
 
