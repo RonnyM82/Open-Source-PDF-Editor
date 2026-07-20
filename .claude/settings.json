@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "if": "Bash(git commit*)",
+            "command": "& './scripts/lint.ps1'; if ($LASTEXITCODE -ne 0) { Write-Output 'Commit BLOCKED: scripts/lint.ps1 failed. CI runs these same two gates (ruff check . + ruff format --check .) and will fail. Fix with: python -m ruff format .   then re-run scripts/lint.ps1 and retry the commit.'; exit 2 }",
+            "statusMessage": "Checking ruff lint + format...",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
