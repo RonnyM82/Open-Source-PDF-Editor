@@ -95,6 +95,18 @@ def test_toolbar_state_flows_into_style(qapp):
         window.close()
 
 
+def test_strikethrough_flows_into_style(qapp):
+    window = MainWindow()
+    try:
+        window._strike_action.setChecked(True)
+        style, preview = window.current_text_style()
+        assert style.strike
+        assert not style.underline
+        assert preview.strikeOut()
+    finally:
+        window.close()
+
+
 def test_toolbar_scripts_are_mutually_exclusive(qapp):
     window = MainWindow()
     try:
@@ -454,6 +466,267 @@ def test_script_and_colour_reflection_do_not_bleed_into_globals(qapp, tmp_path):
         assert not window._sub_action.isChecked()
         assert window._text_color == red
         assert not window._color_swatch_mixed
+    finally:
+        window.close()
+
+
+def test_strike_toggle_tracks_selection_and_mixed_unchecks(qapp, tmp_path):
+    """The strikethrough button follows the same selection-tracking rules as
+    B/I/U — checked for a uniformly-struck selection, unchecked for mixed."""
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 100, 112)
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+
+        _select(editor, "two words")
+        window._strike_action.setChecked(True)  # strike just those words
+
+        _select(editor, "make two")  # plain "make " + struck "two": mixed
+        assert not window._strike_action.isChecked()
+
+        _select(editor, "two words")  # uniformly struck selection
+        assert window._strike_action.isChecked()
+
+        _select(editor, "bold here")  # untouched plain stretch
+        assert not window._strike_action.isChecked()
+    finally:
+        window.close()
+
+
+def test_strike_just_two_words(qapp, tmp_path):
+    """Select two words mid-paragraph, click Strikethrough, commit — a strike
+    line is drawn across exactly those words (the full UI->engine runs path)."""
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_pdf(tmp_path))
+        view = window.active_view
+        para = view.document.paragraph_at(0, 100, 112)
+        view._begin_paragraph_edit(0, para)
+
+        _select(view._para_editor, "two words")
+        window._strike_action.setChecked(True)  # toolbar formats the selection
+        view._para_editor.commit()
+
+        # Strike does not change the font, so the line re-extracts as one span;
+        # locate the "two words" sub-range from the word boxes instead.
+        page = view.document._doc[0]
+        words = {w[4]: w for w in page.get_text("words")}
+        two, wordsw = words["two"], words["words"]
+        left, right = min(two[0], wordsw[0]), max(two[2], wordsw[2])
+
+        strokes = [
+            path["items"][0]
+            for path in page.get_drawings()
+            if len(path.get("items", ())) == 1 and path["items"][0][0] == "l"
+        ]
+        assert len(strokes) == 1  # one rule, for the one struck run
+        (_kind, p1, p2) = strokes[0]
+        assert two[1] < min(p1.y, p2.y) < two[3]  # crosses THROUGH the glyph box
+        assert min(p1.x, p2.x) == pytest.approx(left, abs=2.5)  # over just...
+        assert max(p1.x, p2.x) == pytest.approx(right, abs=2.5)  # ...those words
+    finally:
+        window.close()
+
+
+def _ruled_pdf(tmp_path, *, underline=False, strike=False):
+    """A PDF with one line of app-inserted text carrying a drawn rule."""
+    import pymupdf
+
+    from pdfcore.document import PdfDocument
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    blank = tmp_path / "blank.pdf"
+    d = pymupdf.open()
+    d.new_page()
+    d.save(str(blank))
+    d.close()
+    out = tmp_path / "ruled.pdf"
+    style = TextStyle(code="helv", size=11.0, underline=underline, strike=strike)
+    with PdfDocument.open(blank) as doc:
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("ruled sample line", style)])
+        doc.save(str(out))
+    return out
+
+
+def test_reedit_underlined_shows_tracks_and_retains(qapp, tmp_path):
+    """User report: editing underlined text dropped the underline in the
+    editor, the toggle didn't track it, and a real edit lost it on commit. The
+    drawn rule is now detected at extraction, so all three work."""
+    from PySide6.QtGui import QTextCursor
+
+    window = MainWindow()
+    try:
+        window.open_path(_ruled_pdf(tmp_path, underline=True))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 130.0, 197.0)
+        assert para is not None
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+
+        # (1) the editor shows the underline...
+        pieces = [(t, f) for t, f in editor._pieces() if t.strip()]
+        assert pieces and all(f.fontUnderline() for _t, f in pieces)
+
+        # (2) ...the toggle tracks it when the ruled text is selected...
+        _select(editor, "ruled sample line")
+        assert window._underline_action.isChecked()
+        assert not window._strike_action.isChecked()
+
+        # (3) ...and a real, format-preserving edit keeps it on commit.
+        cursor = editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText("!")  # inherits the underline at the caret
+        editor.setTextCursor(cursor)
+        editor.commit()
+        span = next(s for s in view.document.text_spans(0) if "ruled" in s.text)
+        assert span.underline
+    finally:
+        window.close()
+
+
+def test_reedit_struck_shows_in_editor_and_tracks_toggle(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_ruled_pdf(tmp_path, strike=True))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 130.0, 197.0)
+        assert para is not None
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+
+        pieces = [(t, f) for t, f in editor._pieces() if t.strip()]
+        assert pieces and all(f.fontStrikeOut() for _t, f in pieces)
+
+        _select(editor, "ruled sample line")
+        assert window._strike_action.isChecked()
+        assert not window._underline_action.isChecked()
+    finally:
+        window.close()
+
+
+def _partial_strike_pdf(tmp_path):
+    """A line struck on the outer words but NOT the middle word 'SKIP'."""
+    import pymupdf
+
+    from pdfcore.document import PdfDocument
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    blank = tmp_path / "blank.pdf"
+    d = pymupdf.open()
+    d.new_page()
+    d.save(str(blank))
+    d.close()
+    out = tmp_path / "partial.pdf"
+    struck = TextStyle(code="helv", size=11.0, strike=True)
+    plain = TextStyle(code="helv", size=11.0)
+    with PdfDocument.open(blank) as doc:
+        doc.insert_runs(
+            0,
+            (100.0, 200.0),
+            [StyledRun("keep ", struck), StyledRun("SKIP", plain), StyledRun(" keep", struck)],
+        )
+        doc.save(str(out))
+    return out
+
+
+def test_reedit_partial_strike_shows_unruled_word_in_editor(qapp, tmp_path):
+    """THE reported quirk: editing a sentence struck on only some words re-opened
+    with the whole line struck (so a further edit re-applied strike to the word
+    the user had cleared). The editor now shows exactly the ruled words ruled."""
+    window = MainWindow()
+    try:
+        window.open_path(_partial_strike_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 130.0, 197.0)
+        assert para is not None
+        view._begin_paragraph_edit(0, para)
+        pieces = [(t, f.fontStrikeOut()) for t, f in view._para_editor._pieces() if t.strip()]
+        # The cleared word is its own, UNstruck piece; the outer words are struck.
+        assert any(t.strip() == "SKIP" and not st for t, st in pieces)
+        assert any("keep" in t and st for t, st in pieces)
+        assert not any("SKIP" in t and st for t, st in pieces)  # never struck-through
+    finally:
+        window.close()
+
+
+def test_move_preserves_rule_on_the_text(qapp, tmp_path):
+    """User report: moving a text box cleared its underline/strikethrough. A
+    move rebuilds runs via _runs_from_paragraph, which must carry the rules."""
+    window = MainWindow()
+    try:
+        window.open_path(_ruled_pdf(tmp_path, strike=True))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 130.0, 197.0)
+
+        runs = view._runs_from_paragraph(para)
+        assert runs and all(r.style.strike for r in runs if r.text.strip())
+
+        def strokes():
+            return sum(
+                1
+                for p in view.document._doc[0].get_drawings()
+                if len(p.get("items", ())) == 1 and p["items"][0][0] == "l"
+            )
+
+        assert strokes() == 1
+        view._push_command(
+            "Move",
+            lambda doc: doc.replace_paragraph_runs(0, para, runs, offset=(0.0, 40.0)),
+            ("page", 0),
+        )
+        assert strokes() == 1  # the rule moved WITH the text, not cleared
+        moved = next(s for s in view.document.text_spans(0) if "ruled" in s.text)
+        assert moved.strike
+    finally:
+        window.close()
+
+
+def test_move_preserves_partial_strike(qapp, tmp_path):
+    """A partly-struck line keeps its per-word rules through a move: the runs
+    _runs_from_paragraph builds split by rule_segments."""
+    window = MainWindow()
+    try:
+        window.open_path(_partial_strike_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 130.0, 197.0)
+        runs = view._runs_from_paragraph(para)
+        assert any(r.text.strip() == "SKIP" and not r.style.strike for r in runs)
+        assert any("keep" in r.text and r.style.strike for r in runs)
+    finally:
+        window.close()
+
+
+def test_reedit_ruled_text_noop_does_not_double_rule(qapp, tmp_path):
+    """Opening ruled text and committing unchanged is a no-op — the detected
+    rule must NOT redraw (else a second stroke stacks on every open)."""
+    window = MainWindow()
+    try:
+        window.open_path(_ruled_pdf(tmp_path, underline=True))
+        view = window.active_view
+        view.set_edit_mode(True)
+
+        def strokes():
+            return sum(
+                1
+                for p in view.document._doc[0].get_drawings()
+                if len(p.get("items", ())) == 1 and p["items"][0][0] == "l"
+            )
+
+        assert strokes() == 1
+        for _ in range(3):
+            para = view.document.paragraph_at(0, 130.0, 197.0)
+            view._begin_paragraph_edit(0, para)
+            view._para_editor.commit()  # unchanged
+            assert strokes() == 1  # still one — not redrawn
     finally:
         window.close()
 

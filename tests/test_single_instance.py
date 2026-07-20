@@ -85,6 +85,133 @@ def test_default_key_is_per_user():
     assert default_key().startswith("PDFEditor-SingleInstance-")
 
 
+def test_server_buffers_paths_until_handler_is_set(qapp):
+    """The primary starts listening before its window exists; forwards that
+    arrive early must be buffered and replayed when the handler is attached."""
+    from pdfapp.single_instance import SingleInstanceServer
+
+    server = SingleInstanceServer(key="PDFEditor-Buffer-Test")
+    try:
+        got: list[list[str]] = []
+        server._deliver(["early.pdf"])  # arrives before a handler exists
+        assert got == []  # buffered, not lost
+        server.set_handler(got.append)
+        assert got == [["early.pdf"]]  # replayed on wire-up
+        server._deliver(["later.pdf"])  # now delivered straight through
+        assert got == [["early.pdf"], ["later.pdf"]]
+    finally:
+        server.close()
+
+
+def test_acquire_is_primary_when_alone_and_holds_the_lock(qapp, tmp_path):
+    """With no primary running, acquire_or_forward elects THIS process: a
+    listening server plus the held election lock (so a racer can't also win)."""
+    import os
+
+    from PySide6.QtCore import QLockFile
+
+    from pdfapp import single_instance
+
+    key = f"PDFEditor-Elect-Alone-{os.getpid()}"
+    lock_path = single_instance._lock_path(key)
+    if os.path.exists(lock_path):
+        os.remove(lock_path)
+    server = single_instance.acquire_or_forward(["a.pdf"], key=key)
+    try:
+        assert server is not None
+        assert server.is_listening
+        # The election lock is held: a second QLockFile on the same path fails.
+        other = QLockFile(lock_path)
+        assert not other.tryLock(0)
+    finally:
+        if server is not None:
+            server.close()
+
+
+def _run_election(n: int, key: str, outdir: Path) -> subprocess.CompletedProcess:
+    """Spawn ``n`` racing launches; each writes its verdict into ``outdir``."""
+    env = {**os.environ, "PYTHONPATH": _SRC, "QT_QPA_PLATFORM": "offscreen"}
+    procs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "election",
+                key,
+                f"C:/file{i}.pdf",
+                str(outdir),
+                str(n),
+            ],
+            env=env,
+        )
+        for i in range(n)
+    ]
+    for proc in procs:
+        proc.wait(timeout=40)
+    return procs  # type: ignore[return-value]
+
+
+def test_simultaneous_launches_elect_a_single_primary(tmp_path):
+    """The core fix: N near-simultaneous launches (what Explorer does for a
+    multi-file "Open") converge on ONE primary, and every file reaches it —
+    instead of each spawning its own window."""
+    key = f"PDFEditor-Election-{os.getpid()}"
+    outdir = tmp_path / "verdicts"
+    outdir.mkdir()
+    n = 5
+    _run_election(n, key, outdir)
+
+    verdicts = [p.read_text(encoding="utf-8") for p in outdir.glob("*.txt")]
+    assert len(verdicts) == n, verdicts
+    primaries = [v for v in verdicts if v.startswith("PRIMARY")]
+    secondaries = [v for v in verdicts if v.startswith("SECONDARY")]
+    assert len(primaries) == 1, f"expected exactly one primary, got {verdicts}"
+    assert len(secondaries) == n - 1
+    # The one primary collected EVERY file (its own + all forwards).
+    collected = set(primaries[0].splitlines()[1:])
+    assert collected == {f"C:/file{i}.pdf" for i in range(n)}, collected
+
+
+def _election_worker(key: str, myfile: str, outdir: str, expected: int) -> None:
+    """One racing launch: elect, then (if primary) collect all forwards.
+
+    Writes ``PRIMARY\\n<file>\\n...`` or ``SECONDARY`` to ``<outdir>/<pid>.txt``.
+    ``os._exit`` skips Qt teardown so a real success never turns into a spurious
+    non-zero exit (same rationale as the roundtrip harness).
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from pdfapp import single_instance
+
+    _app = QApplication.instance() or QApplication([])  # noqa: F841 - loop needs it
+    server = single_instance.acquire_or_forward([myfile], key=key)
+    out = os.path.join(outdir, f"{os.getpid()}.txt")
+    if server is None:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write("SECONDARY")
+        os._exit(0)
+
+    collected = [myfile]
+    loop = QEventLoop()
+
+    def on_paths(paths: list[str]) -> None:
+        collected.extend(paths)
+        if len(collected) >= expected:
+            loop.quit()
+
+    server.set_handler(on_paths)
+    guard = QTimer()
+    guard.setSingleShot(True)
+    guard.timeout.connect(loop.quit)
+    guard.start(15000)
+    loop.exec()
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write("PRIMARY\n" + "\n".join(collected))
+    os._exit(0)
+
+
 def _roundtrip_main(expected: list[str]) -> None:
     """Run a primary server + a threaded secondary forward in THIS process.
 
@@ -135,3 +262,5 @@ def _roundtrip_main(expected: list[str]) -> None:
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "roundtrip":
         _roundtrip_main(sys.argv[2:])
+    elif len(sys.argv) >= 6 and sys.argv[1] == "election":
+        _election_worker(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))

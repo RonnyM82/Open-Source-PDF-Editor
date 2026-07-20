@@ -62,6 +62,7 @@ def test_style_controls_keep_nofocus_with_icons(qapp):
         window._bold_action,
         window._italic_action,
         window._underline_action,
+        window._strike_action,
         window._super_action,
         window._sub_action,
     ):

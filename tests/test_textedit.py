@@ -1683,6 +1683,45 @@ def test_insert_underlined_draws_line_under_baseline(quote_pdf, tmp_path):
     assert p2[1] > p1[1] + 20  # spans the text width
 
 
+def test_insert_strikethrough_draws_line_through_text(quote_pdf, tmp_path):
+    out = tmp_path / "struck.pdf"
+    items_before = _drawing_items(quote_pdf.path)
+    with PdfDocument.open(quote_pdf.path) as doc:
+        doc.insert_text(
+            0,
+            (200.0, 480.0),
+            "struck words",
+            style=TextStyle(size=11.0, strike=True),
+        )
+        doc.save(out)
+    new_items = _drawing_items(out) - items_before
+    lines = [it for it in new_items if it[0] == "l"]
+    assert lines, "no strikethrough drawn"
+    # The strike crosses the glyphs ABOVE the 480 baseline (~0.30 x size).
+    (_kind, p1, p2) = lines[0]
+    assert p1[2] == pytest.approx(480.0 - 3.3, abs=0.8)  # ("P", x, y)
+    assert p1[1] == pytest.approx(200.0, abs=1.5)
+    assert p2[1] > p1[1] + 20  # spans the text width
+
+
+def test_insert_underline_and_strike_draw_two_rules(quote_pdf, tmp_path):
+    """Both rules coexist: one below the baseline, one across it."""
+    out = tmp_path / "both.pdf"
+    items_before = _drawing_items(quote_pdf.path)
+    with PdfDocument.open(quote_pdf.path) as doc:
+        doc.insert_text(
+            0,
+            (200.0, 480.0),
+            "both rules",
+            style=TextStyle(size=11.0, underline=True, strike=True),
+        )
+        doc.save(out)
+    lines = [it for it in (_drawing_items(out) - items_before) if it[0] == "l"]
+    assert len(lines) == 2
+    ys = sorted(p1[2] for (_k, p1, _p2) in lines)
+    assert ys[0] < 480.0 < ys[1]  # strike above the baseline, underline below
+
+
 def test_insert_superscript_and_subscript(quote_pdf, tmp_path):
     out = tmp_path / "scripts.pdf"
     with PdfDocument.open(quote_pdf.path) as doc:
@@ -2189,3 +2228,152 @@ def test_wide_gridline_in_underline_zone_survives_cleanup(tmp_path):
         assert len(remaining) == 1  # the gridline survives, the underline died
         (p1, p2) = remaining[0]
         assert abs(p2.x - p1.x) > 400  # and it IS the gridline
+
+
+def test_deleting_struck_text_removes_drawn_strike(tmp_path):
+    """Strikethrough is drawn line-art (like underline) that the text redaction
+    preserves — the edit/delete op must clean up its own strike strokes too."""
+    src = _underlined_insert_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, strike=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("struck out words", style)])
+        assert len(_line_strokes(doc)) == 1  # the strike was drawn
+        para = doc.paragraph_at(0, 130.0, 197.0)
+        assert para is not None and "struck out" in para.text
+
+        doc.replace_paragraph(0, para, "")  # the delete op (emptied commit)
+        assert _line_strokes(doc) == []  # no orphaned strike
+        assert all("struck" not in s.text for s in doc.text_spans(0))
+
+
+def test_wide_gridline_in_strike_zone_survives_cleanup(tmp_path):
+    """A table border crossing THROUGH the text (at the strike height) must NOT
+    be eaten by the strike cleanup — it is wider than the member span, so it is
+    never a candidate (the same do-no-harm rule that protects underlines)."""
+    # 11pt strike sits ~3.3pt above the 200 baseline; the gridline at y=196.7
+    # is inside the cleanup's strike zone but spans the page.
+    src = _underlined_insert_pdf(tmp_path, gridline=((50.0, 196.7), (500.0, 196.7)))
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, strike=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("over the line", style)])
+        assert len(_line_strokes(doc)) == 2  # gridline + strike
+        para = doc.paragraph_at(0, 120.0, 197.0)
+        doc.replace_paragraph(0, para, "")
+        remaining = _line_strokes(doc)
+        assert len(remaining) == 1  # the gridline survives, the strike died
+        (p1, p2) = remaining[0]
+        assert abs(p2.x - p1.x) > 400  # and it IS the gridline
+
+
+# --- rule detection from drawn strokes (2026-07-20 re-edit fix) --------------
+
+
+def test_extract_detects_inserted_underline(tmp_path):
+    """A drawn underline reads back as TextSpan.underline, so re-editing the
+    text can show and keep the rule (user report: it vanished on re-edit)."""
+    src = _underlined_insert_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, underline=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("underlined words", style)])
+        span = next(s for s in doc.text_spans(0) if "underlined" in s.text)
+        assert span.underline
+        assert not span.strike
+
+
+def test_extract_detects_inserted_strike(tmp_path):
+    src = _underlined_insert_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, strike=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("struck words", style)])
+        span = next(s for s in doc.text_spans(0) if "struck" in s.text)
+        assert span.strike
+        assert not span.underline
+
+
+def test_extract_ignores_wide_gridline_as_rule(tmp_path):
+    """A table border wider than the text must NOT read as an underline — the
+    same do-no-harm width filter the stroke cleanup uses."""
+    # The gridline sits in the underline zone (~0.9pt below the 200 baseline)
+    # but spans the whole page, so it is wider than the member span.
+    src = _underlined_insert_pdf(tmp_path, gridline=((50.0, 200.9), (500.0, 200.9)))
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0)  # plain — no drawn rule
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("plain words", style)])
+        span = next(s for s in doc.text_spans(0) if "plain" in s.text)
+        assert not span.underline
+        assert not span.strike
+
+
+def test_paragraph_spans_carry_detected_rule(tmp_path):
+    """paragraph_at builds spans the SAME way, so a re-edited paragraph's
+    members carry the detected rule (the editor's prefill path)."""
+    src = _underlined_insert_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, underline=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("underlined para", style)])
+        para = doc.paragraph_at(0, 130.0, 197.0)
+        assert para is not None
+        assert all(s.underline for s in para.spans if s.text.strip())
+
+
+def test_detected_underline_survives_a_real_reedit(tmp_path):
+    """Round-trip: an underline detected on open, carried into replacement
+    runs, is redrawn on commit — the fix for the vanish-on-edit report."""
+    src = _underlined_insert_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        style = TextStyle(code="helv", size=11.0, underline=True)
+        doc.insert_runs(0, (100.0, 200.0), [StyledRun("first ruled line", style)])
+        para = doc.paragraph_at(0, 130.0, 197.0)
+        # Re-insert carrying the DETECTED rule (what the UI prefill does).
+        assert para.spans[0].underline
+        reused = TextStyle(code="helv", size=11.0, underline=para.spans[0].underline)
+        doc.replace_paragraph_runs(0, para, [StyledRun("kept", reused)])  # short: one line
+        assert len(_line_strokes(doc)) == 1  # rule kept, not doubled or dropped
+        span = next(s for s in doc.text_spans(0) if "kept" in s.text)
+        assert span.underline
+
+
+def _partial_strike_pdf(tmp_path, name="partial.pdf"):
+    """A line struck on the outer words but NOT the middle word 'SKIP'."""
+    blank = _underlined_insert_pdf(tmp_path, name="blank_" + name)
+    out = tmp_path / name
+    struck = TextStyle(code="helv", size=11.0, strike=True)
+    plain = TextStyle(code="helv", size=11.0)
+    with PdfDocument.open(blank) as doc:
+        doc.insert_runs(
+            0,
+            (100.0, 200.0),
+            [StyledRun("keep ", struck), StyledRun("SKIP", plain), StyledRun(" keep", struck)],
+        )
+        doc.save(out)
+    return out
+
+
+def test_partial_strike_splits_into_rule_segments(tmp_path):
+    """A line struck on only some words re-extracts with the UNruled word in
+    its own segment — so re-editing shows exactly those words ruled, not the
+    whole line (user report: a partial strike re-applied across everything)."""
+    with PdfDocument.open(_partial_strike_pdf(tmp_path)) as doc:
+        span = next(s for s in doc.text_spans(0) if "SKIP" in s.text)
+        assert span.strike  # coarse: SOME of it is struck
+        assert "".join(t for t, _u, _s in span.rule_segments) == span.text  # exact
+        struck_text = "".join(t for t, _u, s in span.rule_segments if s)
+        plain_text = "".join(t for t, _u, s in span.rule_segments if not s)
+        assert "SKIP" in plain_text and "SKIP" not in struck_text
+        assert "keep" in struck_text
+
+
+def test_partial_strike_survives_reedit_via_segments(tmp_path):
+    """Rebuilding runs from the detected segments (what the UI commit does) and
+    re-editing keeps the middle word CLEAR — it is not re-struck."""
+    with PdfDocument.open(_partial_strike_pdf(tmp_path)) as doc:
+        para = doc.paragraph_at(0, 130.0, 197.0)
+        span = para.spans[0]
+        runs = [
+            StyledRun(t, TextStyle(code="helv", size=11.0, strike=s))
+            for t, _u, s in span.rule_segments
+        ]
+        doc.replace_paragraph_runs(0, para, runs)
+        span2 = next(s for s in doc.text_spans(0) if "SKIP" in s.text)
+        plain2 = "".join(t for t, _u, s in span2.rule_segments if not s)
+        assert "SKIP" in plain2  # the cleared word stayed cleared through the edit

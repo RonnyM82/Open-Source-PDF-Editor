@@ -22,6 +22,7 @@ launch starts dark.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 
 from PySide6.QtGui import QBrush, QColor
@@ -146,6 +147,29 @@ _mode: str = DARK
 _callbacks: list[Callable[[str], None]] = []
 
 
+def _apply_stylesheet_resilient(app: QApplication, theme_file: str, invert: bool) -> None:
+    """``apply_stylesheet`` with a small retry on the concurrent-cache race.
+
+    qt-material regenerates icon SVGs by ``rmtree`` + recreate of a SHARED
+    ``~/.qt_material/<parent>`` dir; two processes theming at once can have one
+    delete the dir mid-write of the other → ``FileNotFoundError`` (a real crash
+    seen when several files were opened at once). The single-instance guard now
+    means only the primary themes in the normal flow, so this is just insurance
+    for the deliberate multi-window (``PDF_EDITOR_NO_SINGLE_INSTANCE``) case — a
+    couple of retries let the racing rebuild finish. A genuinely broken bundle
+    still fails: the retries exhaust and re-raise, and the empty-stylesheet
+    check in the caller stays loud."""
+    attempts = 3
+    for i in range(attempts):
+        try:
+            apply_stylesheet(app, theme=theme_file, invert_secondary=invert)
+            return
+        except OSError:  # concurrent qt-material cache rebuild — transient
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05 * (i + 1))
+
+
 def apply_theme(app: QApplication, mode: str = DARK) -> None:
     """Apply the qt-material theme for ``mode`` app-wide and notify subscribers.
 
@@ -159,7 +183,7 @@ def apply_theme(app: QApplication, mode: str = DARK) -> None:
     global _mode
     theme_file, invert = _THEMES[mode]  # KeyError on unknown mode is deliberate
     app.setStyleSheet("")  # so the check below sees THIS apply, not residue
-    apply_stylesheet(app, theme=theme_file, invert_secondary=invert)
+    _apply_stylesheet_resilient(app, theme_file, invert)
     if not app.styleSheet():
         raise RuntimeError(
             f"qt-material produced no stylesheet for {theme_file!r} — "

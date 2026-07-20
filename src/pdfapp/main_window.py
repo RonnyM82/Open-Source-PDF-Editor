@@ -8,6 +8,8 @@ reflects that view's state in the toolbar and title via `_sync_chrome()`.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -76,6 +78,8 @@ def _flag_format(kind: str, on: bool) -> QTextCharFormat:
         fmt.setFontItalic(on)
     elif kind == "underline":
         fmt.setFontUnderline(on)
+    elif kind == "strikethrough":
+        fmt.setFontStrikeOut(on)
     return fmt
 
 
@@ -172,6 +176,11 @@ class MainWindow(QMainWindow):
         self._open_action = QAction("&Open…", self)
         self._open_action.setShortcut(QKeySequence.StandardKey.Open)
         self._open_action.triggered.connect(self.open_file_dialog)
+
+        self._new_window_action = QAction("New &Window", self)
+        self._new_window_action.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        self._new_window_action.setToolTip("Open a separate, independent window (Ctrl+Shift+N)")
+        self._new_window_action.triggered.connect(self.new_window)
 
         self._merge_action = QAction("&Merge PDFs…", self)
         self._merge_action.triggered.connect(self.merge_documents)
@@ -355,6 +364,7 @@ class MainWindow(QMainWindow):
         # (glyph colour follows the mode). The style toolbar extends this map.
         self._icon_keys: dict[QAction, str] = {
             self._open_action: "open",
+            self._new_window_action: "new_window",
             self._merge_action: "merge",
             self._split_action: "split",
             self._save_action: "save",
@@ -440,6 +450,8 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self._open_action)
+        file_menu.addAction(self._new_window_action)
+        file_menu.addSeparator()
         file_menu.addAction(self._save_action)
         file_menu.addAction(self._save_as_action)
         file_menu.addSeparator()
@@ -484,8 +496,12 @@ class MainWindow(QMainWindow):
         self._tools_menu = self.menuBar().addMenu("&Tools")
         self._tools_menu.addAction(self._extract_text_action)
 
-        # Populated from the open tabs by _rebuild_window_menu().
-        self._window_menu = self.menuBar().addMenu("&Window")
+        # Lists the open document TABS of THIS window (populated by
+        # _rebuild_window_menu). Named "Documents", not "Window": with File →
+        # New Window opening a real separate window, a "Window" menu that only
+        # switched tabs read as contradictory (user feedback). The attribute
+        # keeps its name — tests and the rebuild helper reference it.
+        self._window_menu = self.menuBar().addMenu("&Documents")
 
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction(self._gestures_action)
@@ -558,7 +574,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
     def _build_style_toolbar(self) -> None:
-        """The text-style toolbar: font, size, bold, underline, colour, scripts.
+        """The text-style toolbar: font, size, bold, underline, strike, colour, scripts.
 
         Drives inserted/replacement text. Opening a span/paragraph editor
         populates it from the clicked text; commit applies the (possibly
@@ -612,6 +628,13 @@ class MainWindow(QMainWindow):
         self._underline_action.setShortcut(QKeySequence.StandardKey.Underline)
         bar.addAction(self._underline_action)
 
+        self._strike_action = QAction("Strikethrough", self)
+        self._strike_action.setCheckable(True)
+        self._strike_action.setToolTip(
+            "Strikethrough (drawn as a line; PDF has no strikethrough fonts)"
+        )
+        bar.addAction(self._strike_action)
+
         self._super_action = QAction("Superscript", self)
         self._super_action.setCheckable(True)
         self._super_action.setToolTip("Superscript")
@@ -637,6 +660,7 @@ class MainWindow(QMainWindow):
                 self._bold_action: "bold",
                 self._italic_action: "italic",
                 self._underline_action: "underline",
+                self._strike_action: "strikethrough",
                 self._super_action: "superscript",
                 self._sub_action: "subscript",
             }
@@ -650,6 +674,7 @@ class MainWindow(QMainWindow):
             self._bold_action,
             self._italic_action,
             self._underline_action,
+            self._strike_action,
             self._super_action,
             self._sub_action,
         )
@@ -674,6 +699,9 @@ class MainWindow(QMainWindow):
         )
         self._underline_action.toggled.connect(
             lambda on: self._apply_to_selection(_flag_format("underline", on))
+        )
+        self._strike_action.toggled.connect(
+            lambda on: self._apply_to_selection(_flag_format("strikethrough", on))
         )
         self._super_action.toggled.connect(lambda _on: self._apply_script_to_selection())
         self._sub_action.toggled.connect(lambda _on: self._apply_script_to_selection())
@@ -787,12 +815,14 @@ class MainWindow(QMainWindow):
             size=float(self._size_spin.value()),
             color=color,
             underline=self._underline_action.isChecked(),
+            strike=self._strike_action.isChecked(),
             script=script,
         )
         preview = QFont(self._font_combo.currentFont())
         preview.setBold(bold)
         preview.setItalic(italic)
         preview.setUnderline(style.underline)
+        preview.setStrikeOut(style.strike)
         return style, preview
 
     def _set_size_field(self, size) -> None:
@@ -815,6 +845,7 @@ class MainWindow(QMainWindow):
             self._bold_action.setChecked(bool(fmt.get("bold")))
             self._italic_action.setChecked(bool(fmt.get("italic")))
             self._underline_action.setChecked(bool(fmt.get("underline")))
+            self._strike_action.setChecked(bool(fmt.get("strike")))
             # Scripts and colour follow the SAME rules (user request,
             # 2026-07-18): uniform selection shows its state, mixed (None)
             # unchecks both script toggles / neutralises the swatch.
@@ -843,6 +874,7 @@ class MainWindow(QMainWindow):
             "bold": self._bold_action.isChecked(),
             "italic": self._italic_action.isChecked(),
             "underline": self._underline_action.isChecked(),
+            "strike": self._strike_action.isChecked(),
             "script": script,
             "size": float(self._size_spin.value()),
             "family": self._font_combo.currentFont().family(),
@@ -866,6 +898,7 @@ class MainWindow(QMainWindow):
             self._bold_action.setChecked(style["bold"])
             self._italic_action.setChecked(style["italic"])
             self._underline_action.setChecked(style["underline"])
+            self._strike_action.setChecked(style["strike"])
             self._super_action.setChecked(style["script"] == SCRIPT_SUPER)
             self._sub_action.setChecked(style["script"] == SCRIPT_SUB)
             self._set_size_field(style["size"])
@@ -900,8 +933,11 @@ class MainWindow(QMainWindow):
                 (info.color >> 16) & 255, (info.color >> 8) & 255, info.color & 255
             )
             self._update_color_swatch()
-            # Underline/scripts are not detectable from extracted text.
-            self._underline_action.setChecked(False)
+            # Underline/strike ARE detectable (drawn rules found at extraction
+            # — TextSpan.underline/strike); a Paragraph carries no such attr, so
+            # getattr falls back to unchecked. Scripts stay undetectable.
+            self._underline_action.setChecked(bool(getattr(info, "underline", False)))
+            self._strike_action.setChecked(bool(getattr(info, "strike", False)))
             self._super_action.setChecked(False)
             self._sub_action.setChecked(False)
         finally:
@@ -917,11 +953,38 @@ class MainWindow(QMainWindow):
 
     # --- open flow ------------------------------------------------------
     def open_file_dialog(self) -> None:
-        path_str, _ = QFileDialog.getOpenFileName(
+        # getOpenFileNames (plural): ctrl/shift-select several PDFs and they all
+        # open as tabs, matching drag-drop and multi-file "Open" from Explorer.
+        paths, _ = QFileDialog.getOpenFileNames(
             self, "Open PDF", "", "PDF files (*.pdf);;All files (*)"
         )
-        if path_str:
+        for path_str in paths:
             self.open_path(Path(path_str))
+
+    @staticmethod
+    def _new_window_command() -> tuple[list[str], dict[str, str]]:
+        """Argv + env to launch a SEPARATE, independent app window.
+
+        The child opts out of single-instance (``PDF_EDITOR_NO_SINGLE_INSTANCE``)
+        so it gets its own window instead of forwarding a bare launch to us — the
+        deliberate multi-window path. Frozen: re-run the packaged exe; from
+        source: ``python -m pdfapp`` with ``src`` on ``PYTHONPATH`` so the child
+        can import the package even when it was only on the parent's sys.path.
+        """
+        env = {**os.environ, "PDF_EDITOR_NO_SINGLE_INSTANCE": "1"}
+        if getattr(sys, "frozen", False):
+            return [sys.executable], env
+        src = str(Path(__file__).resolve().parents[1])  # .../src
+        env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+        return [sys.executable, "-m", "pdfapp"], env
+
+    def new_window(self) -> None:
+        """Open a fresh, independent window (a new process). File → New Window."""
+        args, env = self._new_window_command()
+        try:
+            subprocess.Popen(args, env=env)  # noqa: S603 - fixed argv, our own exe
+        except OSError as exc:
+            self.statusBar().showMessage(f"Couldn't open a new window: {exc}", 8000)
 
     def open_path(self, path: Path) -> None:
         # Focus an already-open tab for the same file rather than duplicating it.

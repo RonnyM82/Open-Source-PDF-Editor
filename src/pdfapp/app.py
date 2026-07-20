@@ -100,41 +100,56 @@ def _run_ocr_smoke(pdf_path: str) -> int:
     return 0 if result.startswith("OCR OK") else 1
 
 
+def _apply_theme_and_icon(app: QApplication) -> None:
+    """Central theme + app icon. The frozen-build smoke fails loudly here if
+    qt-material's data files are missing (apply_theme raises)."""
+    theme.apply_theme(app)
+    # Frozen-safe resource lookup so the bundled PNG is found in the packaged
+    # .exe, not just from source (window title bar + Windows taskbar icon).
+    app.setWindowIcon(QIcon(str(resource_path("assets/icon.png"))))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     app = QApplication.instance() or QApplication(argv)
     app.setApplicationName("PDF Editor")
-    # Central theme, applied before any window exists (both the smoke branch
-    # and the real UI go through it — the frozen-build smoke therefore fails
-    # loudly if qt-material's data files are missing from the bundle).
-    theme.apply_theme(app)
-    # App icon (window title bar + Windows taskbar). Route through the
-    # frozen-safe resource helper so the bundled PNG is found in the packaged
-    # .exe, not just when running from source.
-    app.setWindowIcon(QIcon(str(resource_path("assets/icon.png"))))
 
     smoke_path = os.environ.get("PDF_EDITOR_SMOKE")
     if smoke_path:
+        _apply_theme_and_icon(app)
         MainWindow()  # exercise widget construction in the frozen build
         return _run_smoke(smoke_path)
 
     ocr_smoke_path = os.environ.get("PDF_EDITOR_OCR_SMOKE")
     if ocr_smoke_path:
+        _apply_theme_and_icon(app)
         MainWindow()  # widget construction must also work in this mode
         return _run_ocr_smoke(ocr_smoke_path)
 
     # Files passed on the command line (ignore Qt/option-style args). Opening a
-    # PDF from Explorer / "Open with" launches us as `pdf-editor.exe "<file>"`.
+    # PDF from Explorer / "Open with" launches us as `pdf-editor.exe "<file>"`;
+    # selecting several files launches ONE such process PER file, all at once.
     file_args = [a for a in argv[1:] if not a.startswith("-")]
 
-    # Single instance: if the app is already running, hand our files to it (they
-    # open as tabs in the existing window) and exit — no second process. Opt out
-    # with PDF_EDITOR_NO_SINGLE_INSTANCE (e.g. to run two independent windows).
+    # Single instance FIRST, before the theme or any window: if another instance
+    # owns (or is racing to own) the UI, hand it our files — they open as tabs in
+    # the ONE window — and exit. Electing the primary up front is what makes a
+    # multi-file "Open" land in a single window AND keeps duplicate launches from
+    # concurrently rebuilding qt-material's shared cache (that crash is the
+    # reported symptom). Opt out with PDF_EDITOR_NO_SINGLE_INSTANCE to run
+    # independent windows.
     from pdfapp import single_instance
 
     use_single_instance = "PDF_EDITOR_NO_SINGLE_INSTANCE" not in os.environ
-    if use_single_instance and single_instance.try_forward_to_running(file_args):
-        return 0
+    instance_server = None
+    if use_single_instance:
+        instance_server = single_instance.acquire_or_forward(file_args)
+        if instance_server is None:
+            return 0  # secondary: forwarded to the primary, exit before theming
+
+    # We own the UI (primary, or single-instance disabled): now it is safe to
+    # theme and build the window — no other duplicate launch is doing the same.
+    _apply_theme_and_icon(app)
 
     # Crash + hang self-logging (real UI only — the smokes above stay pure).
     # Captures the exact stack to a log file if the app wedges or faults in the
@@ -144,18 +159,14 @@ def main(argv: list[str] | None = None) -> int:
     diagnostics.install(app)
 
     window = MainWindow()
+    # Wire the (already-listening) server to the window now that it exists;
+    # any forward that arrived during startup was buffered and replays here.
+    if instance_server is not None:
+        instance_server.set_handler(window.handle_external_open)
     window.show()
 
     for arg in file_args:
         window.open_path(Path(arg))
-
-    # Become the primary listener so later launches forward here. Held until
-    # app.exec() returns (a garbage-collected server would stop listening).
-    instance_server = (
-        single_instance.SingleInstanceServer(window.handle_external_open)
-        if use_single_instance
-        else None
-    )
 
     exit_code = app.exec()
     if instance_server is not None:

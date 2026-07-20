@@ -98,7 +98,7 @@ class DocumentView(QWidget):
     # so the window can reflect its style in the style toolbar.
     styleContextChanged = Signal(object)
     # The open editor's selection/caret format for the toolbar: a dict with
-    # "size" (float | None), "bold"/"italic"/"underline" (bool | None),
+    # "size" (float | None), "bold"/"italic"/"underline"/"strike" (bool | None),
     # "script" (SCRIPT_* | None) and "color" (sRGB int | None) of the editor
     # selection. None = MIXED — blanks/unchecks/neutralises the control.
     selectionFormatChanged = Signal(object)
@@ -798,7 +798,7 @@ class DocumentView(QWidget):
         self._edit_open_zoom = self._canvas.zoom
         base_font = self._editor_font_for(span)
         self._editor.open_pieces(
-            rect, [(span.text, self._char_format_for(span))], base_font, select_all=True
+            rect, self._pieces_from_span(span), base_font, select_all=True
         )
         self._edit_open_sig = self._pieces_signature(self._editor)
 
@@ -813,7 +813,32 @@ class DocumentView(QWidget):
         fmt.setProperty(PT_PROPERTY, float(span.size))
         color = span.color
         fmt.setForeground(QColor((color >> 16) & 255, (color >> 8) & 255, color & 255))
+        # Underline/strike are drawn rules, detected geometrically at
+        # extraction (TextSpan.underline/strike) — carry the COARSE state here
+        # so re-editing ruled text shows the rule and the toggle tracks it. The
+        # per-run split (partly-ruled lines) is applied by _pieces_from_span.
+        # Paragraph (the empty-lines fallback) has no such attrs; getattr keeps
+        # that path safe.
+        fmt.setFontUnderline(bool(getattr(span, "underline", False)))
+        fmt.setFontStrikeOut(bool(getattr(span, "strike", False)))
         return fmt
+
+    def _pieces_from_span(self, span: TextSpan) -> list[tuple[str, QTextCharFormat]]:
+        """Editor (text, format) pieces for a span, SPLIT by its per-run
+        ``rule_segments`` so a line ruled on only some words re-opens with
+        exactly those words ruled — not the whole line (user report: editing a
+        partly-struck sentence re-applied the strike across all of it)."""
+        base = self._char_format_for(span)
+        segments = getattr(span, "rule_segments", None)
+        if not segments:
+            return [(span.text, base)]
+        pieces: list[tuple[str, QTextCharFormat]] = []
+        for text, underline, strike in segments:
+            fmt = QTextCharFormat(base)
+            fmt.setFontUnderline(underline)
+            fmt.setFontStrikeOut(strike)
+            pieces.append((text, fmt))
+        return pieces
 
     def _pieces_signature(self, editor) -> tuple:
         """A comparable snapshot of an editor's rich content (no-op detection)."""
@@ -892,6 +917,7 @@ class DocumentView(QWidget):
                         size=max(1.0, size),
                         color=color,
                         underline=fmt.fontUnderline() or font.underline(),
+                        strike=fmt.fontStrikeOut() or font.strikeOut(),
                         script=script,
                     ),
                 )
@@ -911,14 +937,15 @@ class DocumentView(QWidget):
         return round(font.pointSizeF(), 1) if font.pointSizeF() > 0 else 11.0
 
     @staticmethod
-    def _fmt_traits(fmt: QTextCharFormat) -> tuple[bool, bool, bool]:
-        """(bold, italic, underline) of a char format — the SAME predicates
-        the commit conversion uses (_runs_from_pieces)."""
+    def _fmt_traits(fmt: QTextCharFormat) -> tuple[bool, bool, bool, bool]:
+        """(bold, italic, underline, strike) of a char format — the SAME
+        predicates the commit conversion uses (_runs_from_pieces)."""
         font = fmt.font()
         return (
             font.bold() or fmt.fontWeight() >= 600,
             font.italic(),
             fmt.fontUnderline() or font.underline(),
+            fmt.fontStrikeOut() or font.strikeOut(),
         )
 
     @staticmethod
@@ -956,13 +983,14 @@ class DocumentView(QWidget):
         cursor = editor.textCursor()
         if not cursor.hasSelection():
             fmt = cursor.charFormat()
-            bold, italic, underline = self._fmt_traits(fmt)
+            bold, italic, underline, strike = self._fmt_traits(fmt)
             self.selectionFormatChanged.emit(
                 {
                     "size": self._fmt_size_pt(fmt),
                     "bold": bold,
                     "italic": italic,
                     "underline": underline,
+                    "strike": strike,
                     "script": self._fmt_script(fmt),
                     "color": self._fmt_color(fmt),
                 }
@@ -973,16 +1001,18 @@ class DocumentView(QWidget):
         bolds: set[bool] = set()
         italics: set[bool] = set()
         underlines: set[bool] = set()
+        strikes: set[bool] = set()
         scripts: set[int] = set()
         colors: set[int] = set()
         for pos in range(cursor.selectionStart() + 1, cursor.selectionEnd() + 1):
             probe.setPosition(pos)  # charFormat() = format of the char BEFORE pos
             fmt = probe.charFormat()
             sizes.add(self._fmt_size_pt(fmt))
-            bold, italic, underline = self._fmt_traits(fmt)
+            bold, italic, underline, strike = self._fmt_traits(fmt)
             bolds.add(bold)
             italics.add(italic)
             underlines.add(underline)
+            strikes.add(strike)
             scripts.add(self._fmt_script(fmt))
             colors.add(self._fmt_color(fmt))
 
@@ -995,6 +1025,7 @@ class DocumentView(QWidget):
                 "bold": uniform(bolds),
                 "italic": uniform(italics),
                 "underline": uniform(underlines),
+                "strike": uniform(strikes),
                 "script": uniform(scripts),
                 "color": uniform(colors),
             }
@@ -1060,7 +1091,7 @@ class DocumentView(QWidget):
             if i:
                 pieces.append(("\n", QTextCharFormat()))
             for line_span in line:
-                pieces.append((line_span.text, self._char_format_for(line_span)))
+                pieces.extend(self._pieces_from_span(line_span))
         if not pieces:
             pieces = [(para.text, self._char_format_for(para))]
         font = self._editor_font_for(para)
@@ -1996,22 +2027,32 @@ class DocumentView(QWidget):
         self._push_command("Rotate image", op, ("page", page_index))
 
     def _runs_from_paragraph(self, para: Paragraph) -> list[StyledRun]:
-        """The paragraph's own content as engine runs (per-span styles kept)."""
+        """The paragraph's own content as engine runs (per-span styles AND
+        per-run underline/strike kept). Splitting each span by its
+        ``rule_segments`` is what lets a MOVE, group-move or merge preserve
+        the rules — without it a move re-laid the text with no rules (user
+        report: moving a text box cleared its underline/strikethrough)."""
         runs: list[StyledRun] = []
         for i, line in enumerate(para.lines):
             if i:
                 runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
             for line_span in line:
-                runs.append(
-                    StyledRun(
-                        line_span.text,
-                        TextStyle(
-                            code=line_span.base14 or "helv",
-                            size=line_span.size,
-                            color=line_span.color,
-                        ),
-                    )
+                segments = getattr(line_span, "rule_segments", None) or (
+                    (line_span.text, line_span.underline, line_span.strike),
                 )
+                for text, underline, strike in segments:
+                    runs.append(
+                        StyledRun(
+                            text,
+                            TextStyle(
+                                code=line_span.base14 or "helv",
+                                size=line_span.size,
+                                color=line_span.color,
+                                underline=underline,
+                                strike=strike,
+                            ),
+                        )
+                    )
         if not runs:
             runs = [
                 StyledRun(

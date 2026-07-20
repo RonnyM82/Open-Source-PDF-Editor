@@ -71,6 +71,17 @@ class TextSpan:
     # labels run bottom-up = 90). None = an arbitrary angle we refuse to
     # edit (redact band + reinsertion only support quarter turns).
     rotation: int | None = 0
+    # Drawn text rules detected from the page's line-art (underline below the
+    # baseline, strikethrough across it — PDF has no font bit for either).
+    # Detected geometrically at extraction so re-editing ruled text shows and
+    # keeps the rule; see _stroke_on_span / _span_rule_segments. ``underline``/
+    # ``strike`` are the coarse "any part ruled" summary; ``rule_segments`` is
+    # the PER-RUN breakdown — ``((text, underline, strike), ...)`` covering the
+    # whole span in order — so a line ruled on only some words re-opens with
+    # exactly those words ruled (a single tuple when uniform).
+    underline: bool = False
+    strike: bool = False
+    rule_segments: tuple[tuple[str, bool, bool], ...] = ()
 
 
 # Super/subscript have no font variants in PDF: rendered as a size scale plus
@@ -82,6 +93,13 @@ _SCRIPT_SCALE = 0.58
 _SUPER_RISE = 0.35  # of the base size, upward
 _SUB_DROP = 0.15  # of the base size, downward
 
+# Strikethrough, like underline, has no font variant in PDF: it is a drawn
+# vector line ACROSS the text, sitting this fraction of the size ABOVE the
+# baseline (roughly the middle of the x-height). Shared by the layout
+# (_insert_line) and the stroke-cleanup pass (_remove_member_rules) so the
+# rule we draw and the rule we later remove agree.
+_STRIKE_RATIO = 0.30
+
 
 @dataclass(frozen=True)
 class TextStyle:
@@ -91,7 +109,8 @@ class TextStyle:
     subset (unlike automatic matching of existing text, which never embeds;
     an explicit choice can only be honoured by embedding). ``code`` is the
     base-14 fallback used when ``fontfile`` is None. ``underline`` draws a
-    vector line under each inserted line (PDF has no underline fonts).
+    vector line under each inserted line, ``strike`` one across it (PDF has
+    no underline/strikethrough fonts — both are drawn rules).
     """
 
     code: str = "helv"
@@ -99,6 +118,7 @@ class TextStyle:
     size: float = 11.0
     color: int = 0x000000
     underline: bool = False
+    strike: bool = False
     script: int = SCRIPT_NORMAL
 
 
@@ -145,7 +165,7 @@ class StyledRun:
 
     Rich text = a sequence of runs; ``\\n`` inside a run's text is a hard
     line break. The engine lays runs out itself (word wrap, per-run baseline
-    shift/underline) — widths measured with the same font resolution the
+    shift/underline/strike) — widths measured with the same font resolution the
     inserts use, and baselines placed explicitly, so none of the
     ``insert_textbox`` page-state metric problems apply.
     """
@@ -250,17 +270,25 @@ def _insert_line(
         )
         if rc < 1:
             raise ValueError(f"could not place text fragment {frag.text!r}")
-        if frag.style.underline and frag.text.strip():
-            off = shift + max(0.6, _effective_size(frag.style) * 0.08)
+        if frag.text.strip():
             start = frag.x
             end = frag.x + frag.width
-            _draw_underline(
-                page,
-                (origin_x + start * bx + off * dx, baseline_y + start * by + off * dy),
-                (origin_x + end * bx + off * dx, baseline_y + end * by + off * dy),
-                _effective_size(frag.style),
-                frag.style.color,
-            )
+            eff = _effective_size(frag.style)
+            # Underline sits below the (script-shifted) baseline; strikethrough
+            # crosses the text above it. Both are drawn along the run's own axis.
+            for enabled, off in (
+                (frag.style.underline, shift + max(0.6, eff * 0.08)),
+                (frag.style.strike, shift - eff * _STRIKE_RATIO),
+            ):
+                if not enabled:
+                    continue
+                _draw_rule(
+                    page,
+                    (origin_x + start * bx + off * dx, baseline_y + start * by + off * dy),
+                    (origin_x + end * bx + off * dx, baseline_y + end * by + off * dy),
+                    eff,
+                    frag.style.color,
+                )
 
 
 def _runs_have_text(runs: list[StyledRun]) -> bool:
@@ -451,24 +479,32 @@ def _span_from_raw(
     raw: dict,
     embedded_by_font: dict[str, bool],
     rotation: int | None = 0,
+    strokes: Sequence[tuple[pymupdf.Point, pymupdf.Point]] = (),
 ) -> TextSpan:
     font = strip_subset_prefix(raw["font"])
     # Unmatched names default to embedded=True: the conservative branch (flag
     # to the user) rather than a wrong exact-match.
     embedded = embedded_by_font.get(font, True)
     base14 = None if embedded else map_font_to_base14(raw["font"], raw["flags"])
+    bbox = tuple(raw["bbox"])
+    origin = tuple(raw["origin"])
+    size = float(raw["size"])
+    segments = _span_rule_segments(raw, bbox, origin, size, rotation, strokes)
     return TextSpan(
         page_index=page_index,
-        text=raw["text"],
-        bbox=tuple(raw["bbox"]),
-        origin=tuple(raw["origin"]),
+        text=_raw_text(raw),
+        bbox=bbox,
+        origin=origin,
         font=font,
         base14=base14,
-        size=float(raw["size"]),
+        size=size,
         color=int(raw["color"]),
         flags=int(raw["flags"]),
         embedded=embedded,
         rotation=rotation,
+        underline=any(u for _t, u, _s in segments),
+        strike=any(s for _t, _u, s in segments),
+        rule_segments=segments,
     )
 
 
@@ -485,6 +521,7 @@ def extract_spans(doc: pymupdf.Document, page_index: int) -> list[TextSpan]:
     page = doc[page_index]
     embedded_by_font = _embedded_font_map(doc, page_index)
     comment_rects = comments_module.comment_rects(doc, page_index)
+    strokes = _page_line_strokes(page)
 
     def outside_comments(raw: dict) -> bool:
         if not comment_rects:
@@ -494,8 +531,8 @@ def extract_spans(doc: pymupdf.Document, page_index: int) -> list[TextSpan]:
         return not any(r[0] <= cx <= r[2] and r[1] <= cy <= r[3] for r in comment_rects)
 
     return [
-        _span_from_raw(page_index, raw, embedded_by_font, _line_rotation(line))
-        for block in page.get_text("dict")["blocks"]
+        _span_from_raw(page_index, raw, embedded_by_font, _line_rotation(line), strokes)
+        for block in page.get_text("rawdict")["blocks"]
         for line in block.get("lines", ())
         for raw in line["spans"]
         if outside_comments(raw)
@@ -575,7 +612,7 @@ def replace_span_runs(
     page.add_redact_annot(band, fill=fill)
     _apply_text_only_redactions(page)
     _repair_foreign_spans(doc, page_index, foreign, [span.bbox])
-    _remove_member_underlines(page, [span])
+    _remove_member_rules(page, [span])
     comment_guard.restore()
 
     lines = _layout_runs(runs, None)
@@ -633,15 +670,16 @@ def _redact_band(span: TextSpan) -> pymupdf.Rect:
     return pymupdf.Rect(x0 + inset_x, top, x1 - inset_x, bottom)
 
 
-def _draw_underline(
+def _draw_rule(
     page: pymupdf.Page,
     start: tuple[float, float],
     end: tuple[float, float],
     size: float,
     color: int,
 ) -> None:
-    """Draw an underline between two PRE-COMPUTED points (the caller places
-    them along the run's baseline axis — rotation-safe)."""
+    """Draw a text rule (underline or strikethrough) between two PRE-COMPUTED
+    points (the caller places them along the run's baseline axis — the offset
+    from the baseline decides under vs across; rotation-safe)."""
     page.draw_line(
         pymupdf.Point(*start),
         pymupdf.Point(*end),
@@ -663,22 +701,147 @@ def _apply_text_only_redactions(page: pymupdf.Page) -> None:
 # max(0.6, 0.08 × size) along the descender axis), with slack either side.
 _UNDERLINE_ZONE_NEAR = 0.3
 _UNDERLINE_ZONE_SLACK = 1.5
+# Strikethroughs sit _STRIKE_RATIO × size ABOVE the baseline (negative along
+# the descender axis); the same slack tolerates the drawing-vs-detection gap.
+_STRIKE_ZONE_SLACK = 1.5
 
 
-def _remove_member_underlines(page: pymupdf.Page, spans: Sequence[TextSpan]) -> None:
-    """Remove underline strokes previously drawn under the given spans.
+def _stroke_on_span(
+    bbox: tuple[float, float, float, float],
+    origin: tuple[float, float],
+    size: float,
+    rotation: int | None,
+    p1: pymupdf.Point,
+    p2: pymupdf.Point,
+) -> tuple[bool, bool]:
+    """Classify a single-segment stroke ``p1``→``p2`` against a span's geometry.
 
-    Underlines are vector line-art WE draw (``_draw_underline``), and the
-    text redaction deliberately PRESERVES line art (table borders) — so
-    editing or deleting underlined text left its lines behind (user
+    Returns ``(in_underline_zone, in_strike_zone)``: the stroke is parallel to
+    the span's baseline, sits within the span's width (+1 pt — a wider table
+    gridline is excluded), and lies in the underline zone (below the baseline)
+    and/or the strike zone (≈``_STRIKE_RATIO``×size above it). ``(False,
+    False)`` otherwise. The single source of truth shared by rule DETECTION
+    (extraction) and rule REMOVAL (edit/delete cleanup), so what we draw, spot
+    and erase always agree.
+    """
+    rot = rotation if rotation in _BASELINE_DIR else 0
+    bx, by = _BASELINE_DIR[rot]
+    dx, dy = _DESCENDER_DIR[rot]
+    base_d = origin[0] * dx + origin[1] * dy
+    d1 = p1.x * dx + p1.y * dy - base_d
+    d2 = p2.x * dx + p2.y * dy - base_d
+    if abs(d1 - d2) > 0.3:  # not parallel to the baseline
+        return False, False
+    corners = ((bbox[0], bbox[1]), (bbox[2], bbox[3]))
+    b_lo = min(cx * bx + cy * by for cx, cy in corners) - 1.0
+    b_hi = max(cx * bx + cy * by for cx, cy in corners) + 1.0
+    b1 = p1.x * bx + p1.y * by
+    b2 = p2.x * bx + p2.y * by
+    if min(b1, b2) < b_lo or max(b1, b2) > b_hi:
+        return False, False  # wider than the member: a gridline, not our rule
+    mid = (d1 + d2) / 2
+    far = max(0.6, size * 0.08) + _UNDERLINE_ZONE_SLACK
+    in_underline = _UNDERLINE_ZONE_NEAR <= mid <= far
+    in_strike = abs(mid + size * _STRIKE_RATIO) <= _STRIKE_ZONE_SLACK
+    return in_underline, in_strike
+
+
+def _page_line_strokes(page: pymupdf.Page) -> list[tuple[pymupdf.Point, pymupdf.Point]]:
+    """The page's single-segment line paths — the candidate underline/strike
+    rules (the shape :func:`_draw_rule` makes)."""
+    strokes: list[tuple[pymupdf.Point, pymupdf.Point]] = []
+    for path in page.get_drawings():
+        items = path.get("items", ())
+        if len(items) == 1 and items[0][0] == "l":
+            strokes.append((items[0][1], items[0][2]))
+    return strokes
+
+
+def _raw_text(raw: dict) -> str:
+    """A span dict's text: reconstructed from ``chars`` (rawdict) or the
+    ``text`` key (plain dict)."""
+    chars = raw.get("chars")
+    if chars is not None:
+        return "".join(ch["c"] for ch in chars)
+    return raw.get("text", "")
+
+
+def _char_ruled(
+    char_bbox: tuple[float, float, float, float],
+    rotation: int,
+    strokes: Sequence[tuple[pymupdf.Point, pymupdf.Point]],
+) -> bool:
+    """True when a char's baseline-axis CENTRE lies within any of the given
+    strokes' extent. The strokes are already SPAN-qualified (a rule on this
+    span, gridlines filtered by width), so no zone re-check is needed — this
+    only asks *which* characters a rule covers, letting a line ruled on some
+    words re-open with exactly those words ruled."""
+    bx, by = _BASELINE_DIR[rotation]
+    cb = (char_bbox[0] + char_bbox[2]) / 2 * bx + (char_bbox[1] + char_bbox[3]) / 2 * by
+    for p1, p2 in strokes:
+        s1 = p1.x * bx + p1.y * by
+        s2 = p2.x * bx + p2.y * by
+        if min(s1, s2) - 0.5 <= cb <= max(s1, s2) + 0.5:
+            return True
+    return False
+
+
+def _span_rule_segments(
+    raw: dict,
+    bbox: tuple[float, float, float, float],
+    origin: tuple[float, float],
+    size: float,
+    rotation: int | None,
+    strokes: Sequence[tuple[pymupdf.Point, pymupdf.Point]],
+) -> tuple[tuple[str, bool, bool], ...]:
+    """Split one span's text into per-run ``(text, underline, strike)`` tuples.
+
+    Strokes are first qualified against the WHOLE span (``_stroke_on_span`` —
+    a wider gridline is rejected), then each character is tested for coverage
+    (``_char_ruled``). Runs of characters with the same rule state merge, so a
+    uniform span is one tuple and a partly-ruled one is several. Without
+    per-char data (plain dict) it falls back to a single whole-span tuple.
+    """
+    text = _raw_text(raw)
+    rot = rotation if rotation in _BASELINE_DIR else 0
+    ul_strokes: list[tuple[pymupdf.Point, pymupdf.Point]] = []
+    st_strokes: list[tuple[pymupdf.Point, pymupdf.Point]] = []
+    for p1, p2 in strokes:
+        u, s = _stroke_on_span(bbox, origin, size, rotation, p1, p2)
+        if u:
+            ul_strokes.append((p1, p2))
+        if s:
+            st_strokes.append((p1, p2))
+    if not (ul_strokes or st_strokes):
+        return ((text, False, False),)
+    chars = raw.get("chars")
+    if not chars:  # plain dict: no per-char boxes — treat the span uniformly
+        return ((text, bool(ul_strokes), bool(st_strokes)),)
+    segments: list[list] = []
+    for ch in chars:
+        u = _char_ruled(ch["bbox"], rot, ul_strokes)
+        s = _char_ruled(ch["bbox"], rot, st_strokes)
+        if segments and segments[-1][1] == u and segments[-1][2] == s:
+            segments[-1][0] += ch["c"]
+        else:
+            segments.append([ch["c"], u, s])
+    return tuple((t, u, s) for t, u, s in segments)
+
+
+def _remove_member_rules(page: pymupdf.Page, spans: Sequence[TextSpan]) -> None:
+    """Remove underline/strikethrough strokes previously drawn on the given spans.
+
+    Both are vector line-art WE draw (``_draw_rule``), and the text
+    redaction deliberately PRESERVES line art (table borders) — so
+    editing or deleting ruled text left its lines behind (user
     report, 2026-07-18: an emptied text box kept its underlines). A
     candidate stroke is a single-segment line path parallel to a member's
-    baseline, sitting in that member's underline zone, and NO WIDER than
-    the member (+1 pt): a table gridline runs wider, so it is never a
-    candidate — and removal uses ``LINE_ART_REMOVE_IF_COVERED`` with a
-    rect hugging each stroke, so nothing longer than the rect can die.
-    Text and images are untouched (``TEXT_NONE`` / ``IMAGE_NONE``);
-    re-insertion happens AFTER this pass, so fresh underlines survive.
+    baseline, sitting in that member's underline OR strike zone, and NO
+    WIDER than the member (+1 pt): a table gridline runs wider, so it is
+    never a candidate — and removal uses ``LINE_ART_REMOVE_IF_COVERED``
+    with a rect hugging each stroke, so nothing longer than the rect can
+    die. Text and images are untouched (``TEXT_NONE`` / ``IMAGE_NONE``);
+    re-insertion happens AFTER this pass, so fresh rules survive.
     """
     candidates: list[pymupdf.Rect] = []
     for path in page.get_drawings():
@@ -687,24 +850,9 @@ def _remove_member_underlines(page: pymupdf.Page, spans: Sequence[TextSpan]) -> 
             continue
         p1, p2 = items[0][1], items[0][2]
         for span in spans:
-            rotation = span.rotation if span.rotation in _BASELINE_DIR else 0
-            bx, by = _BASELINE_DIR[rotation]
-            dx, dy = _DESCENDER_DIR[rotation]
-            base_d = span.origin[0] * dx + span.origin[1] * dy
-            d1 = p1.x * dx + p1.y * dy - base_d
-            d2 = p2.x * dx + p2.y * dy - base_d
-            if abs(d1 - d2) > 0.3:  # not parallel to the baseline
+            u, s = _stroke_on_span(span.bbox, span.origin, span.size, span.rotation, p1, p2)
+            if not (u or s):
                 continue
-            far = max(0.6, span.size * 0.08) + _UNDERLINE_ZONE_SLACK
-            if not (_UNDERLINE_ZONE_NEAR <= (d1 + d2) / 2 <= far):
-                continue
-            corners = ((span.bbox[0], span.bbox[1]), (span.bbox[2], span.bbox[3]))
-            b_lo = min(cx * bx + cy * by for cx, cy in corners) - 1.0
-            b_hi = max(cx * bx + cy * by for cx, cy in corners) + 1.0
-            b1 = p1.x * bx + p1.y * by
-            b2 = p2.x * bx + p2.y * by
-            if min(b1, b2) < b_lo or max(b1, b2) > b_hi:
-                continue  # wider than the member: a gridline, not our underline
             margin = 0.3 + (path.get("width") or 1.0) / 2
             candidates.append(
                 pymupdf.Rect(
@@ -1032,9 +1180,10 @@ def paragraph_at(
     page = doc[page_index]
     embedded_by_font = _embedded_font_map(doc, page_index)
     keep = _comment_line_filter(doc, page_index)
+    strokes = _page_line_strokes(page)
     # Hit-test in ORIGINAL block/line order — overlap ties (a box's line bbox
     # bleeding into a neighbour's) must resolve exactly as they always did.
-    for block in page.get_text("dict")["blocks"]:
+    for block in page.get_text("rawdict")["blocks"]:
         lines = [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
         hit = None
         for line in lines:
@@ -1049,13 +1198,13 @@ def paragraph_at(
             # MuPDF put its lines in different blocks (E10.7).
             region_lines, _plain = _partition_lines(page, boundaries, keep)
             region = _line_region(hit, boundaries)
-            return _build_paragraph(page_index, region_lines[region], embedded_by_font)
+            return _build_paragraph(page_index, region_lines[region], embedded_by_font, strokes)
         kept = [line for line in lines if not _line_owned(line, boundaries)]
         seed = kept.index(hit)
         unit = next(u for u in _block_units(kept) if seed in u)
         unit_lines = [kept[i] for i in unit]
         run = _pitch_run(unit_lines, unit.index(seed))
-        return _build_paragraph(page_index, [kept[unit[j]] for j in run], embedded_by_font)
+        return _build_paragraph(page_index, [kept[unit[j]] for j in run], embedded_by_font, strokes)
     return None
 
 
@@ -1101,7 +1250,7 @@ def _partition_lines(
     """
     region_lines: dict[int, list[dict]] = {}
     plain_blocks: list[list[dict]] = []
-    for block in page.get_text("dict")["blocks"]:
+    for block in page.get_text("rawdict")["blocks"]:
         lines = [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
         if not boundaries:
             if lines:
@@ -1137,12 +1286,13 @@ def paragraphs_on_page(
     """
     page = doc[page_index]
     embedded_by_font = _embedded_font_map(doc, page_index)
+    strokes = _page_line_strokes(page)
     result: list[Paragraph] = []
     region_lines, plain_blocks = _partition_lines(
         page, boundaries, _comment_line_filter(doc, page_index)
     )
     for region in sorted(region_lines):
-        result.append(_build_paragraph(page_index, region_lines[region], embedded_by_font))
+        result.append(_build_paragraph(page_index, region_lines[region], embedded_by_font, strokes))
     for lines in plain_blocks:
         for unit in _block_units(lines):
             unit_lines = [lines[i] for i in unit]
@@ -1150,7 +1300,9 @@ def paragraphs_on_page(
             while seed < len(unit_lines):
                 run = _pitch_run(unit_lines, seed)
                 result.append(
-                    _build_paragraph(page_index, [unit_lines[i] for i in run], embedded_by_font)
+                    _build_paragraph(
+                        page_index, [unit_lines[i] for i in run], embedded_by_font, strokes
+                    )
                 )
                 seed = run[-1] + 1
     return result
@@ -1219,17 +1371,22 @@ def _pitch_run(lines: list[dict], seed: int, regions: list[int] | None = None) -
 
 
 def _build_paragraph(
-    page_index: int, lines: list[dict], embedded_by_font: dict[str, bool]
+    page_index: int,
+    lines: list[dict],
+    embedded_by_font: dict[str, bool],
+    strokes: Sequence[tuple[pymupdf.Point, pymupdf.Point]] = (),
 ) -> Paragraph:
     line_tuples = tuple(
         tuple(
-            _span_from_raw(page_index, raw, embedded_by_font, _line_rotation(line))
+            _span_from_raw(page_index, raw, embedded_by_font, _line_rotation(line), strokes)
             for raw in line["spans"]
         )
         for line in lines
     )
     spans = tuple(span for line in line_tuples for span in line)
-    text = "\n".join("".join(raw["text"] for raw in line["spans"]) for line in lines)
+    # rawdict spans carry no "text" key — rebuild from the spans we just made
+    # (splitting for rules is disabled here anyway; text is char-identical).
+    text = "\n".join("".join(s.text for s in line) for line in line_tuples)
     bbox = (
         min(s.bbox[0] for s in spans),
         min(s.bbox[1] for s in spans),
@@ -1553,7 +1710,7 @@ def replace_paragraph_runs(
         page.add_redact_annot(band, fill=fill)
     _apply_text_only_redactions(page)
     _repair_foreign_spans(doc, page_index, foreign, member_bboxes)
-    _remove_member_underlines(page, para.spans)
+    _remove_member_rules(page, para.spans)
     comment_guard.restore()
     new_bbox = None
     if has_text:

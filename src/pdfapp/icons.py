@@ -60,6 +60,7 @@ _NAMES = {
     "move_up": "mdi6.arrow-up",
     "move_down": "mdi6.arrow-down",
     "delete_page": "mdi6.delete-outline",
+    "new_window": "mdi6.open-in-new",
     "insert_pages": "mdi6.file-plus-outline",
     "insert_text": "mdi6.text-box-plus-outline",
     "insert_image": "mdi6.image-plus-outline",
@@ -74,6 +75,7 @@ _NAMES = {
     "bold": "mdi6.format-bold",
     "italic": "mdi6.format-italic",
     "underline": "mdi6.format-underline",
+    "strikethrough": "mdi6.format-strikethrough",
     "superscript": "mdi6.format-superscript",
     "subscript": "mdi6.format-subscript",
     # Tools

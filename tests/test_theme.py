@@ -40,6 +40,44 @@ def test_unknown_mode_is_rejected_before_any_styling(theme_app):
     assert app.styleSheet() == ""  # nothing half-applied
 
 
+def test_apply_theme_retries_the_concurrent_cache_race(theme_app, monkeypatch):
+    """qt-material rebuilds a SHARED on-disk icon cache (rmtree + recreate); two
+    processes theming at once can have one delete it mid-write of the other,
+    raising OSError (the reported multi-open crash). apply_theme retries so the
+    transient race doesn't take the app down."""
+    import pdfapp.theme as theme_mod
+
+    app, theme = theme_app
+    real = theme_mod.apply_stylesheet
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:  # first attempt hits the race
+            raise FileNotFoundError("~/.qt_material/theme/active/branch-closed.svg")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(theme_mod, "apply_stylesheet", flaky)
+    theme.apply_theme(app)  # must NOT propagate the transient error
+    assert calls["n"] == 2  # failed once, retried, succeeded
+    assert "pdf-editor-addendum" in app.styleSheet()
+
+
+def test_apply_theme_reraises_a_persistent_error(theme_app, monkeypatch):
+    """A genuinely broken bundle (not a transient race) still fails loudly after
+    the retries exhaust — the frozen-build smoke must not be masked."""
+    import pdfapp.theme as theme_mod
+
+    app, theme = theme_app
+
+    def always_fails(*args, **kwargs):
+        raise FileNotFoundError("missing source svgs")
+
+    monkeypatch.setattr(theme_mod, "apply_stylesheet", always_fails)
+    with pytest.raises(OSError):
+        theme.apply_theme(app)
+
+
 def test_canvas_brush_differs_per_mode_and_follows_current(theme_app):
     app, theme = theme_app
     assert theme.canvas_brush(theme.DARK) != theme.canvas_brush(theme.LIGHT)
