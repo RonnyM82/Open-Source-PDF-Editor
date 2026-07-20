@@ -797,9 +797,7 @@ class DocumentView(QWidget):
         self._edit_open_style = self._current_style()
         self._edit_open_zoom = self._canvas.zoom
         base_font = self._editor_font_for(span)
-        self._editor.open_pieces(
-            rect, self._pieces_from_span(span), base_font, select_all=True
-        )
+        self._editor.open_pieces(rect, self._pieces_from_span(span), base_font, select_all=True)
         self._edit_open_sig = self._pieces_signature(self._editor)
 
     def _char_format_for(self, span: TextSpan | Paragraph) -> QTextCharFormat:

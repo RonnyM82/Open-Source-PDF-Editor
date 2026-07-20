@@ -77,7 +77,8 @@ def test_new_window_action_lives_in_the_file_menu(qapp):
     window = MainWindow()
     try:
         file_menu = next(
-            m for m in window.menuBar().findChildren(type(window._window_menu))
+            m
+            for m in window.menuBar().findChildren(type(window._window_menu))
             if m.title() == "&File"
         )
         assert window._new_window_action in file_menu.actions()
