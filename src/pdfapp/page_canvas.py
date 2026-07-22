@@ -459,13 +459,19 @@ class PageCanvas(QGraphicsView):
         self._resize_anchor = QPointF(anchor_scene[0], anchor_scene[1])
 
     def begin_text_selection(self, sx: float, sy: float) -> None:
-        """Accept the pending plain press as a read-only text-selection drag (X4).
-
-        The view calls this synchronously from its ``selectDragStarted``
-        handler; the canvas then reports live drag positions via
-        ``textSelectMoved`` and the release via ``textSelectFinished``.
+        """Accept the pending plain press as a read-only window/marquee text
+        selection (X4). The view calls this synchronously from its
+        ``selectDragStarted`` handler; the canvas draws a rubber-band rectangle
+        while dragging and reports live positions via ``textSelectMoved`` and
+        the release via ``textSelectFinished`` (the view selects the text
+        inside the rectangle).
         """
         self._text_select_press = QPointF(sx, sy)
+        if self._move_band is None:
+            self._move_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+        anchor = self.mapFromScene(self._text_select_press)
+        self._move_band.setGeometry(QRect(anchor, anchor))
+        self._move_band.show()
 
     # --- hover affordances (U2a) ------------------------------------------
     def set_hover(
@@ -745,9 +751,13 @@ class PageCanvas(QGraphicsView):
             event.accept()
             return
         if self._text_select_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            # Read-only flow selection drag (X4): report the live cursor point;
-            # the view recomputes the word-snapped range and repaints.
+            # Read-only window selection drag (X4): grow the rubber band and
+            # report the live cursor point; the view selects the text inside.
             current = self.mapToScene(event.position().toPoint())
+            if self._move_band is not None:
+                top_left = self.mapFromScene(self._text_select_press)
+                bottom_right = self.mapFromScene(current)
+                self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
             self.textSelectMoved.emit(current.x(), current.y())
             event.accept()
             return
@@ -804,6 +814,8 @@ class PageCanvas(QGraphicsView):
             return
         if self._text_select_press is not None and event.button() == Qt.MouseButton.LeftButton:
             self._text_select_press = None
+            if self._move_band is not None:
+                self._move_band.hide()
             current = self.mapToScene(event.position().toPoint())
             self.textSelectFinished.emit(current.x(), current.y())
             event.accept()
@@ -824,6 +836,8 @@ class PageCanvas(QGraphicsView):
         # single clicks and drags keep their scroll/select behaviour).
         # Ctrl+double-click edits the whole paragraph instead of one span.
         self._text_select_press = None  # a dblclick's release must not clear it (X4)
+        if self._move_band is not None:
+            self._move_band.hide()  # drop any marquee band from the first press
         if self._suppress_dblclick:
             self._suppress_dblclick = False
             event.accept()
@@ -861,7 +875,7 @@ class PageCanvas(QGraphicsView):
             painter.setBrush(strong)
             for hit in self._search_current:
                 painter.drawRect(hit)
-        if self._text_selection_rects:  # read-only flow selection (X4)
+        if self._text_selection_rects:  # read-only window/marquee selection (X4)
             accent = QColor(theme.accent())
             fill = QColor(accent)
             fill.setAlpha(70)
