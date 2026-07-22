@@ -171,14 +171,21 @@ def test_action_indicates_and_gates_per_document(qapp, tmp_path, quote_pdf):
         view, _point = _open(window, tmp_path)
         assert window._dblclick_para_action.isEnabled()
         assert window._dblclick_para_action.isChecked()  # paragraph-first default
-        window._dblclick_para_action.setChecked(False)
-        assert view.dblclick_paragraph is False
 
-        window.open_path(quote_pdf.path)  # second tab: read-only, its own default
+        # A second tab opens read-only: the action gates OFF (disabled). It seeds
+        # the persisted default (still True — nothing was toggled yet).
+        window.open_path(quote_pdf.path)
         assert not window._dblclick_para_action.isEnabled()
-        assert window._dblclick_para_action.isChecked()  # shows the tab's own state
+        assert window._dblclick_para_action.isChecked()
 
+        # Put the second tab in edit mode and flip its sub-mode OFF.
+        window.active_view.set_edit_mode(True)
+        window._dblclick_para_action.setChecked(False)
+        assert window.active_view.dblclick_paragraph is False
+
+        # The FIRST tab is an existing open document — unchanged by the toggle.
         window._tabs.setCurrentWidget(view)
-        assert not window._dblclick_para_action.isChecked()
+        assert window._dblclick_para_action.isChecked()
+        assert view.dblclick_paragraph is True
     finally:
         window.close()

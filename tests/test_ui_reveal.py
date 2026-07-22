@@ -77,21 +77,42 @@ def test_reveal_recomputes_after_mutation(qapp, quote_pdf):
 
 
 def test_reveal_action_follows_active_tab(qapp, quote_pdf, multipage_pdf):
+    """The action reflects the ACTIVE tab, and toggling one tab leaves other
+    OPEN tabs untouched (per-document). New tabs seed from the persisted
+    app-level default — here still ON, since nothing was toggled first."""
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
         first = window.active_view
         first.set_edit_mode(True)
-        window._show_areas_action.setChecked(False)  # turn OFF on tab 1
-        assert first.show_editable_areas is False
+        assert window._show_areas_action.isChecked()  # default ON
 
         window.open_path(multipage_pdf)
         second = window.active_view
         second.set_edit_mode(True)
-        assert second.show_editable_areas  # its own default stays ON
-        assert window._show_areas_action.isChecked()
+        assert second.show_editable_areas  # new tab seeds the default (ON)
 
+        window._show_areas_action.setChecked(False)  # turn OFF on the active tab (2)
+        assert second.show_editable_areas is False
+
+        # The first tab is an existing open document — unchanged by the toggle.
         window._tabs.setCurrentWidget(first)
-        assert not window._show_areas_action.isChecked()
+        assert first.show_editable_areas is True
+        assert window._show_areas_action.isChecked()
+    finally:
+        window.close()
+
+
+def test_new_tab_seeds_persisted_reveal_default(qapp, quote_pdf, multipage_pdf):
+    """Turning reveal OFF persists it as the app-level default: the NEXT
+    document opened starts with it off too (the persistence the user asked for)."""
+    window = MainWindow()
+    try:
+        window.open_path(quote_pdf.path)
+        window.active_view.set_edit_mode(True)
+        window._show_areas_action.setChecked(False)  # persists show_editable_areas=False
+
+        window.open_path(multipage_pdf)  # fresh tab seeds the persisted default
+        assert window.active_view.show_editable_areas is False
     finally:
         window.close()

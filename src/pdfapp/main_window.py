@@ -51,6 +51,7 @@ from pdfapp.document_view import DocumentView
 from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
 from pdfapp.recent_files import RecentFiles
+from pdfapp.settings import Settings
 from pdfcore import pages
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
@@ -130,11 +131,14 @@ class MainWindow(QMainWindow):
         # Drop a PDF onto the window to open it, exactly like File > Open.
         self.setAcceptDrops(True)
 
-        self._thumbs_visible = True
+        # Persisted preferences (theme, layout, toggles, last highlight colour)
+        # live in the app's own data dir — the installed build's %LOCALAPPDATA%
+        # spot; the same directory as recent_files.json and the diagnostics log.
+        self._settings = Settings(portable.data_dir() / "settings.json")
+        self._thumbs_visible = self._settings.get("thumbnails_visible", True)
         self._last_hover_hint = ""
         self._print_options = PrintOptions()
-        # Recent-files list (File → Open Recent), persisted across launches in
-        # the app's own data dir — the installed build's %LOCALAPPDATA% spot.
+        # Recent-files list (File → Open Recent), persisted across launches.
         self._recent_files = RecentFiles(portable.data_dir() / "recent_files.json")
         # One stack per document (owned by its DocumentView); the group routes
         # Undo/Redo to the active tab's stack.
@@ -245,11 +249,13 @@ class MainWindow(QMainWindow):
 
         self._thumbs_action = QAction("&Thumbnails", self)
         self._thumbs_action.setCheckable(True)
-        self._thumbs_action.setChecked(True)
+        self._thumbs_action.setChecked(self._thumbs_visible)  # persisted (settings)
         self._thumbs_action.toggled.connect(self._toggle_thumbnails)
 
-        # Checked = dark (the default). Not persisted — no settings mechanism
-        # exists, so every launch starts dark (deliberate, restyle S3).
+        # Checked = the mode already applied at startup. Theme IS persisted now
+        # (settings.json): app.main applies the saved mode before this window
+        # builds, so current_mode() already reflects it; runtime toggles persist
+        # via _on_theme_changed.
         self._dark_theme_action = QAction("Dar&k theme", self)
         self._dark_theme_action.setCheckable(True)
         self._dark_theme_action.setChecked(theme.current_mode() == theme.DARK)
@@ -530,6 +536,9 @@ class MainWindow(QMainWindow):
         self._assign_icons()  # glyph colour follows the mode
         for view in self._views():
             view.refresh_theme()
+        # Persist so the next launch starts in this mode (app.main reads it
+        # before the window builds). Fires for every apply after construction.
+        self._settings.set("theme", mode)
 
     def _assign_icons(self) -> None:
         """(Re-)bake themed icons for every action — build time + theme change."""
@@ -1080,6 +1089,11 @@ class MainWindow(QMainWindow):
 
     def _add_view(self, view: DocumentView) -> None:
         view.set_thumbnails_visible(self._thumbs_visible)
+        # Seed the persisted app-level defaults into the fresh view BEFORE
+        # wiring stateChanged (these are per-document flags; the last user
+        # choice becomes the default every new document opens with).
+        view.set_show_editable_areas(self._settings.get("show_editable_areas", True))
+        view.set_dblclick_paragraph(self._settings.get("dblclick_paragraph", True))
         view.stateChanged.connect(lambda v=view: self._on_view_state_changed(v))
         view.editWarning.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         view.hoverHintChanged.connect(self._show_hover_hint)
@@ -1280,10 +1294,14 @@ class MainWindow(QMainWindow):
             v.set_edit_mode(checked)
 
     def _on_show_areas_toggled(self, checked: bool) -> None:
+        # Persist as the app-level default for newly opened documents (last
+        # choice wins); existing open tabs keep their own value.
+        self._settings.set("show_editable_areas", checked)
         if (v := self.active_view) is not None and v.show_editable_areas != checked:
             v.set_show_editable_areas(checked)
 
     def _on_dblclick_para_toggled(self, checked: bool) -> None:
+        self._settings.set("dblclick_paragraph", checked)
         if (v := self.active_view) is not None and v.dblclick_paragraph != checked:
             v.set_dblclick_paragraph(checked)
 
@@ -1394,6 +1412,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_thumbnails(self, checked: bool) -> None:
         self._thumbs_visible = checked
+        self._settings.set("thumbnails_visible", checked)
         for view in self._views():
             view.set_thumbnails_visible(checked)
 

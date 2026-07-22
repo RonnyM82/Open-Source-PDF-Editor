@@ -100,13 +100,26 @@ def _run_ocr_smoke(pdf_path: str) -> int:
     return 0 if result.startswith("OCR OK") else 1
 
 
-def _apply_theme_and_icon(app: QApplication) -> None:
+def _apply_theme_and_icon(app: QApplication, mode: str = theme.DARK) -> None:
     """Central theme + app icon. The frozen-build smoke fails loudly here if
     qt-material's data files are missing (apply_theme raises)."""
-    theme.apply_theme(app)
+    theme.apply_theme(app, mode)
     # Frozen-safe resource lookup so the bundled PNG is found in the packaged
     # .exe, not just from source (window title bar + Windows taskbar icon).
     app.setWindowIcon(QIcon(str(resource_path("assets/icon.png"))))
+
+
+def _persisted_theme_mode() -> str:
+    """The theme mode to start in, read from the persisted settings.
+
+    Falls back to the dark default when unset or unrecognised (apply_theme
+    KeyErrors on an unknown mode, so validate here). Constructed fresh — the
+    running MainWindow owns the write side via theme.on_change."""
+    from pdfapp import portable
+    from pdfapp.settings import Settings
+
+    mode = Settings(portable.data_dir() / "settings.json").get("theme", theme.DARK)
+    return mode if mode in (theme.DARK, theme.LIGHT) else theme.DARK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,7 +162,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # We own the UI (primary, or single-instance disabled): now it is safe to
     # theme and build the window — no other duplicate launch is doing the same.
-    _apply_theme_and_icon(app)
+    # Honour the persisted theme so the app starts in the user's last mode (no
+    # flash — applied before the window exists).
+    _apply_theme_and_icon(app, _persisted_theme_mode())
 
     # Crash + hang self-logging (real UI only — the smokes above stay pure).
     # Captures the exact stack to a log file if the app wedges or faults in the
