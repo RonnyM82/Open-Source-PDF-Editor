@@ -356,6 +356,7 @@ class MainWindow(QMainWindow):
 
         self._highlight_action = QAction("High&light text", self)
         self._highlight_action.setCheckable(True)
+        self._highlight_action.setShortcut("Ctrl+Shift+H")
         self._highlight_action.triggered.connect(self.highlight_text)
 
         self._insert_comment_action = QAction("Insert &comment…", self)
@@ -464,7 +465,9 @@ class MainWindow(QMainWindow):
             self._find_action: "Find in document (Ctrl+F)",
             self._insert_text_action: "Insert text — then click the page to place it",
             self._insert_image_action: "Insert an image — then click the page to place it",
-            self._highlight_action: "Highlight text — drag a window over it",
+            self._highlight_action: (
+                "Highlight text (Ctrl+Shift+H) — the current selection, or drag a window over text"
+            ),
             self._insert_comment_action: (
                 "Add a review comment — markup that doesn't print unless chosen at print time"
             ),
@@ -1303,10 +1306,12 @@ class MainWindow(QMainWindow):
 
     def highlight_text(self) -> None:
         if (v := self.active_view) is not None:
-            if v.armed_action == "highlight":
+            if v.has_text_selection():
+                v.highlight_selection()  # highlight the marquee selection now
+            elif v.armed_action == "highlight":
                 v.cancel_armed_mode()
             else:
-                v.begin_highlight()
+                v.begin_highlight()  # no selection: arm the area-marquee drag
             self._sync_chrome()
 
     def insert_pages_from_file(self) -> None:

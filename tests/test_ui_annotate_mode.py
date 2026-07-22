@@ -13,6 +13,7 @@ pytest.importorskip("PySide6")
 
 from pdfapp.main_window import MainWindow  # noqa: E402
 from pdfapp.page_coords import page_to_scene  # noqa: E402
+from pdfcore.textselect import region_rects  # noqa: E402
 
 
 def _markup_view(window, path):
@@ -39,8 +40,25 @@ def _scene_center(view, bbox):
     )
 
 
+def _sp(view, px, py):
+    return page_to_scene(
+        px,
+        py,
+        render_zoom=view._canvas.render_zoom,
+        rotation=view.document.page_rotation(0),
+        page_size_pts=view.document.page_size(0),
+    )
+
+
 def _annot_count(view, page=0):
     return len(list(view.document._doc[page].annots()))
+
+
+def _select_span(view, span):
+    """Drive an X4 marquee selection over a span's words."""
+    x0, y0, x1, y1 = span.bbox
+    view._on_select_drag_started(*_sp(view, x0 - 2, y0 - 2))
+    view._on_text_select_finished(*_sp(view, x1 + 2, y1 + 2))
 
 
 # --- highlight ----------------------------------------------------------------
@@ -79,6 +97,58 @@ def test_highlight_span_via_dispatch_in_markup(qapp, quote_pdf):
         view._highlight_rect(0, span.bbox)
         assert _annot_count(view) >= 1
         assert view.undo_stack.count() == 1
+    finally:
+        window.close()
+
+
+# --- text-selection highlighting (A3) -----------------------------------------
+
+
+def test_highlight_the_text_selection(qapp, quote_pdf):
+    """A marquee text selection + the Highlight action highlights the selection
+    (one annot per selected line), clears it, and is undoable."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        span = _span(view, quote_pdf.price)
+        _select_span(view, span)
+        assert view.has_text_selection()
+        n_rects = len(region_rects(view._text_selection))
+        assert n_rects >= 1
+
+        window.highlight_text()  # a selection is present → highlight it now
+        assert not view.has_text_selection()  # cleared after the mutation
+        assert _annot_count(view) == n_rects
+        assert view.undo_stack.count() == 1
+
+        view.undo_stack.undo()
+        assert _annot_count(view) == 0
+    finally:
+        window.close()
+
+
+def test_highlight_action_without_selection_arms_marquee(qapp, quote_pdf):
+    """With no selection the Highlight action falls back to the area marquee."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        assert not view.has_text_selection()
+        window.highlight_text()
+        assert view.armed_action == "highlight"  # kept the area-drag path
+    finally:
+        window.close()
+
+
+def test_highlight_selection_applies_current_colour(qapp, quote_pdf):
+    """The view's highlighter colour reaches the annotation end to end."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        view.set_highlight_color((1.0, 0.0, 0.0))
+        _select_span(view, _span(view, quote_pdf.price))
+        window.highlight_text()
+        annot = next(view.document._doc[0].annots())
+        assert annot.colors["stroke"] == pytest.approx((1.0, 0.0, 0.0), abs=0.02)
     finally:
         window.close()
 

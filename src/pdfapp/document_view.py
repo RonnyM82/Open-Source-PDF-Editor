@@ -147,6 +147,10 @@ class DocumentView(QWidget):
         # pass); Ctrl is always a momentary override to the other target
         # (XOR), so Ctrl+double-click edits one line by default.
         self._dblclick_paragraph = True
+        # Current highlighter colour (r, g, b) 0-1, or None for the engine's
+        # default yellow. Set by MainWindow from the Annotate toolbar swatch
+        # (A4); all highlight paths (marquee, span, selection) read it.
+        self._highlight_color: tuple[float, float, float] | None = None
 
         self._canvas = PageCanvas(self)
         self._canvas.renderNeeded.connect(self._on_render_needed)
@@ -1235,14 +1239,50 @@ class DocumentView(QWidget):
 
     def _highlight_rect(self, page_index: int, rect: tuple[float, float, float, float]) -> None:
         """Highlight all text inside ``rect`` as one undo step (region drag
-        and the context menu's span highlight both land here)."""
+        and the context menu's span highlight both land here), in the current
+        highlighter colour."""
+        color = self._highlight_color
         results: list = []
 
         def op(doc: PdfDocument) -> None:
-            results.append(doc.highlight_region(page_index, rect))
+            results.append(doc.highlight_region(page_index, rect, color))
 
         if self._push_command("Highlight text", op, ("page", page_index)) and results[0] == 0:
             self.editWarning.emit("No text in the selection.")
+
+    def set_highlight_color(self, rgb: tuple[float, float, float] | None) -> None:
+        """Set the highlighter colour for subsequent highlights ((r,g,b) 0-1 or
+        None for the engine's default yellow). Driven by the Annotate toolbar."""
+        self._highlight_color = rgb
+
+    def has_text_selection(self) -> bool:
+        """True when a marquee text selection is active (X4) — the source for a
+        'highlight the selection' action."""
+        return bool(self._text_selection)
+
+    def highlight_selection(self) -> None:
+        """Highlight the current marquee text selection (X4 Region) in the
+        current colour, as one undo step, then clear the selection (its
+        positions go stale after the page-scoped mutation).
+
+        The Region already names the selected words per line, so its per-line
+        union rects map straight onto highlight annotations — no coordinate
+        conversion (they are unrotated page space, engine is rotation-blind)
+        and no character re-clipping (which could disagree with the selection).
+        """
+        if not self._text_selection:
+            return
+        n = self._current_page
+        rects = textselect.region_rects(self._text_selection)
+        if not rects:
+            return
+        color = self._highlight_color
+
+        def op(doc: PdfDocument) -> None:
+            doc.highlight_rects(n, rects, color)
+
+        if self._push_command("Highlight selection", op, ("page", n)):
+            self._clear_text_selection()
 
     _COMMENT_W = 220.0  # default comment box size (page pts)
     _COMMENT_H = 64.0
@@ -1820,6 +1860,9 @@ class DocumentView(QWidget):
             menu.addSeparator()
         if self._text_selection is not None:
             actions["copy"] = menu.addAction(icons.icon("copy"), "Copy")
+            actions["highlight_selection"] = menu.addAction(
+                icons.icon("highlight"), "Highlight selection"
+            )
         elif span is not None:
             actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
         if comment is None:  # adding a comment ON a comment would stack them
@@ -1841,6 +1884,8 @@ class DocumentView(QWidget):
             self._delete_comment_at(n, comment.xref)
         elif chosen is actions.get("copy"):
             self.copy_selection()
+        elif chosen is actions.get("highlight_selection"):
+            self.highlight_selection()
         elif chosen is actions.get("highlight"):
             self._highlight_rect(n, span.bbox)
         elif chosen is actions.get("add_comment"):
