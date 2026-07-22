@@ -213,6 +213,28 @@ def test_escape_deselects(qapp, quote_pdf):
         window.close()
 
 
+def test_escape_clears_a_pure_multi_selection(qapp, quote_pdf):
+    """Esc must clear a MULTI-selection too (Ctrl/Shift+click builds one with
+    _selection is None) — not only a single selection. The multi state was
+    unreachable by the Esc chain before its guard was broadened."""
+    window = MainWindow()
+    try:
+        window.open_path(quote_pdf.path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        paras = view.document.paragraphs(0)
+        view.toggle_multi_select(0, paras[0])
+        view.toggle_multi_select(0, paras[1])
+        assert len(view._multi_paragraphs) == 2 and view._selection is None
+        assert view._canvas._multi_selection_rects  # chrome up
+
+        view._on_escape()
+        assert view._multi_paragraphs == []
+        assert view._canvas._multi_selection_rects == []
+    finally:
+        window.close()
+
+
 def test_opening_an_editor_clears_selection(qapp, quote_pdf):
     window = MainWindow()
     try:

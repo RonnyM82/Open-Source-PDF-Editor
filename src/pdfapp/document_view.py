@@ -1832,8 +1832,8 @@ class DocumentView(QWidget):
         if self._canvas.is_armed:  # armed mode first, selection second
             self.cancel_armed_mode()
             return
-        if self._selection is not None:
-            self._clear_selection()
+        if self._selection is not None or self._multi_paragraphs:
+            self._clear_selection()  # clears a single OR a pure multi-selection
             return
         if self._text_selection is not None:  # read-only text selection (X4)
             self._clear_text_selection()
