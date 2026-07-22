@@ -213,6 +213,11 @@ class DocumentView(QWidget):
         self._text_selection: textselect.Selection | None = None
         self._text_sel_anchor_pos: textselect.Position | None = None
         self._text_sel_anchor_pt: tuple[float, float] | None = None
+        # The reading-order lines the active selection is built over — the ONE
+        # block the drag started in (block_lines_at), so a drag can't flow
+        # across table columns/rows. Held for the drag AND for chrome re-push /
+        # copy. Distinct from _text_lines (whole-page, hover-I-beam only).
+        self._text_sel_lines: list | None = None
         self._text_lines: list | None = None
         self._text_lines_page = -1
         # Armed one-shot click action: ("text", None) | ("image", Path).
@@ -1685,29 +1690,42 @@ class DocumentView(QWidget):
             self._text_lines_page = self._current_page
         return self._text_lines
 
+    def _selection_boundaries(self, n: int) -> tuple:
+        """Registered insert-box rects on page ``n`` (block resolution honours
+        them, exactly as editing does)."""
+        return tuple(box.rect for box in self._doc.boxes(n))
+
     def _begin_text_selection(self, sx: float, sy: float) -> None:
-        """A plain read-only press anchors a flow selection at the nearest
-        text position and accepts the drag. Inert (drag not accepted) on a
-        page with no native words — scanned pages have nothing to select."""
+        """A plain read-only press anchors a flow selection in the BLOCK under
+        the cursor and accepts the drag. The selection is constrained to that
+        one block (block_lines_at), so a drag can't reach across a table's
+        columns or rows. Inert (drag not accepted) when the point is not over a
+        text block — scanned pages and blank areas have nothing to select."""
         self._clear_text_selection()  # a new drag replaces any prior selection
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
-        anchor = textselect.position_at(self._page_text_lines(), px, py)
+        lines = self._doc.text_block_lines_at(n, px, py, boundaries=self._selection_boundaries(n))
+        if not lines:
+            return
+        anchor = textselect.position_at(lines, px, py)
         if anchor is None:
             return
+        self._text_sel_lines = lines
         self._text_sel_anchor_pos = anchor
         self._text_sel_anchor_pt = (px, py)
         self._canvas.begin_text_selection(sx, sy)
 
     def _on_text_select_moved(self, sx: float, sy: float) -> None:
-        """Extend the flow selection to the live cursor position (word-snapped)."""
-        if self._text_sel_anchor_pos is None:
+        """Extend the flow selection to the live cursor (word-snapped), clamped
+        to the block the drag started in."""
+        if self._text_sel_anchor_pos is None or self._text_sel_lines is None:
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
-        lines = self._page_text_lines()
-        cursor = textselect.position_at(lines, px, py)
-        self._text_selection = textselect.selection_span(lines, self._text_sel_anchor_pos, cursor)
+        cursor = textselect.position_at(self._text_sel_lines, px, py)
+        self._text_selection = textselect.selection_span(
+            self._text_sel_lines, self._text_sel_anchor_pos, cursor
+        )
         self._push_text_selection_chrome()
 
     def _on_text_select_finished(self, sx: float, sy: float) -> None:
@@ -1715,29 +1733,31 @@ class DocumentView(QWidget):
         which deselects (matches Acrobat: click to place, drag to select)."""
         anchor_pos = self._text_sel_anchor_pos
         anchor_pt = self._text_sel_anchor_pt
+        lines = self._text_sel_lines
         self._text_sel_anchor_pos = None
         self._text_sel_anchor_pt = None
-        if anchor_pos is None:
+        if anchor_pos is None or lines is None:
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
         if anchor_pt is not None and abs(px - anchor_pt[0]) < 2.0 and abs(py - anchor_pt[1]) < 2.0:
             self._clear_text_selection()  # a click, not a drag — deselect
             return
-        lines = self._page_text_lines()
         cursor = textselect.position_at(lines, px, py)
         self._text_selection = textselect.selection_span(lines, anchor_pos, cursor)
         self._push_text_selection_chrome()
 
     def _select_word_at(self, sx: float, sy: float) -> None:
-        """Read-only double-click: select the whole word under the cursor (X4)."""
+        """Read-only double-click: select the whole word under the cursor,
+        within its own block (X4)."""
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
-        lines = self._page_text_lines()
-        pos = textselect.word_at(lines, px, py)
+        lines = self._doc.text_block_lines_at(n, px, py, boundaries=self._selection_boundaries(n))
+        pos = textselect.word_at(lines, px, py) if lines else None
         if pos is None:
             self._clear_text_selection()
             return
+        self._text_sel_lines = lines
         self._text_selection = textselect.selection_span(lines, pos, pos)
         self._push_text_selection_chrome()
 
@@ -1745,20 +1765,20 @@ class DocumentView(QWidget):
         """Copy the read-only text selection to the clipboard (X4: Ctrl+C or
         the read-only context menu). No-op in edit mode or with no selection;
         a pure read — the undo stack is never touched."""
-        if self._edit_mode or self._text_selection is None:
+        if self._edit_mode or self._text_selection is None or self._text_sel_lines is None:
             return
-        text = textselect.selection_text(self._page_text_lines(), self._text_selection)
+        text = textselect.selection_text(self._text_sel_lines, self._text_selection)
         if text:
             QApplication.clipboard().setText(text)
 
     def _push_text_selection_chrome(self) -> None:
         """(Re-)display the text-selection rects (scene px) — re-pushed after a
         page show and every re-render, exactly like the search chrome."""
-        if self._text_selection is None:
+        if self._text_selection is None or self._text_sel_lines is None:
             self._canvas.clear_text_selection()
             return
         n = self._current_page
-        rects = textselect.selection_rects(self._page_text_lines(), self._text_selection)
+        rects = textselect.selection_rects(self._text_sel_lines, self._text_selection)
         zoom = self._canvas.render_zoom
         rot = self._doc.page_rotation(n)
         size = self._doc.page_size(n)
@@ -1771,6 +1791,7 @@ class DocumentView(QWidget):
     def _clear_text_selection(self) -> None:
         self._text_sel_anchor_pos = None
         self._text_sel_anchor_pt = None
+        self._text_sel_lines = None
         if self._text_selection is None:
             return
         self._text_selection = None

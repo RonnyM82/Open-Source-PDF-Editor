@@ -391,6 +391,20 @@ class PdfDocument:
         """
         return textselect.page_lines(self._doc, n)
 
+    def text_block_lines_at(
+        self,
+        n: int,
+        px: float,
+        py: float,
+        boundaries: Sequence[tuple[float, float, float, float]] = (),
+    ) -> list[list[textselect.Word]] | None:
+        """Reading-order lines of the text BLOCK under a page point (X3.1).
+
+        None when the point is not over text. Used to CONSTRAIN read-only drag
+        selection to one paragraph so it cannot flow across table columns/rows.
+        """
+        return textselect.block_lines_at(self._doc, n, px, py, boundaries=boundaries)
+
     def search(self, query: str, include_comments: bool = False) -> list[textsource.SearchHit]:
         """Find ``query`` across every page's native text layer (SR1).
 

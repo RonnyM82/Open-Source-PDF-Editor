@@ -103,6 +103,48 @@ def test_entering_edit_mode_resets_the_ibeam(qapp, text_pdf):
 # --- drag selection + copy --------------------------------------------------
 
 
+def _prose_pdf(tmp_path):
+    """One tight-pitch multi-line paragraph — MuPDF groups it into ONE block
+    (like real prose / the quote's description cell), so a drag selects ACROSS
+    its lines. (A loosely-spaced fixture would block each line separately,
+    which is the same limit the app's paragraph editing has.)"""
+    import pymupdf
+
+    path = tmp_path / "prose.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for i, t in enumerate(
+        [
+            "body first line of the paragraph",
+            "body second line with more words",
+            "body third and final line",
+        ]
+    ):
+        page.insert_text((72, 111 + i * 8), t, fontname="helv", fontsize=8)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def _table_pdf(tmp_path):
+    """A multi-line description cell beside a separate right column on shared
+    baselines — the table hazard from the user's screenshot."""
+    import pymupdf
+
+    path = tmp_path / "table.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for i, t in enumerate(
+        ["Description first line here", "Description second line more", "Third and final line"]
+    ):
+        page.insert_text((72, 120 + i * 8), t, fontname="helv", fontsize=7)
+    page.insert_text((300, 120), "PARTNO-123", fontname="helv", fontsize=7)
+    page.insert_text((430, 120), "1,185.47", fontname="helv", fontsize=7)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
 def _drag_select(view, lines, start_line, end_line):
     """Simulate a plain read-only drag from the first word of ``start_line`` to
     the last word of ``end_line`` (canvas-level start + finish signals)."""
@@ -112,32 +154,32 @@ def _drag_select(view, lines, start_line, end_line):
     view._on_text_select_finished(*_scene_point(view, *_word_center(cursor)))
 
 
-def test_drag_selects_multiline_flow_and_copies(qapp, text_pdf):
+def test_drag_selects_multiline_flow_and_copies(qapp, tmp_path):
     window = MainWindow()
     try:
-        window.open_path(text_pdf)
+        window.open_path(_prose_pdf(tmp_path))
         view = window.active_view
         lines = view.document.text_lines(0)
-        i = _line_index(lines, "line 0.")
-        j = _line_index(lines, "line 1.")
+        i = _line_index(lines, "first line")
+        j = _line_index(lines, "second line")
         _drag_select(view, lines, i, j)
         assert view._text_selection is not None
         assert view._canvas._text_selection_rects  # chrome pushed
         view.copy_selection()
         text = qapp.clipboard().text()
-        assert text == "Lorem ipsum dolor sit amet, line 0.\nLorem ipsum dolor sit amet, line 1."
+        assert text == "body first line of the paragraph\nbody second line with more words"
     finally:
         window.close()
 
 
-def test_backward_drag_equals_forward_drag(qapp, text_pdf):
+def test_backward_drag_equals_forward_drag(qapp, tmp_path):
     window = MainWindow()
     try:
-        window.open_path(text_pdf)
+        window.open_path(_prose_pdf(tmp_path))
         view = window.active_view
         lines = view.document.text_lines(0)
-        i = _line_index(lines, "line 0.")
-        j = _line_index(lines, "line 1.")
+        i = _line_index(lines, "first line")
+        j = _line_index(lines, "second line")
 
         _drag_select(view, lines, i, j)  # forward
         view.copy_selection()
@@ -155,20 +197,38 @@ def test_backward_drag_equals_forward_drag(qapp, text_pdf):
         window.close()
 
 
-def test_live_drag_updates_selection_while_moving(qapp, text_pdf):
+def test_live_drag_updates_selection_while_moving(qapp, tmp_path):
     window = MainWindow()
     try:
-        window.open_path(text_pdf)
+        window.open_path(_prose_pdf(tmp_path))
         view = window.active_view
         lines = view.document.text_lines(0)
-        i = _line_index(lines, "line 0.")
-        j = _line_index(lines, "line 1.")
+        i = _line_index(lines, "first line")
+        j = _line_index(lines, "second line")
         view._on_select_drag_started(*_scene_point(view, *_word_center(lines[i][0])))
         view._on_text_select_moved(*_scene_point(view, *_word_center(lines[i][-1])))
         one_line = view._text_selection
         assert one_line.start[0] == one_line.end[0]  # still within one line
         view._on_text_select_moved(*_scene_point(view, *_word_center(lines[j][-1])))
         assert view._text_selection.end[0] == j  # extended down a line
+    finally:
+        window.close()
+
+
+def test_drag_is_contained_within_the_block_across_columns(qapp, tmp_path):
+    """The user's fix: a drag anchored in the description cell and dragged
+    toward the price column stays inside the description block — its row-mates
+    in other columns are never pulled in."""
+    window = MainWindow()
+    try:
+        window.open_path(_table_pdf(tmp_path))
+        view = window.active_view
+        view._on_select_drag_started(*_scene_point(view, 74.0, 121.0))  # in the description
+        view._on_text_select_finished(*_scene_point(view, 460.0, 137.0))  # toward the column
+        view.copy_selection()
+        text = qapp.clipboard().text()
+        assert "Description first line here" in text  # got the description...
+        assert "PARTNO" not in text and "1,185" not in text  # ...but not the column
     finally:
         window.close()
 
@@ -241,15 +301,13 @@ def test_comment_text_never_copied(qapp, quote_pdf):
     try:
         window.open_path(quote_pdf.path)
         view = window.active_view
-        view.document.add_comment(
-            0, (250.0, 55.0, 430.0, 95.0), "SECRET REVIEW NOTE", author="tester"
-        )
-        view._text_lines = None  # the doc changed under us (test setup)
-        w, h = view.document.page_size(0)
-        view._on_select_drag_started(*_scene_point(view, 1.0, 1.0))
-        view._on_text_select_finished(*_scene_point(view, w - 1, h - 1))
+        view.document.add_comment(0, (300.0, 500.0, 460.0, 540.0), "SECRETNOTE", author="tester")
+        span = next(s for s in view.document.text_spans(0) if s.text.strip() == quote_pdf.price)
+        cx, cy = (span.bbox[0] + span.bbox[2]) / 2, (span.bbox[1] + span.bbox[3]) / 2
+        view._on_point_activated(*_scene_point(view, cx, cy), False)  # select the price word
         view.copy_selection()
-        assert "SECRET" not in qapp.clipboard().text()
+        text = qapp.clipboard().text()
+        assert text and "SECRETNOTE" not in text  # comment markup never selectable
     finally:
         window.close()
 

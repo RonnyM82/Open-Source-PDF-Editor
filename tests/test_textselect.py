@@ -201,6 +201,86 @@ def test_comment_text_is_never_selectable(quote_pdf):
     assert "SECRET" not in selection_text(lines, span)
 
 
+# --- block-constrained selection (X3.1: contain a drag within one block) -----
+
+
+def _two_column_pdf(tmp_path):
+    """A multi-line 'description' cell beside a separate right-hand column on
+    the SAME baselines — the table hazard. Tight line pitch makes MuPDF group
+    the 3 description lines into ONE block and keep the right column separate
+    (probe-verified), mirroring the real quote."""
+    path = tmp_path / "twocol.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for i, text in enumerate(
+        ["Description first line here", "Description second line more", "Third and final line"]
+    ):
+        page.insert_text((72, 120 + i * 8), text, fontname="helv", fontsize=7)
+    page.insert_text((300, 120), "PARTNO-123", fontname="helv", fontsize=7)
+    page.insert_text((430, 120), "1,185.47", fontname="helv", fontsize=7)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_block_lines_at_returns_only_the_column_paragraph(tmp_path):
+    with PdfDocument.open(_two_column_pdf(tmp_path)) as doc:
+        lines = doc.text_block_lines_at(0, 90.0, 121.0)  # inside the description
+    texts = [" ".join(w.text for w in ln) for ln in lines]
+    assert texts == [
+        "Description first line here",
+        "Description second line more",
+        "Third and final line",
+    ]
+    flat = [w.text for ln in lines for w in ln]
+    assert "PARTNO-123" not in flat and "1,185.47" not in flat  # the column, not the row
+
+
+def test_block_lines_at_none_off_text(tmp_path):
+    with PdfDocument.open(_two_column_pdf(tmp_path)) as doc:
+        assert doc.text_block_lines_at(0, 400.0, 500.0) is None  # blank area
+
+
+def test_selection_clamps_to_the_block_dragged_from(tmp_path):
+    """A drag anchored in the description column, dragged far into the right
+    column, stays inside the description — the containment the user asked for."""
+    with PdfDocument.open(_two_column_pdf(tmp_path)) as doc:
+        lines = doc.text_block_lines_at(0, 74.0, 121.0)
+        anchor = position_at(lines, 74.0, 121.0)
+        cursor = position_at(lines, 460.0, 137.0)  # bottom-right, off the block
+        span = selection_span(lines, anchor, cursor)
+        text = selection_text(lines, span)
+    assert "PARTNO" not in text and "1,185" not in text
+    assert text.startswith("Description first line here")
+
+
+def test_same_baseline_neighbours_are_separate_blocks(tmp_path):
+    """Cells on the SAME baseline are separate blocks — a paragraph is a
+    VERTICAL run of lines, never horizontal neighbours (the CAD/title-block
+    rule). So selecting one cell never grabs its row-mates or the other
+    column."""
+    with PdfDocument.open(_two_column_pdf(tmp_path)) as doc:
+        lines = doc.text_block_lines_at(0, 310.0, 121.0)  # the PARTNO cell
+    flat = [w.text for ln in lines for w in ln]
+    assert "PARTNO-123" in flat
+    assert "1,185.47" not in flat  # same-baseline neighbour is its own block
+    assert "Description" not in flat
+
+
+def test_block_lines_at_excludes_comment_text(quote_pdf):
+    with PdfDocument.open(quote_pdf.path) as doc:
+        doc.add_comment(0, (300.0, 500.0, 460.0, 540.0), "SECRETNOTE", author="t")
+        # A block over real text still resolves; the comment's own text never does.
+        span = next(s for s in doc.text_spans(0) if s.text.strip() == quote_pdf.price)
+        cx, cy = (span.bbox[0] + span.bbox[2]) / 2, (span.bbox[1] + span.bbox[3]) / 2
+        lines = doc.text_block_lines_at(0, cx, cy)
+        # And a block resolved AT the comment's location is None (markup only).
+        at_comment = doc.text_block_lines_at(0, 380.0, 520.0)
+    flat = [w.text for ln in (lines or []) for w in ln]
+    assert "SECRETNOTE" not in flat
+    assert at_comment is None
+
+
 def test_engine_stays_rotation_blind(text_pdf):
     """Word boxes come back in unrotated page space regardless of /Rotate —
     the UI derotates (page_coords), the engine never does (same as search)."""

@@ -194,6 +194,57 @@ def page_lines(doc: pymupdf.Document, page_index: int) -> list[list[Word]]:
     """Page ``page_index``'s native words grouped into reading-order lines.
 
     Comment/markup text is excluded (``page_words`` drops it by default), so a
-    review comment is never selectable or copyable.
+    review comment is never selectable or copyable. This is the WHOLE-PAGE
+    flow; :func:`block_lines_at` is the block-CONSTRAINED variant used for
+    drag selection.
     """
     return group_lines(page_words(doc, page_index))
+
+
+def _spans_bbox(spans: Sequence) -> Rect:
+    """Union bbox of a visual line's spans."""
+    return (
+        min(s.bbox[0] for s in spans),
+        min(s.bbox[1] for s in spans),
+        max(s.bbox[2] for s in spans),
+        max(s.bbox[3] for s in spans),
+    )
+
+
+def _center_in_any(bbox: Rect, boxes: Sequence[Rect], pad: float = 1.0) -> bool:
+    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    return any(
+        x0 - pad <= cx <= x1 + pad and y0 - pad <= cy <= y1 + pad for x0, y0, x1, y1 in boxes
+    )
+
+
+def block_lines_at(
+    doc: pymupdf.Document,
+    page_index: int,
+    px: float,
+    py: float,
+    boundaries: Sequence[Rect] = (),
+) -> list[list[Word]] | None:
+    """Reading-order lines of the text BLOCK under a page point (None if not
+    over text) — the block-CONSTRAINED input for drag selection.
+
+    Whole-page line flow (:func:`page_lines`) reads across a table's columns
+    and rows, because MuPDF groups words on a shared baseline into one visual
+    line regardless of column. To keep a drag inside the block it started in,
+    this resolves the paragraph under the point via
+    :func:`textedit.paragraph_at` — the SAME unit the app outlines on hover and
+    edits — and returns only that paragraph's words, grouped into lines. A
+    word-snapped selection over the result therefore cannot flow into a
+    neighbouring column or the next row. ``boundaries`` (registered insert-box
+    rects) are honoured exactly as in editing, so an inserted box is its own
+    block. Comment text is excluded (``page_words`` and ``paragraph_at`` both
+    drop it).
+    """
+    from pdfcore import textedit
+
+    para = textedit.paragraph_at(doc, page_index, px, py, boundaries=boundaries)
+    if para is None:
+        return None
+    line_boxes = [_spans_bbox(line) for line in para.lines] or [para.bbox]
+    kept = [w for w in page_words(doc, page_index) if _center_in_any(w.bbox, line_boxes)]
+    return group_lines(kept)
