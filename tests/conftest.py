@@ -30,6 +30,19 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def _isolate_app_data(tmp_path, monkeypatch):
+    """Redirect the app's own data dir (recent files, etc.) to tmp_path.
+
+    ``portable.data_dir()`` resolves to ``%LOCALAPPDATA%\\PDF Editor`` in a dev /
+    test run, so without this every MainWindow that opens a file would write into
+    the developer's real profile. Pointing LOCALAPPDATA at tmp_path keeps state
+    per-test and off the real machine. test_ui_portable sets its own LOCALAPPDATA
+    and so is unaffected.
+    """
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+
+
 @pytest.fixture
 def theme_app(qapp):
     """qapp + the theme module, restoring EVERYTHING qt-material mutates.

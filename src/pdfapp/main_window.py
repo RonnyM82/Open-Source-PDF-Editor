@@ -46,10 +46,11 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
-from pdfapp import diagnostics, icons, theme
+from pdfapp import diagnostics, icons, portable, theme
 from pdfapp.document_view import DocumentView
 from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
+from pdfapp.recent_files import RecentFiles
 from pdfcore import pages
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
@@ -132,6 +133,9 @@ class MainWindow(QMainWindow):
         self._thumbs_visible = True
         self._last_hover_hint = ""
         self._print_options = PrintOptions()
+        # Recent-files list (File → Open Recent), persisted across launches in
+        # the app's own data dir — the installed build's %LOCALAPPDATA% spot.
+        self._recent_files = RecentFiles(portable.data_dir() / "recent_files.json")
         # One stack per document (owned by its DocumentView); the group routes
         # Undo/Redo to the active tab's stack.
         self._undo_group = QUndoGroup(self)
@@ -450,6 +454,11 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self._open_action)
+        # Fly-out of the last few opened files; rebuilt each time it's shown so
+        # it always reflects the current list (like the Documents menu).
+        self._recent_menu = file_menu.addMenu("Open &Recent")
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+        self._rebuild_recent_menu()  # populate now so tests see it pre-show
         file_menu.addAction(self._new_window_action)
         file_menu.addSeparator()
         file_menu.addAction(self._save_action)
@@ -991,6 +1000,7 @@ class MainWindow(QMainWindow):
         existing = self._find_tab(path)
         if existing is not None:
             self._tabs.setCurrentWidget(existing)
+            self._recent_files.add(path)  # bump it to the front of Open Recent
             return
 
         try:
@@ -1005,6 +1015,9 @@ class MainWindow(QMainWindow):
             return
 
         self._add_view(DocumentView(doc))
+        # Only successfully-opened files land in Open Recent (a failed open /
+        # cancelled password prompt returned above).
+        self._recent_files.add(path)
         # A breadcrumb so a later hang/crash log shows what was open (no-op until
         # diagnostics.install has run, i.e. never in tests).
         diagnostics.log_event(f"opened {path.name} ({doc.page_count} pages)")
@@ -1550,6 +1563,41 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, idx=index: self._tabs.setCurrentIndex(idx)
             )
+
+    def _rebuild_recent_menu(self) -> None:
+        """Populate the Open Recent fly-out from the persisted list."""
+        self._recent_menu.clear()
+        entries = self._recent_files.entries()
+        if not entries:
+            placeholder = self._recent_menu.addAction("No recent files")
+            placeholder.setEnabled(False)
+            return
+        for index, path in enumerate(entries, start=1):
+            # &1..&9, then &0 for the tenth — a keyboard accelerator per entry.
+            # Escape any '&' in the file name so it isn't read as a mnemonic.
+            accel = index % 10
+            label = path.name.replace("&", "&&")
+            action = self._recent_menu.addAction(f"&{accel}  {label}")
+            action.setToolTip(str(path))
+            action.triggered.connect(lambda _checked=False, p=path: self._open_recent(p))
+        self._recent_menu.addSeparator()
+        clear_action = self._recent_menu.addAction("Clear Recent Files")
+        clear_action.triggered.connect(self._clear_recent)
+
+    def _open_recent(self, path: Path) -> None:
+        """Open a file chosen from Open Recent, pruning it if it has gone."""
+        if not path.exists():
+            self._recent_files.remove(path)
+            QMessageBox.warning(
+                self,
+                "File not found",
+                f"This file is no longer available and was removed from Open Recent:\n\n{path}",
+            )
+            return
+        self.open_path(path)
+
+    def _clear_recent(self) -> None:
+        self._recent_files.clear()
 
     def _update_title(self) -> None:
         view = self.active_view
