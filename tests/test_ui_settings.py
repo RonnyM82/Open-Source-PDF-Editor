@@ -74,6 +74,49 @@ def test_dblclick_paragraph_default_seeds_new_view(qapp, text_pdf):
         window.close()
 
 
+def test_offscreen_close_does_not_save_geometry(qapp):
+    """A never-shown window (offscreen tests) must NOT persist its degenerate
+    geometry — the isVisible() guard protects the user's real saved layout."""
+    window = MainWindow()
+    window.close()  # delivers closeEvent; isVisible() is False
+    assert window._settings.get("window_geometry") is None
+    assert window._settings.get("window_state") is None
+
+
+def test_window_layout_saved_and_restored(qapp):
+    from PySide6.QtCore import QByteArray
+
+    w1 = MainWindow()
+    try:
+        w1._save_window_layout()
+        geometry = w1._settings.get("window_geometry")
+        state = w1._settings.get("window_state")
+        assert isinstance(geometry, str) and geometry
+        assert isinstance(state, str) and state
+    finally:
+        w1.close()
+    # A fresh window's __init__ restores the saved layout; the blobs are valid.
+    w2 = MainWindow()
+    try:
+        assert w2.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+    finally:
+        w2.close()
+
+
+def test_navigation_toolbar_has_object_name(qapp):
+    """saveState() silently drops toolbars without a unique objectName."""
+    from PySide6.QtWidgets import QToolBar
+
+    window = MainWindow()
+    try:
+        names = {tb.objectName() for tb in window.findChildren(QToolBar)}
+        assert "navigation_toolbar" in names
+        assert "text_style_toolbar" in names
+        assert "" not in names  # every toolbar is named
+    finally:
+        window.close()
+
+
 def test_show_areas_toggle_persists(qapp, text_pdf):
     window = MainWindow()
     try:

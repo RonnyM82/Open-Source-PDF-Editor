@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QSize, Qt
+from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -123,6 +123,11 @@ def _dropped_pdf_paths(mime: QMimeData) -> list[Path]:
     return paths
 
 
+# Bumped whenever the toolbar/dock layout changes so a stale saved window
+# state (restoreState) is cleanly ignored rather than hiding a new toolbar.
+_STATE_VERSION = 2
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -169,6 +174,11 @@ class MainWindow(QMainWindow):
         # Follow theme switches however they are triggered (menu, tests):
         # keep the toggle in sync and re-pull themed chrome per open view.
         theme.on_change(self._on_theme_changed)
+
+        # Restore the saved window size/position + toolbar layout LAST, once all
+        # toolbars exist and carry their objectNames (a saved geometry wins over
+        # the default resize above; a no-op on first launch / a version change).
+        self._restore_window_layout()
 
     # --- active view ----------------------------------------------------
     @property
@@ -547,6 +557,9 @@ class MainWindow(QMainWindow):
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
+        # Unique objectName so QMainWindow.saveState()/restoreState() persists
+        # this bar's position (Qt silently drops unnamed toolbars from state).
+        toolbar.setObjectName("navigation_toolbar")
         toolbar.setIconSize(QSize(20, 20))  # match the style toolbar
         toolbar.addAction(self._prev_action)
 
@@ -1626,6 +1639,26 @@ class MainWindow(QMainWindow):
         star = " *" if view.dirty else ""
         self.setWindowTitle(f"PDF Editor — {view.title}{star}")
 
+    # --- window layout persistence --------------------------------------
+    def _restore_window_layout(self) -> None:
+        """Restore saved geometry + toolbar state (base64 in settings).
+
+        restoreGeometry BEFORE restoreState (Qt requirement); both no-op safely
+        on an empty/None value or a version mismatch."""
+        geometry = self._settings.get("window_geometry")
+        if geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+        state = self._settings.get("window_state")
+        if state:
+            self.restoreState(QByteArray.fromBase64(state.encode("ascii")), _STATE_VERSION)
+
+    def _save_window_layout(self) -> None:
+        """Persist geometry + toolbar state as base64 (called at close time)."""
+        self._settings.set("window_geometry", bytes(self.saveGeometry().toBase64()).decode("ascii"))
+        self._settings.set(
+            "window_state", bytes(self.saveState(_STATE_VERSION).toBase64()).decode("ascii")
+        )
+
     # --- lifecycle ------------------------------------------------------
     def closeEvent(self, event) -> None:
         # Prompt for each dirty document before the window closes. Only when
@@ -1637,4 +1670,9 @@ class MainWindow(QMainWindow):
                 if not self._confirm_close(view):
                     event.ignore()
                     return
+            # A real, shown window is really closing: snapshot the layout. The
+            # isVisible() guard is load-bearing — a never-shown offscreen test
+            # window's saveGeometry() is degenerate and would clobber the real
+            # saved layout in the shared data dir.
+            self._save_window_layout()
         event.accept()
