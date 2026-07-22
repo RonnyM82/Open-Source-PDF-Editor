@@ -12,7 +12,17 @@ from pathlib import Path
 
 import pymupdf
 
-from pdfcore import boxregistry, comments, imageedit, invoice, ocr, pages, textedit, textsource
+from pdfcore import (
+    boxregistry,
+    comments,
+    imageedit,
+    invoice,
+    ocr,
+    pages,
+    textedit,
+    textselect,
+    textsource,
+)
 from pdfcore.boxregistry import BoxRecord
 from pdfcore.comments import CommentInfo
 from pdfcore.imageedit import ImageInfo
@@ -371,6 +381,15 @@ class PdfDocument:
         method never triggers a slow OCR run itself.
         """
         return textsource.collect_page_text(self._doc, n, ocr_words=ocr_words)
+
+    def text_lines(self, n: int) -> list[list[textsource.Word]]:
+        """Page ``n``'s native words grouped into reading-order lines (X3).
+
+        The input to the read-only word-snapped selection helpers in
+        :mod:`pdfcore.textselect`. Comment/markup text is excluded, so it is
+        never selectable or copyable.
+        """
+        return textselect.page_lines(self._doc, n)
 
     def search(self, query: str, include_comments: bool = False) -> list[textsource.SearchHit]:
         """Find ``query`` across every page's native text layer (SR1).
