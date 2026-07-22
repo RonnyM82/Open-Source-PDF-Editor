@@ -108,6 +108,14 @@ class PageCanvas(QGraphicsView):
     # the normal navigation path and lands the hand-off with
     # scroll_to_vertical_edge(); at the document bounds it does nothing.
     pageScrollRequested = Signal(int)
+    # Read-only flow text selection (X4). A plain press emits selectDragStarted
+    # like edit mode; the view accepts it by calling begin_text_selection(), and
+    # the canvas then reports live drag positions and the release here. The view
+    # owns the selection (page space); the canvas only draws the rects.
+    textSelectMoved = Signal(float, float)
+    textSelectFinished = Signal(float, float)
+    # Ctrl+C on the focused canvas — the view copies the read-only selection.
+    copyRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -145,6 +153,8 @@ class PageCanvas(QGraphicsView):
         self._insert_armed = False  # one-shot click-to-place for new text
         self._region_armed = False  # one-shot window selection (highlight)
         self._region_press = None  # scene QPointF while a region drag is live
+        self._text_select_press = None  # scene QPointF while a text drag is live (X4)
+        self._text_hover = False  # read-only I-beam cursor is showing (X4)
         self._suppress_dblclick = False  # armed press consumed -> eat the dblclick
         self._move_press = None  # scene QPointF while a Ctrl+drag is live
         self._move_base_rect: QRectF | None = None  # paragraph rect (scene px)
@@ -169,6 +179,9 @@ class PageCanvas(QGraphicsView):
         # Display only — the view owns the hit list and the current index.
         self._search_rects: list[QRectF] = []
         self._search_current: list[QRectF] = []
+        # Read-only text-selection highlight (X4): per-line rects, scene px.
+        # Display only — the view owns the selection (page space).
+        self._text_selection_rects: list[QRectF] = []
         # Armed-mode chip (U4): a persistent floating hint while a one-shot
         # mode is live — the transient status message was easy to miss.
         self._armed_chip = QLabel(self.viewport())
@@ -445,6 +458,15 @@ class PageCanvas(QGraphicsView):
         self._move_base_rect = QRectF()  # non-None so the press is accepted
         self._resize_anchor = QPointF(anchor_scene[0], anchor_scene[1])
 
+    def begin_text_selection(self, sx: float, sy: float) -> None:
+        """Accept the pending plain press as a read-only text-selection drag (X4).
+
+        The view calls this synchronously from its ``selectDragStarted``
+        handler; the canvas then reports live drag positions via
+        ``textSelectMoved`` and the release via ``textSelectFinished``.
+        """
+        self._text_select_press = QPointF(sx, sy)
+
     # --- hover affordances (U2a) ------------------------------------------
     def set_hover(
         self,
@@ -470,7 +492,26 @@ class PageCanvas(QGraphicsView):
         if kind_changed:
             self.hoverKindChanged.emit(kind)
 
+    def set_text_hover(self, on: bool) -> None:
+        """Read-only text selection (X4): show the I-beam over selectable words.
+
+        Independent of the edit-mode hover outline (which read-only never
+        shows); reset by ``clear_hover`` / ``leaveEvent`` so the cursor never
+        sticks off a word or off the page.
+        """
+        on = bool(on)
+        if on == self._text_hover:
+            return
+        self._text_hover = on
+        if on:
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.viewport().unsetCursor()
+
     def clear_hover(self) -> None:
+        if self._text_hover:
+            self._text_hover = False
+            self.viewport().unsetCursor()
         if self._hover_kind is None:
             return
         self._hover_kind = None
@@ -584,6 +625,23 @@ class PageCanvas(QGraphicsView):
         self._search_current = []
         self.viewport().update()
 
+    # --- read-only text-selection highlight (X4) --------------------------
+    def set_text_selection_rects(
+        self, scene_rects: list[tuple[float, float, float, float]]
+    ) -> None:
+        """Show the read-only text selection's per-line rects (empty clears)."""
+        rects = [QRectF(x0, y0, x1 - x0, y1 - y0) for (x0, y0, x1, y1) in scene_rects]
+        if rects == self._text_selection_rects:
+            return
+        self._text_selection_rects = rects
+        self.viewport().update()
+
+    def clear_text_selection(self) -> None:
+        if not self._text_selection_rects:
+            return
+        self._text_selection_rects = []
+        self.viewport().update()
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             # Reaches here only for clicks NOT on the editor overlay (a child
@@ -646,8 +704,13 @@ class PageCanvas(QGraphicsView):
             if self._item.boundingRect().contains(scene_pos):
                 self._move_press = scene_pos
                 self._move_base_rect = None
+                self._text_select_press = None
                 self.selectDragStarted.emit(scene_pos.x(), scene_pos.y())
-                if self._move_base_rect is not None:
+                if self._move_base_rect is not None:  # edit: move/resize accepted
+                    event.accept()
+                    return
+                if self._text_select_press is not None:  # read-only: text selection
+                    self._move_press = None
                     event.accept()
                     return
                 self._move_press = None
@@ -681,6 +744,13 @@ class PageCanvas(QGraphicsView):
             self._move_band.show()
             event.accept()
             return
+        if self._text_select_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            # Read-only flow selection drag (X4): report the live cursor point;
+            # the view recomputes the word-snapped range and repaints.
+            current = self.mapToScene(event.position().toPoint())
+            self.textSelectMoved.emit(current.x(), current.y())
+            event.accept()
+            return
         if not event.buttons():
             self._update_hover(event.position().toPoint())
         super().mouseMoveEvent(event)
@@ -692,6 +762,12 @@ class PageCanvas(QGraphicsView):
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
             self.escapePressed.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_C and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+C copies the read-only text selection (X4). An open in-place
+            # editor holds focus in edit mode, so its own copy is unaffected.
+            self.copyRequested.emit()
             event.accept()
             return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -726,6 +802,12 @@ class PageCanvas(QGraphicsView):
             self.moveDragFinished.emit(press.x(), press.y(), current.x(), current.y())
             event.accept()
             return
+        if self._text_select_press is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._text_select_press = None
+            current = self.mapToScene(event.position().toPoint())
+            self.textSelectFinished.emit(current.x(), current.y())
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event) -> None:
@@ -741,6 +823,7 @@ class PageCanvas(QGraphicsView):
         # Double-click on the page begins an in-place edit (no mode toggle —
         # single clicks and drags keep their scroll/select behaviour).
         # Ctrl+double-click edits the whole paragraph instead of one span.
+        self._text_select_press = None  # a dblclick's release must not clear it (X4)
         if self._suppress_dblclick:
             self._suppress_dblclick = False
             event.accept()
@@ -778,6 +861,17 @@ class PageCanvas(QGraphicsView):
             painter.setBrush(strong)
             for hit in self._search_current:
                 painter.drawRect(hit)
+        if self._text_selection_rects:  # read-only flow selection (X4)
+            accent = QColor(theme.accent())
+            fill = QColor(accent)
+            fill.setAlpha(70)
+            pen = QPen(accent)
+            pen.setCosmetic(True)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.setBrush(fill)
+            for rect in self._text_selection_rects:
+                painter.drawRect(rect)
         if self._reveal_rects:  # faint dashed underlay — hover/selection on top
             accent = QColor(theme.accent())
             accent.setAlpha(120)

@@ -42,6 +42,7 @@ from pdfapp.search_bar import SearchBar
 from pdfapp.text_editor_overlay import PT_PROPERTY, ParagraphEditorOverlay, TextEditorOverlay
 from pdfapp.thumbnail_panel import ThumbnailPanel
 from pdfapp.undo import SnapshotCommand, undo_limit_for
+from pdfcore import textselect
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
     FLAG_BOLD,
@@ -161,6 +162,9 @@ class DocumentView(QWidget):
             lambda kind: self.hoverHintChanged.emit(hover_hint(kind, self._dblclick_paragraph))
         )
         self._canvas.selectDragStarted.connect(self._on_select_drag_started)
+        self._canvas.textSelectMoved.connect(self._on_text_select_moved)
+        self._canvas.textSelectFinished.connect(self._on_text_select_finished)
+        self._canvas.copyRequested.connect(self.copy_selection)
         self._canvas.escapePressed.connect(self._on_escape)
         self._canvas.deleteSelectionRequested.connect(self._on_delete_selection)
         # Signal-to-signal: armed state feeds chrome sync (checked actions).
@@ -202,6 +206,15 @@ class DocumentView(QWidget):
         # Click-to-select state (U6): ("text"|"image", page, Paragraph|ImageInfo).
         # The canvas only displays the chrome; this is the source of truth.
         self._selection: tuple[str, int, object] | None = None
+        # Read-only word-snapped flow text selection (X4). The selection lives
+        # in PAGE space as (line, word) positions into the current page's
+        # reading-order lines (cached in _text_lines); the canvas only draws the
+        # rects. Cleared on page change / entering edit mode / mutation / close.
+        self._text_selection: textselect.Selection | None = None
+        self._text_sel_anchor_pos: textselect.Position | None = None
+        self._text_sel_anchor_pt: tuple[float, float] | None = None
+        self._text_lines: list | None = None
+        self._text_lines_page = -1
         # Armed one-shot click action: ("text", None) | ("image", Path).
         # The canvas' insertPointSelected feeds it. (Highlighting uses the
         # canvas' region-select mode instead — a dragged window.)
@@ -340,10 +353,13 @@ class DocumentView(QWidget):
         if on == self._edit_mode:
             return
         self._edit_mode = on
+        self._clear_text_selection()  # the read-only selection is mode-specific (X4)
+        # Drop any hover chrome/cursor on BOTH transitions — entering edit mode
+        # must also reset the read-only I-beam (X4), not just leaving it.
+        self._canvas.clear_hover()
         if not on:
             self._commit_open_editor()
             self.cancel_armed_mode()
-            self._canvas.clear_hover()
             self._clear_selection()
         self._push_reveal_chrome()  # reveal-all displays only in edit mode
         self.stateChanged.emit()
@@ -400,6 +416,7 @@ class DocumentView(QWidget):
         index = max(0, min(index, self._doc.page_count - 1))
         if index != self._current_page:
             self._clear_selection()  # a selection never outlives its page view
+            self._clear_text_selection()  # nor does the read-only text selection
         self._current_page = index
         self._show_page(index)
         self.stateChanged.emit()
@@ -722,9 +739,11 @@ class DocumentView(QWidget):
 
         The canvas reports the RAW gesture (``block`` = Ctrl held); the U8
         sub-mode sets the default target and Ctrl is a momentary override:
-        ``target = sub_mode XOR ctrl``. Inert in read-only mode.
+        ``target = sub_mode XOR ctrl``. In read-only mode it selects the word
+        under the cursor (X4) instead of opening an editor.
         """
         if not self._edit_mode:
+            self._select_word_at(sx, sy)  # read-only: word selection (X4)
             return
         self._commit_open_editor()  # apply any in-progress edit first
         n = self._current_page
@@ -1563,6 +1582,7 @@ class DocumentView(QWidget):
         selected element accepts a move/resize drag instead — click first,
         then drag (deliberate: a stray drag must never move text)."""
         if not self._edit_mode:
+            self._begin_text_selection(sx, sy)  # read-only flow selection (X4)
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
@@ -1652,6 +1672,125 @@ class DocumentView(QWidget):
         self._multi_paragraphs = []
         self._canvas.clear_selection()
 
+    # --- read-only flow text selection + copy (X4) ------------------------
+    def _page_text_lines(self) -> list:
+        """The current page's reading-order lines for text selection (X4).
+
+        Cached per page and self-invalidated on a page change; mutations clear
+        it via after_command. Read-only never mutates, so the cache stays valid
+        for the whole time a selection can live.
+        """
+        if self._text_lines is None or self._text_lines_page != self._current_page:
+            self._text_lines = self._doc.text_lines(self._current_page)
+            self._text_lines_page = self._current_page
+        return self._text_lines
+
+    def _begin_text_selection(self, sx: float, sy: float) -> None:
+        """A plain read-only press anchors a flow selection at the nearest
+        text position and accepts the drag. Inert (drag not accepted) on a
+        page with no native words — scanned pages have nothing to select."""
+        self._clear_text_selection()  # a new drag replaces any prior selection
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        anchor = textselect.position_at(self._page_text_lines(), px, py)
+        if anchor is None:
+            return
+        self._text_sel_anchor_pos = anchor
+        self._text_sel_anchor_pt = (px, py)
+        self._canvas.begin_text_selection(sx, sy)
+
+    def _on_text_select_moved(self, sx: float, sy: float) -> None:
+        """Extend the flow selection to the live cursor position (word-snapped)."""
+        if self._text_sel_anchor_pos is None:
+            return
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        lines = self._page_text_lines()
+        cursor = textselect.position_at(lines, px, py)
+        self._text_selection = textselect.selection_span(lines, self._text_sel_anchor_pos, cursor)
+        self._push_text_selection_chrome()
+
+    def _on_text_select_finished(self, sx: float, sy: float) -> None:
+        """Finalize the flow selection. A press with no real drag is a click,
+        which deselects (matches Acrobat: click to place, drag to select)."""
+        anchor_pos = self._text_sel_anchor_pos
+        anchor_pt = self._text_sel_anchor_pt
+        self._text_sel_anchor_pos = None
+        self._text_sel_anchor_pt = None
+        if anchor_pos is None:
+            return
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        if anchor_pt is not None and abs(px - anchor_pt[0]) < 2.0 and abs(py - anchor_pt[1]) < 2.0:
+            self._clear_text_selection()  # a click, not a drag — deselect
+            return
+        lines = self._page_text_lines()
+        cursor = textselect.position_at(lines, px, py)
+        self._text_selection = textselect.selection_span(lines, anchor_pos, cursor)
+        self._push_text_selection_chrome()
+
+    def _select_word_at(self, sx: float, sy: float) -> None:
+        """Read-only double-click: select the whole word under the cursor (X4)."""
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        lines = self._page_text_lines()
+        pos = textselect.word_at(lines, px, py)
+        if pos is None:
+            self._clear_text_selection()
+            return
+        self._text_selection = textselect.selection_span(lines, pos, pos)
+        self._push_text_selection_chrome()
+
+    def copy_selection(self) -> None:
+        """Copy the read-only text selection to the clipboard (X4: Ctrl+C or
+        the read-only context menu). No-op in edit mode or with no selection;
+        a pure read — the undo stack is never touched."""
+        if self._edit_mode or self._text_selection is None:
+            return
+        text = textselect.selection_text(self._page_text_lines(), self._text_selection)
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _push_text_selection_chrome(self) -> None:
+        """(Re-)display the text-selection rects (scene px) — re-pushed after a
+        page show and every re-render, exactly like the search chrome."""
+        if self._text_selection is None:
+            self._canvas.clear_text_selection()
+            return
+        n = self._current_page
+        rects = textselect.selection_rects(self._page_text_lines(), self._text_selection)
+        zoom = self._canvas.render_zoom
+        rot = self._doc.page_rotation(n)
+        size = self._doc.page_size(n)
+        scene = [
+            page_coords.page_rect_to_scene(r, render_zoom=zoom, rotation=rot, page_size_pts=size)
+            for r in rects
+        ]
+        self._canvas.set_text_selection_rects(scene)
+
+    def _clear_text_selection(self) -> None:
+        self._text_sel_anchor_pos = None
+        self._text_sel_anchor_pt = None
+        if self._text_selection is None:
+            return
+        self._text_selection = None
+        self._canvas.clear_text_selection()
+
+    def _read_only_context_menu(self, sx: float, sy: float) -> None:
+        """Read-only right-click: a single Copy for the current selection (X4).
+
+        The full edit-mode menu is untouched; this is the minimal read-only
+        branch. Only shown when there is a selection to copy."""
+        if self._text_selection is None or not self.isVisible():
+            return  # nothing to copy / offscreen tests call copy_selection directly
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        copy_action = menu.addAction(icons.icon("copy"), "Copy")
+        if menu.exec(QCursor.pos()) is copy_action:
+            self.copy_selection()
+
     def _merge_selected_paragraphs(self) -> None:
         """Merge the multi-selected text boxes into ONE paragraph (E10.7).
 
@@ -1696,6 +1835,9 @@ class DocumentView(QWidget):
         if self._selection is not None:
             self._clear_selection()
             return
+        if self._text_selection is not None:  # read-only text selection (X4)
+            self._clear_text_selection()
+            return
         if not self._search_bar.isHidden():  # search close is LAST (SR2)
             self.close_search()
 
@@ -1727,7 +1869,12 @@ class DocumentView(QWidget):
     def _on_hover_moved(self, sx: float, sy: float) -> None:
         """Synchronous hover hit-test against the cached page geometry."""
         if not self._edit_mode:
-            self._canvas.clear_hover()  # read-only: a clean viewer
+            # Read-only: an I-beam over selectable words (X4), else clean.
+            n = self._current_page
+            px, py = self._scene_point_to_page(sx, sy, n)
+            self._canvas.set_text_hover(
+                textselect.word_at(self._page_text_lines(), px, py) is not None
+            )
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
@@ -1874,6 +2021,7 @@ class DocumentView(QWidget):
         CLICK POINT directly — no arm-then-click detour.
         """
         if not self._edit_mode:
+            self._read_only_context_menu(sx, sy)  # read-only: just Copy (X4)
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
@@ -2174,6 +2322,8 @@ class DocumentView(QWidget):
         """
         kind, page = scope
         self._clear_selection()  # the selected object may no longer exist
+        self._clear_text_selection()  # its (line, word) positions may be stale
+        self._text_lines = None  # content changed — rebuild the line cache
         self.clear_search_results()  # hit rects describe pre-mutation content
         self._current_page = min(self._current_page, self._doc.page_count - 1)
         if kind == "page":
@@ -2198,6 +2348,7 @@ class DocumentView(QWidget):
         self._cache.clear()
         self._geometry.clear()
         self._ocr_words.clear()
+        self._text_lines = None  # content may have changed — rebuild on next use (X4)
 
     def _page_pixmap(self, index: int, render_zoom: float):
         key = (index, "main", render_zoom)
@@ -2230,6 +2381,7 @@ class DocumentView(QWidget):
             self._push_selection_chrome()  # rescale to the new render zoom
             self._push_reveal_chrome()
             self._push_search_chrome()
+            self._push_text_selection_chrome()
 
     def _populate_thumbnails(self) -> None:
         pixmaps = [self._thumb_pixmap(i) for i in range(self._doc.page_count)]
@@ -2245,4 +2397,5 @@ class DocumentView(QWidget):
         self._push_selection_chrome()
         self._push_reveal_chrome()
         self._push_search_chrome()
+        self._push_text_selection_chrome()
         self._thumbnails.set_current(self._current_page)

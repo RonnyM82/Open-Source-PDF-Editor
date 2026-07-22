@@ -71,6 +71,7 @@ _NAMES = {
     "delete_image": "mdi6.image-remove-outline",
     "rotate_image_cw": "mdi6.rotate-right",
     "rotate_image_ccw": "mdi6.rotate-left",
+    "copy": "mdi6.content-copy",
     # Text style
     "bold": "mdi6.format-bold",
     "italic": "mdi6.format-italic",
