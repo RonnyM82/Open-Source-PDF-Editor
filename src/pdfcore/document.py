@@ -282,16 +282,40 @@ class PdfDocument:
         """Insert NEW rich text at a baseline point on page ``n`` (E9)."""
         textedit.insert_new_runs(self._doc, n, point, runs)
 
-    def highlight(self, n: int, span: TextSpan) -> None:
-        """Add a highlight annotation over ``span`` on page ``n`` (E7)."""
-        textedit.add_highlight(self._doc, n, span)
+    def highlight(
+        self, n: int, span: TextSpan, color: tuple[float, float, float] | None = None
+    ) -> None:
+        """Add a highlight annotation over ``span`` on page ``n`` (E7).
 
-    def highlight_region(self, n: int, rect: tuple[float, float, float, float]) -> int:
+        ``color`` is an ``(r, g, b)`` 0-1 stroke colour; ``None`` = yellow.
+        """
+        textedit.add_highlight(self._doc, n, span, color)
+
+    def highlight_region(
+        self,
+        n: int,
+        rect: tuple[float, float, float, float],
+        color: tuple[float, float, float] | None = None,
+    ) -> int:
         """Highlight the text inside a selection window on page ``n``.
 
         Character-level clipping; returns the number of annotations added.
+        ``color`` is an ``(r, g, b)`` 0-1 stroke colour; ``None`` = yellow.
         """
-        return textedit.highlight_region(self._doc, n, rect)
+        return textedit.highlight_region(self._doc, n, rect, color)
+
+    def highlight_rects(
+        self,
+        n: int,
+        rects: list[tuple[float, float, float, float]],
+        color: tuple[float, float, float] | None = None,
+    ) -> int:
+        """Highlight per-line union rects (a text SELECTION) on page ``n``.
+
+        One annotation per rect; returns the count. ``color`` is an
+        ``(r, g, b)`` 0-1 stroke colour; ``None`` = yellow.
+        """
+        return textedit.highlight_rects(self._doc, n, rects, color)
 
     # --- inserted-box registry (E10; identity stored IN the document) ------
     def boxes(self, n: int | None = None) -> list[BoxRecord]:

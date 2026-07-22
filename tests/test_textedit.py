@@ -2091,6 +2091,88 @@ def test_add_highlight_roundtrip(quote_pdf, tmp_path):
         reopened.close()
 
 
+# --- highlight colour + selection rects (A1) ----------------------------------
+
+
+def _one_line_pdf(tmp_path, text="alpha beta gamma"):
+    src = tmp_path / "h.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 100), text, fontsize=10)
+    doc.save(str(src))
+    doc.close()
+    return src
+
+
+def test_highlight_rects_roundtrip(tmp_path):
+    src = _one_line_pdf(tmp_path)
+    rects = [(72, 92, 140, 102), (72, 104, 140, 114)]
+    out = tmp_path / "out.pdf"
+    with PdfDocument.open(src) as pdoc:
+        count = pdoc.highlight_rects(0, rects)
+        pdoc.save(out)
+
+    assert count == 2
+    reopened = pymupdf.open(str(out))
+    try:
+        page = reopened[0]  # keep the page alive — annots orphan otherwise
+        annots = list(page.annots())
+        assert len(annots) == 2
+        assert all(a.type[0] == pymupdf.PDF_ANNOT_HIGHLIGHT for a in annots)
+        assert "alpha" in page.get_text()  # non-destructive
+    finally:
+        reopened.close()
+
+
+def test_highlight_rects_color_roundtrip(tmp_path):
+    src = _one_line_pdf(tmp_path, "colour me")
+    pink = (1.0, 0.25, 0.5)
+    out = tmp_path / "out.pdf"
+    with PdfDocument.open(src) as pdoc:
+        pdoc.highlight_rects(0, [(72, 92, 140, 102)], color=pink)
+        pdoc.save(out)
+
+    reopened = pymupdf.open(str(out))
+    try:
+        annot = next(reopened[0].annots())
+        assert annot.colors["stroke"] == pytest.approx(pink, abs=0.02)
+    finally:
+        reopened.close()
+
+
+def test_highlight_rects_default_is_yellow(tmp_path):
+    src = _one_line_pdf(tmp_path, "default yellow")
+    with PdfDocument.open(src) as pdoc:
+        pdoc.highlight_rects(0, [(72, 92, 160, 102)])
+        annot = next(pdoc._doc[0].annots())
+        assert annot.colors["stroke"] == pytest.approx((1.0, 1.0, 0.0), abs=0.05)
+
+
+def test_highlight_region_color(tmp_path):
+    src = _one_line_pdf(tmp_path, "region colour test")
+    blue = (0.25, 0.77, 1.0)
+    with PdfDocument.open(src) as pdoc:
+        count = pdoc.highlight_region(0, (60, 92, 300, 104), color=blue)
+        annot = next(pdoc._doc[0].annots())
+        assert count >= 1
+        assert annot.colors["stroke"] == pytest.approx(blue, abs=0.02)
+
+
+def test_highlight_span_color_roundtrip(quote_pdf, tmp_path):
+    green = (0.46, 1.0, 0.01)
+    out = tmp_path / "out.pdf"
+    with PdfDocument.open(quote_pdf.path) as doc:
+        span = _find(doc.text_spans(0), quote_pdf.price)
+        doc.highlight(0, span, color=green)
+        doc.save(out)
+
+    reopened = pymupdf.open(str(out))
+    try:
+        annot = next(reopened[0].annots())
+        assert annot.colors["stroke"] == pytest.approx(green, abs=0.02)
+    finally:
+        reopened.close()
+
+
 # --- extraction: real quote sample (local-only, skips when absent) ---------
 
 

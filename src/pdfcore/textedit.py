@@ -1786,21 +1786,35 @@ def insert_new_runs(
         _insert_line(page, x, y + i * pitch, line)
 
 
-def add_highlight(doc: pymupdf.Document, page_index: int, span: TextSpan) -> None:
+def add_highlight(
+    doc: pymupdf.Document,
+    page_index: int,
+    span: TextSpan,
+    color: tuple[float, float, float] | None = None,
+) -> None:
     """Highlight one span (a standard PDF highlight annotation, E7).
 
     Additive and non-destructive — the annotation sits over the text. The
     page must stay referenced while the annot is touched: a ``doc[n]``
     temporary gets garbage-collected and orphans the annotation ("annotation
     not bound to any page").
+
+    ``color`` is an ``(r, g, b)`` tuple of 0-1 floats for the highlight STROKE
+    colour (highlights use stroke, not fill); ``None`` keeps PyMuPDF's default
+    yellow. Colour must be set on the annot AFTER creation and before update().
     """
     page = doc[page_index]
     annot = page.add_highlight_annot(pymupdf.Rect(span.bbox))
+    if color is not None:
+        annot.set_colors(stroke=color)
     annot.update()
 
 
 def highlight_region(
-    doc: pymupdf.Document, page_index: int, rect: tuple[float, float, float, float]
+    doc: pymupdf.Document,
+    page_index: int,
+    rect: tuple[float, float, float, float],
+    color: tuple[float, float, float] | None = None,
 ) -> int:
     """Highlight the text inside a selection window (E9.1). Returns the
     number of highlight annotations added.
@@ -1810,6 +1824,8 @@ def highlight_region(
     annotation per contiguous stretch per line, so the marks hug the text
     like a real marker instead of one box over whitespace. Whitespace-only
     stretches are skipped. Same page-reference gotcha as add_highlight.
+
+    ``color`` is an ``(r, g, b)`` 0-1 stroke colour; ``None`` = default yellow.
     """
     page = doc[page_index]
     region = pymupdf.Rect(rect)
@@ -1827,6 +1843,8 @@ def highlight_region(
                         for bb in stretch[1:]:
                             union |= pymupdf.Rect(bb)
                         annot = page.add_highlight_annot(union)
+                        if color is not None:
+                            annot.set_colors(stroke=color)
                         annot.update()
                         count += 1
                     stretch, stretch_text = [], []
@@ -1842,6 +1860,31 @@ def highlight_region(
                         flush()
                 flush()
     return count
+
+
+def highlight_rects(
+    doc: pymupdf.Document,
+    page_index: int,
+    rects: list[tuple[float, float, float, float]],
+    color: tuple[float, float, float] | None = None,
+) -> int:
+    """Add one highlight annotation per rect (page space, unrotated). Returns
+    the count added.
+
+    Used for a text-SELECTION highlight (X4): the selection already names the
+    exact words per visual line, so its per-line union rects map straight onto
+    highlight annotations — no character re-clipping (which could disagree with
+    the words the user selected). ``color`` is an ``(r, g, b)`` 0-1 stroke
+    colour; ``None`` = default yellow. Same page-reference gotcha as
+    ``add_highlight`` — hold ``page`` across the whole loop.
+    """
+    page = doc[page_index]
+    for rect in rects:
+        annot = page.add_highlight_annot(pymupdf.Rect(rect))
+        if color is not None:
+            annot.set_colors(stroke=color)
+        annot.update()
+    return len(rects)
 
 
 def _embedded_font_map(doc: pymupdf.Document, page_index: int) -> dict[str, bool]:
