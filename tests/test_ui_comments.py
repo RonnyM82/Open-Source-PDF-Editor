@@ -139,15 +139,19 @@ def test_search_bar_comment_toggle(qapp, quote_pdf):
         window.close()
 
 
-def test_comments_inert_in_read_only(qapp, quote_pdf):
+def test_comments_arm_in_markup_mode(qapp, quote_pdf):
+    """A2: comment/callout insertion is available in Markup mode (annotations
+    are decoupled from edit mode)."""
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
-        view = window.active_view  # read-only by default (U0)
+        view = window.active_view  # Markup mode by default (U0)
+        assert view.edit_mode is False
         view.begin_insert_comment()
-        assert view.armed_action is None  # gated
+        assert view.armed_action == "comment"
+        view.cancel_armed_mode()
         view.begin_insert_callout()
-        assert view.armed_action is None
+        assert view.armed_action == "callout_target"
     finally:
         window.close()
 
@@ -209,8 +213,8 @@ def test_retarget_callout_one_click(qapp, quote_pdf):
         view.undo_stack.undo()
         assert view.document.comments(0)[0].target == pytest.approx((100.0, 300.0), abs=1.0)
 
-        view.set_edit_mode(False)  # read-only: arming is inert
+        view.set_edit_mode(False)  # Markup mode: retarget stays available (A2)
         view.begin_retarget_callout(0, view.document.comments(0)[0])
-        assert view.armed_action is None
+        assert view.armed_action == "retarget"
     finally:
         window.close()

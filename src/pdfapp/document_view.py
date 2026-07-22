@@ -347,24 +347,23 @@ class DocumentView(QWidget):
         return self._edit_mode
 
     def set_edit_mode(self, on: bool) -> None:
-        """Flip between read-only viewing and editing.
+        """Flip between Markup mode (annotate) and Edit mode (content editing).
 
-        Leaving edit mode commits any open in-place editor (same semantics
-        as click-away-applies) and disarms one-shot modes. The undo stack is
-        untouched — the mode gates NEW interactions, not document state.
+        A mode switch is a clean slate for transient interaction state in BOTH
+        directions: commit any open in-place editor (comment editors can be open
+        in Markup mode too), disarm one-shot modes, drop element + text
+        selection and hover chrome. The undo stack is untouched — the mode gates
+        which NEW interactions are offered, not document state.
         """
         on = bool(on)
         if on == self._edit_mode:
             return
         self._edit_mode = on
-        self._clear_text_selection()  # the read-only selection is mode-specific (X4)
-        # Drop any hover chrome/cursor on BOTH transitions — entering edit mode
-        # must also reset the read-only I-beam (X4), not just leaving it.
-        self._canvas.clear_hover()
-        if not on:
-            self._commit_open_editor()
-            self.cancel_armed_mode()
-            self._clear_selection()
+        self._commit_open_editor()  # apply any in-progress edit (either mode)
+        self.cancel_armed_mode()
+        self._clear_selection()
+        self._clear_text_selection()  # the marquee selection is Markup-mode only (X4)
+        self._canvas.clear_hover()  # reset the I-beam / hover outline
         self._push_reveal_chrome()  # reveal-all displays only in edit mode
         self.stateChanged.emit()
 
@@ -746,9 +745,6 @@ class DocumentView(QWidget):
         ``target = sub_mode XOR ctrl``. In read-only mode it selects the word
         under the cursor (X4) instead of opening an editor.
         """
-        if not self._edit_mode:
-            self._select_word_at(sx, sy)  # read-only: word selection (X4)
-            return
         self._commit_open_editor()  # apply any in-progress edit first
         n = self._current_page
         px, py = page_coords.scene_to_page(
@@ -763,8 +759,13 @@ class DocumentView(QWidget):
         # outlined paragraph starts the edit too — not just its glyphs.
         geometry = self.page_geometry(n)
         target = hover_target(geometry, px, py)
+        # A comment is markup — double-click edits it in EITHER mode (comments
+        # float on top). Checked BEFORE the Markup-mode word-selection branch.
         if target is not None and target.kind == "comment":
-            self._begin_comment_edit(n, target.payload)  # markup floats on top
+            self._begin_comment_edit(n, target.payload)
+            return
+        if not self._edit_mode:
+            self._select_word_at(sx, sy)  # Markup mode: word selection (X4)
             return
         if target is not None and target.kind == "text":
             para = target.payload
@@ -1158,29 +1159,32 @@ class DocumentView(QWidget):
 
     def begin_insert_comment(self) -> None:
         """Arm click-to-place for a review comment (markup; never prints by
-        default)."""
-        if not self._edit_mode or not self._canvas.has_page:
+        default). An ANNOTATION — available in Markup mode, not gated on edit."""
+        if not self._canvas.has_page:
             return
         self._click_action = ("comment", None)
         self._canvas.arm_insert_point("Click where the comment should go · Esc cancels")
 
     def begin_insert_callout(self) -> None:
-        """Arm a TWO-click callout: first the arrow target, then the box."""
-        if not self._edit_mode or not self._canvas.has_page:
+        """Arm a TWO-click callout: first the arrow target, then the box.
+        An ANNOTATION — available in Markup mode."""
+        if not self._canvas.has_page:
             return
         self._click_action = ("callout_target", None)
         self._canvas.arm_insert_point("Click what the callout should point AT · Esc cancels")
 
     def begin_retarget_callout(self, n: int, comment) -> None:
-        """Arm one click to re-point a callout's arrowhead (context menu)."""
-        if not self._edit_mode or not self._canvas.has_page:
+        """Arm one click to re-point a callout's arrowhead (context menu).
+        An ANNOTATION edit — available in Markup mode."""
+        if not self._canvas.has_page:
             return
         self._click_action = ("retarget", (n, comment.xref))
         self._canvas.arm_insert_point("Click what the arrowhead should point AT · Esc cancels")
 
     def begin_highlight(self) -> None:
-        """Arm a window selection: drag across the text to highlight it."""
-        if not self._edit_mode or not self._canvas.has_page:
+        """Arm a window selection: drag across the text to highlight it.
+        An ANNOTATION — available in Markup mode."""
+        if not self._canvas.has_page:
             return
         self._click_action = None
         self._canvas.arm_region_select("Drag a window across the text to highlight · Esc cancels")
@@ -1585,12 +1589,18 @@ class DocumentView(QWidget):
         """Plain press: select what's under it. A press on the ALREADY
         selected element accepts a move/resize drag instead — click first,
         then drag (deliberate: a stray drag must never move text)."""
-        if not self._edit_mode:
-            self._begin_text_selection(sx, sy)  # read-only flow selection (X4)
-            return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
         target = hover_target(self.page_geometry(n), px, py)
+        # A comment is markup — selectable + draggable in EITHER mode (comments
+        # float on top), so this precedes both the Markup marquee and content
+        # selection.
+        if target is not None and target.kind == "comment":
+            self._select_and_drag_comment(n, px, py, target)
+            return
+        if not self._edit_mode:
+            self._begin_text_selection(sx, sy)  # Markup: marquee text selection (X4)
+            return
         if target is None:
             self._clear_selection()
             return
@@ -1602,24 +1612,23 @@ class DocumentView(QWidget):
         ):
             self.toggle_multi_select(n, target.payload)  # Shift+click adds (E10.7)
             return
-        if target.kind == "comment":
-            kind = "comment"
-        elif target.kind.startswith("image"):
-            kind = "image"
-        else:
-            kind = "text"
+        kind = "image" if target.kind.startswith("image") else "text"
         if self._selection == (kind, n, target.payload):
             self._accept_target_drag(n, px, py, target)
             return
         self._selection = (kind, n, target.payload)
         self._push_selection_chrome()
-        if kind == "comment":
-            # Comments drag on the FIRST press (user request, 2026-07-18):
-            # the click-first rule protects CONTENT from stray drags (a text
-            # move redacts and reinserts), but moving markup is a pure
-            # re-anchor and instantly undoable. A press without a real drag
-            # still only selects (sub-1pt offsets are ignored on release).
-            self._accept_target_drag(n, px, py, target)
+
+    def _select_and_drag_comment(self, n: int, px: float, py: float, target) -> None:
+        """Select a comment and accept its move drag on the FIRST press — works
+        in either mode. Moving markup is a pure re-anchor and instantly
+        undoable, so it is exempt from the U6 click-first rule (which protects
+        CONTENT from stray drags); a press without a real drag still only
+        selects (sub-1pt offsets are ignored on release)."""
+        if self._selection != ("comment", n, target.payload):
+            self._selection = ("comment", n, target.payload)
+            self._push_selection_chrome()
+        self._accept_target_drag(n, px, py, target)
 
     def _push_selection_chrome(self) -> None:
         """(Re-)display the selection on the canvas — also called after
@@ -1776,20 +1785,66 @@ class DocumentView(QWidget):
         self._text_selection = None
         self._canvas.clear_text_selection()
 
-    def _read_only_context_menu(self, sx: float, sy: float) -> None:
-        """Read-only right-click: a single Copy for the current selection (X4).
+    def _annotate_context_menu(self, sx: float, sy: float) -> None:
+        """Markup-mode right-click: annotation actions only — edit/delete a
+        comment, retarget a callout, highlight the text under the cursor, copy a
+        text selection, or add a comment here. Content-edit items stay in the
+        edit-mode menu.
 
-        The full edit-mode menu is untouched; this is the minimal read-only
-        branch. Only shown when there is a selection to copy."""
-        if self._text_selection is None or not self.isVisible():
-            return  # nothing to copy / offscreen tests call copy_selection directly
+        Only built when on screen — offscreen tests call the dispatch methods
+        (copy_selection, _highlight_rect, _open_comment_editor, …) directly.
+        """
+        if not self.isVisible():
+            return
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        geometry = self.page_geometry(n)
+        span = page_coords.span_at(geometry.spans, px, py)
+        comment = self._doc.comment_at(n, px, py)
         from PySide6.QtGui import QCursor
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        copy_action = menu.addAction(icons.icon("copy"), "Copy")
-        if menu.exec(QCursor.pos()) is copy_action:
+        actions: dict[str, object] = {}
+        if comment is not None:  # markup floats on top: its menu comes first
+            actions["edit_comment"] = menu.addAction(
+                icons.icon("insert_comment"), "Edit comment\tDouble-click"
+            )
+            if comment.kind == "callout":
+                actions["retarget"] = menu.addAction(
+                    icons.icon("insert_callout"), "Move arrowhead…"
+                )
+            actions["delete_comment"] = menu.addAction(
+                icons.icon("delete_image"), "Delete comment\tDel"
+            )
+            menu.addSeparator()
+        if self._text_selection is not None:
+            actions["copy"] = menu.addAction(icons.icon("copy"), "Copy")
+        elif span is not None:
+            actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
+        if comment is None:  # adding a comment ON a comment would stack them
+            if not menu.isEmpty():
+                menu.addSeparator()
+            actions["add_comment"] = menu.addAction(
+                icons.icon("insert_comment"), "Add comment here"
+            )
+        if menu.isEmpty():
+            return
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        if chosen is actions.get("edit_comment"):
+            self._begin_comment_edit(n, comment)
+        elif chosen is actions.get("retarget"):
+            self.begin_retarget_callout(n, comment)
+        elif chosen is actions.get("delete_comment"):
+            self._delete_comment_at(n, comment.xref)
+        elif chosen is actions.get("copy"):
             self.copy_selection()
+        elif chosen is actions.get("highlight"):
+            self._highlight_rect(n, span.bbox)
+        elif chosen is actions.get("add_comment"):
+            self._open_comment_editor(n, px, py, None)
 
     def _merge_selected_paragraphs(self) -> None:
         """Merge the multi-selected text boxes into ONE paragraph (E10.7).
@@ -1842,15 +1897,18 @@ class DocumentView(QWidget):
             self.close_search()
 
     def _on_delete_selection(self) -> None:
-        """Delete/Backspace removes a selected IMAGE or COMMENT (paragraph
-        text is deleted through its editor instead)."""
-        if self._selection is None or not self._edit_mode:
+        """Delete/Backspace removes a selected COMMENT (either mode — markup) or
+        IMAGE (edit mode only — content). Paragraph text is deleted through its
+        editor instead. In Markup mode a selection can only ever be a comment."""
+        if self._selection is None:
             return
         kind, n, payload = self._selection
-        if kind == "image" and n == self._current_page:
-            self._delete_image_at(n, payload)
-        elif kind == "comment" and n == self._current_page:
+        if n != self._current_page:
+            return
+        if kind == "comment":
             self._delete_comment_at(n, payload.xref)
+        elif kind == "image" and self._edit_mode:
+            self._delete_image_at(n, payload)
 
     def _delete_comment_at(self, page_index: int, xref: int) -> None:
         def op(doc: PdfDocument) -> None:
@@ -1868,20 +1926,27 @@ class DocumentView(QWidget):
     # --- hover affordances (U2a) ------------------------------------------
     def _on_hover_moved(self, sx: float, sy: float) -> None:
         """Synchronous hover hit-test against the cached page geometry."""
-        if not self._edit_mode:
-            # Read-only: an I-beam over selectable words (X4), else clean.
-            n = self._current_page
-            px, py = self._scene_point_to_page(sx, sy, n)
-            self._canvas.set_text_hover(
-                textselect.word_at(self._page_text_lines(), px, py) is not None
-            )
-            return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
         target = hover_target(self.page_geometry(n), px, py)
-        if target is None:
-            self._canvas.clear_hover()
+        over_comment = target is not None and target.kind == "comment"
+        # Element hover outline: comments in EITHER mode (markup floats on top),
+        # every element in edit mode.
+        if self._edit_mode or over_comment:
+            self._canvas.set_text_hover(False)  # not an I-beam target
+            if target is None:
+                self._canvas.clear_hover()
+            else:
+                self._show_hover_target(n, target)
             return
+        # Markup mode, not over a comment: an I-beam over selectable words (X4),
+        # else clean. Clear a lingering comment outline first.
+        if self._canvas.hover_kind is not None:
+            self._canvas.clear_hover()
+        self._canvas.set_text_hover(textselect.word_at(self._page_text_lines(), px, py) is not None)
+
+    def _show_hover_target(self, n: int, target) -> None:
+        """Draw the hover outline (+ corner ticks) for ``target``."""
         zoom = self._canvas.render_zoom
         rot = self._doc.page_rotation(n)
         size = self._doc.page_size(n)
@@ -2021,7 +2086,7 @@ class DocumentView(QWidget):
         CLICK POINT directly — no arm-then-click detour.
         """
         if not self._edit_mode:
-            self._read_only_context_menu(sx, sy)  # read-only: just Copy (X4)
+            self._annotate_context_menu(sx, sy)  # Markup: comment / highlight / copy
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)

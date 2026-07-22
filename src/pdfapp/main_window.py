@@ -271,8 +271,9 @@ class MainWindow(QMainWindow):
         self._dark_theme_action.setChecked(theme.current_mode() == theme.DARK)
         self._dark_theme_action.toggled.connect(self._on_dark_theme_toggled)
 
-        # Per-document read-only/edit switch (U0). Documents open READ-ONLY;
-        # checked = the ACTIVE tab is editable. _sync_chrome reflects the
+        # Per-document Markup/Edit switch (U0). Documents open in MARKUP mode
+        # (annotate: highlight/comment/callout, select + copy); checked = the
+        # ACTIVE tab is in EDIT mode (content editing). _sync_chrome reflects the
         # active view's mode; the toggle handler drives it.
         self._edit_mode_action = QAction("&Edit mode", self)
         self._edit_mode_action.setCheckable(True)
@@ -365,6 +366,9 @@ class MainWindow(QMainWindow):
         self._insert_callout_action.setCheckable(True)
         self._insert_callout_action.triggered.connect(self.insert_callout)
 
+        # CONTENT edits — enabled only in edit mode (U0). Annotation actions
+        # deliberately are NOT here: highlight/comment/callout are available in
+        # Markup mode too (see _annotate_actions).
         self._page_edit_actions = (
             self._rotate_cw_action,
             self._rotate_ccw_action,
@@ -374,6 +378,10 @@ class MainWindow(QMainWindow):
             self._insert_action,
             self._insert_text_action,
             self._insert_image_action,
+        )
+        # ANNOTATIONS — markup, available whenever a document is open (Markup
+        # mode AND edit mode), like the read features. Enabled on `has` alone.
+        self._annotate_actions = (
             self._highlight_action,
             self._insert_comment_action,
             self._insert_callout_action,
@@ -514,6 +522,15 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         for action in self._page_edit_actions:
             edit_menu.addAction(action)
+
+        # Annotations (markup) are their own menu — available in Markup mode,
+        # not gated on edit mode. Kept as an attribute (shiboken invalidates
+        # transient menu wrappers; A4 adds the highlight-colour submenu here).
+        self._annotate_menu = self.menuBar().addMenu("&Annotate")
+        self._annotate_menu.addAction(self._highlight_action)
+        self._annotate_menu.addSeparator()
+        self._annotate_menu.addAction(self._insert_comment_action)
+        self._annotate_menu.addAction(self._insert_callout_action)
 
         # Kept as an attribute (like _window_menu): shiboken invalidates
         # transient wrappers fetched back via QAction.menu(), so tests and
@@ -1526,19 +1543,22 @@ class MainWindow(QMainWindow):
 
         for action in self._zoom_actions:
             action.setEnabled(has)
-        # Mutating actions require edit mode (U0); read-only is a clean viewer.
+        # CONTENT-edit actions require edit mode (U0).
         for action in self._page_edit_actions:
             action.setEnabled(has and edit_on)
         # A PDF must keep at least one page.
         self._delete_action.setEnabled(has and edit_on and count > 1)
         self._move_up_action.setEnabled(has and edit_on and not at_start)
         self._move_down_action.setEnabled(has and edit_on and not at_end)
-        # Undo/redo also park in read-only — a restore mutates the document.
-        # Safe to overrule the QUndoGroup: it re-enables only on stack
-        # activity, which user actions can't produce read-only — and a
-        # programmatic push re-syncs this chrome right after (stateChanged).
-        self._undo_action.setEnabled(edit_on and view is not None and view.undo_stack.canUndo())
-        self._redo_action.setEnabled(edit_on and view is not None and view.undo_stack.canRedo())
+        # Annotation actions are available in BOTH modes (highlight/comment/
+        # callout are markup, not content) — enabled on `has` alone.
+        for action in self._annotate_actions:
+            action.setEnabled(has)
+        # Undo/redo follow the stack in EITHER mode: annotations now mutate in
+        # Markup mode, so a restore must be reachable there too (undo is
+        # document-wide — it may also reverse an earlier content edit).
+        self._undo_action.setEnabled(view is not None and view.undo_stack.canUndo())
+        self._redo_action.setEnabled(view is not None and view.undo_stack.canRedo())
         self._edit_mode_action.setEnabled(has)
         self._edit_mode_action.blockSignals(True)
         self._edit_mode_action.setChecked(edit_on)
@@ -1560,7 +1580,7 @@ class MainWindow(QMainWindow):
         self._dblclick_para_action.blockSignals(True)
         self._dblclick_para_action.setChecked(bool(has and view.dblclick_paragraph))
         self._dblclick_para_action.blockSignals(False)
-        self._mode_label.setText(("Editing" if edit_on else "Read-only") if has else "")
+        self._mode_label.setText(("Editing" if edit_on else "Markup") if has else "")
         self._save_action.setEnabled(has)
         self._save_as_action.setEnabled(has)
         self._print_action.setEnabled(has)

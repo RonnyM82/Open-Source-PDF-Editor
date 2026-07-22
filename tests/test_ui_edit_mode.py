@@ -1,9 +1,11 @@
-"""Offscreen tests for the read-only vs edit mode container (U0).
+"""Offscreen tests for the Markup vs Edit mode container (U0 / A2).
 
-Documents open READ-ONLY: every editorial entry point is inert until the
-user deliberately switches that document to edit mode. Navigation, zoom and
-save never gate. Chrome (toolbar toggle, action enablement, the status-bar
-mode label) follows the ACTIVE tab's mode.
+Documents open in MARKUP mode: annotations (highlight / comment / callout) and
+read features (select, copy, find) work, but CONTENT-edit entry points
+(edit/delete text, insert text/image, image ops, page ops) are inert until the
+user switches that document to Edit mode. Navigation, zoom and save never gate.
+Chrome (toolbar toggle, action enablement, the status-bar mode label) follows
+the ACTIVE tab's mode.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ def _scene_center_of(view, bbox):
     )
 
 
-def test_documents_open_read_only(qapp, quote_pdf):
+def test_documents_open_in_markup_mode(qapp, quote_pdf):
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
@@ -40,9 +42,13 @@ def test_documents_open_read_only(qapp, quote_pdf):
         assert view.edit_mode is False
         assert window._edit_mode_action.isEnabled()
         assert not window._edit_mode_action.isChecked()
-        assert window._mode_label.text() == "Read-only"
+        assert window._mode_label.text() == "Markup"
+        # Content-edit actions are inert until edit mode...
         for action in window._page_edit_actions:
             assert not action.isEnabled()
+        # ...but annotation actions are available in Markup mode.
+        for action in window._annotate_actions:
+            assert action.isEnabled()
     finally:
         window.close()
 
@@ -65,7 +71,9 @@ def test_double_click_is_inert_until_edit_mode(qapp, quote_pdf):
         window.close()
 
 
-def test_armed_modes_inert_in_read_only(qapp, quote_pdf, sample_png, monkeypatch):
+def test_content_armed_modes_inert_in_markup(qapp, quote_pdf, sample_png, monkeypatch):
+    """CONTENT insert (text/image) stays inert in Markup mode; only edit mode
+    arms it. Annotation arming is covered separately (it works in Markup)."""
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
@@ -78,13 +86,35 @@ def test_armed_modes_inert_in_read_only(qapp, quote_pdf, sample_png, monkeypatch
         view.begin_insert_image()
         assert view._click_action is None
         assert not view._canvas._insert_armed
-        view.begin_highlight()
-        assert not view._canvas._region_armed
 
         view.set_edit_mode(True)
         view.begin_insert_text()
         assert view._click_action == ("text", None)
         assert view._canvas._insert_armed
+    finally:
+        window.close()
+
+
+def test_annotations_arm_in_markup_mode(qapp, quote_pdf):
+    """Highlight / comment / callout arm WITHOUT edit mode (markup, A2)."""
+    window = MainWindow()
+    try:
+        window.open_path(quote_pdf.path)
+        view = window.active_view
+        assert view.edit_mode is False
+
+        view.begin_highlight()
+        assert view._canvas._region_armed
+        assert view.armed_action == "highlight"
+        view.cancel_armed_mode()
+
+        view.begin_insert_comment()
+        assert view._canvas._insert_armed
+        assert view.armed_action == "comment"
+        view.cancel_armed_mode()
+
+        view.begin_insert_callout()
+        assert view.armed_action == "callout_target"
     finally:
         window.close()
 
@@ -175,8 +205,8 @@ def test_mode_chrome_follows_active_tab(qapp, quote_pdf, multipage_pdf):
 
         window._tabs.setCurrentWidget(first)
         assert not window._edit_mode_action.isChecked()
-        assert window._mode_label.text() == "Read-only"
-        assert not window._insert_text_action.isEnabled()
+        assert window._mode_label.text() == "Markup"
+        assert not window._insert_text_action.isEnabled()  # content: edit-mode only
 
         window._tabs.setCurrentWidget(second)  # per-document mode survives
         assert window._edit_mode_action.isChecked()
@@ -185,21 +215,25 @@ def test_mode_chrome_follows_active_tab(qapp, quote_pdf, multipage_pdf):
         window.close()
 
 
-def test_undo_redo_park_in_read_only(qapp, multipage_pdf):
+def test_undo_available_in_markup_after_annotation(qapp, quote_pdf):
+    """Annotations mutate in Markup mode, so undo/redo track the stack there —
+    not parked as in the old read-only model."""
     window = MainWindow()
     try:
-        window.open_path(multipage_pdf)
+        window.open_path(quote_pdf.path)
         view = window.active_view
-        view.set_edit_mode(True)
-        window.rotate_clockwise()
-        assert window._undo_action.isEnabled()
+        assert view.edit_mode is False
+        assert not window._undo_action.isEnabled()  # nothing to undo yet
 
-        view.set_edit_mode(False)
-        assert not window._undo_action.isEnabled()
-        assert view.dirty  # the mode switch never touches document state
+        span = _find_span(view, quote_pdf.price)
+        view._highlight_rect(0, span.bbox)  # a markup mutation
+        window._sync_chrome()
+        assert view.undo_stack.count() == 1
+        assert window._undo_action.isEnabled()  # undoable in Markup mode
 
-        view.set_edit_mode(True)
-        assert window._undo_action.isEnabled()
+        view.undo_stack.undo()
+        window._sync_chrome()
+        assert window._redo_action.isEnabled()
     finally:
         window.close()
 
