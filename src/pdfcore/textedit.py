@@ -1350,12 +1350,19 @@ def _rect_area(rect: tuple[float, ...]) -> float:
     return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
 
 
-def _normalize_text(s: str) -> str:
+def normalize_box_text(s: str) -> str:
     """Collapse all whitespace (incl. the U+00A0 an embedded TTF can emit) to
-    single spaces — so a fingerprint matches re-extracted text regardless of
-    word-wrap: a wrapped visual line is a contiguous SUBSTRING of the box's
-    logical text once whitespace is normalized."""
+    single spaces — so a box fingerprint matches re-extracted text regardless
+    of word-wrap: a wrapped visual line is a contiguous SUBSTRING of the box's
+    logical text once whitespace is normalized, and a whole paragraph's text
+    equals its fingerprint whether or not it wrapped. THE shared normalizer for
+    box ownership — `_line_region` (engine) and `DocumentView._box_for` (UI)
+    must agree, so both go through this."""
     return " ".join(s.split())
+
+
+# Internal alias (the engine's ownership helpers read it under the short name).
+_normalize_text = normalize_box_text
 
 
 def _line_text(line: dict) -> str:

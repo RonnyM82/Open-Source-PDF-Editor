@@ -160,6 +160,46 @@ def test_distribute_needs_three_boxes(qapp, tmp_path):
         window.close()
 
 
+def test_align_left_is_on_screen_left_on_a_rotated_page(qapp, tmp_path):
+    """Review finding: align/distribute must work in ON-SCREEN axes. On a
+    /Rotate 90 page, 'Align left' must share the boxes' on-screen left edge —
+    which is NOT the page-space left edge."""
+    from pdfapp import page_coords
+
+    path = tmp_path / "rot.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.set_rotation(90)
+    for x, y in ((120, 100), (160, 150), (80, 210)):
+        page.insert_text((x, y), f"box {x}", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        assert view.document.page_rotation(0) == 90
+        _select_all(view)
+        view._align_selected_boxes("left")
+
+        # Convert each box's new bbox to SCENE space and assert equal left edges.
+        def scene_left(p):
+            r = page_coords.page_rect_to_scene(
+                p.bbox,
+                render_zoom=view._canvas.render_zoom,
+                rotation=90,
+                page_size_pts=view.document.page_size(0),
+            )
+            return r[0]
+
+        lefts = [scene_left(p) for p in view.page_geometry(0).paragraphs]
+        assert max(lefts) - min(lefts) < 1.0  # aligned on the ON-SCREEN left
+    finally:
+        window.close()
+
+
 def test_align_survives_undo(qapp, tmp_path):
     window, view = _open(
         tmp_path, [(120, 100, 9, "alpha"), (160, 150, 9, "beta"), (80, 210, 9, "gamma")]

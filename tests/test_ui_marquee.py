@@ -178,6 +178,37 @@ def test_plain_click_clears_but_modified_click_keeps(qapp, tmp_path, monkeypatch
         window.close()
 
 
+def test_shift_marquee_does_not_fold_a_hidden_single_selection(qapp, tmp_path, monkeypatch):
+    """Review finding: a plain click on a box while a multi-selection is shown
+    sets _selection (invisible — multi has chrome priority). A later
+    Shift-marquee must NOT silently fold that hidden box into the group."""
+    window, view = _view(tmp_path)
+    try:
+        paras = _paras_by_y(view)
+        top, mid, bot = paras[0], paras[1], paras[2]
+
+        # Multi-select top + mid.
+        _set_mods(monkeypatch)
+        rect = (60, 90, max(top.bbox[2], mid.bbox[2]) + 10, mid.bbox[3] + 5)
+        _marquee(view, rect, direction="lr")
+        assert len(view._multi_paragraphs) == 2
+
+        # Plain-click the BOTTOM box: sets _selection (hidden behind multi chrome).
+        cx = (bot.bbox[0] + bot.bbox[2]) / 2
+        cy = (bot.bbox[1] + bot.bbox[3]) / 2
+        view._on_select_drag_started(*_scene(view, cx, cy))
+        assert view._selection is not None  # hidden single selection exists
+
+        # Shift-marquee a FAR-AWAY empty area (selects nothing): must not pull
+        # the hidden bottom box in.
+        _set_mods(monkeypatch, shift=True)
+        _marquee(view, (500, 500, 520, 520), direction="lr")
+        assert not any("row three" in pp.text for _pn, pp in view._multi_paragraphs)
+        assert len(view._multi_paragraphs) == 2  # still just top + mid
+    finally:
+        window.close()
+
+
 def test_canvas_begin_marquee_emits_on_release(qapp, tmp_path):
     """Wiring: begin_box_marquee + a real release event emits boxMarqueeFinished
     with the press and release scene points."""

@@ -14,6 +14,7 @@ pytest.importorskip("PySide6")
 import pymupdf  # noqa: E402
 
 from pdfapp.main_window import MainWindow  # noqa: E402
+from pdfcore.textedit import normalize_box_text as normalize  # noqa: E402
 
 
 def _blank(tmp_path):
@@ -95,6 +96,62 @@ def test_moved_box_over_existing_text_does_not_absorb_it(qapp, tmp_path):
         assert "preexisting two" in existing.text
         assert "floating" not in existing.text
         assert any(p.text == "floating label" for p in paras)
+    finally:
+        window.close()
+
+
+def test_box_for_returns_none_for_foreign_text_under_a_moved_box(qapp, tmp_path):
+    """Review finding: _box_for must mirror the engine's _line_region — a
+    fingerprinted box moved over pre-existing text must NOT be returned when
+    that foreign paragraph is edited/deleted (else its registry entry gets
+    hijacked)."""
+    path = tmp_path / "foreign.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((100, 200), "preexisting paragraph line", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        _insert(view, 100, 400, "LABEL")
+        label = _para_with(view, "LABEL")
+        dy = 202 - label.bbox[1]  # move LABEL up onto the existing paragraph
+        view._apply_box_offsets(0, [(label, (0.0, dy))], "Move text")
+
+        existing = _para_with(view, "preexisting")
+        # The box under the existing paragraph is the LABEL box; _box_for must
+        # NOT return it for the foreign paragraph.
+        assert view._box_for(view.document, 0, existing.bbox, existing.text) is None
+        # The LABEL box IS returned for its own content.
+        label = _para_with(view, "LABEL")
+        box = view._box_for(view.document, 0, label.bbox, label.text)
+        assert box is not None and normalize(box.text) == "LABEL"
+    finally:
+        window.close()
+
+
+def test_box_for_matches_a_wrapped_box_by_normalized_text(qapp, tmp_path):
+    """A wrapped box re-extracts as para.text with a newline, but its stored
+    fingerprint is the logical one-line text; _box_for must match them
+    NORMALIZED (not by exact equality, which the review flagged)."""
+    window = MainWindow()
+    try:
+        window.open_path(_blank(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        _insert(view, 100, 200, "alpha beta gamma")  # stored fingerprint, one line
+        box = view.document.boxes(0)[0]
+        para = _para_with(view, "alpha")
+        # Query _box_for with a NEWLINE-broken version of the same text (what a
+        # wrapped re-extraction produces). Exact equality would miss it.
+        wrapped = "alpha beta\ngamma"
+        assert normalize(wrapped) == normalize(box.text)
+        found = view._box_for(view.document, 0, para.bbox, wrapped)
+        assert found is not None and found.id == box.id
     finally:
         window.close()
 

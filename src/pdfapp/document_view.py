@@ -57,6 +57,7 @@ from pdfcore.textedit import (
     TextSpan,
     TextStyle,
     merge_paragraphs,
+    normalize_box_text,
 )
 
 # Thumbnails render at a fixed low dpi for speed; the main page renders at
@@ -364,9 +365,15 @@ class DocumentView(QWidget):
     @staticmethod
     def _box_for(doc: PdfDocument, n: int, bbox: tuple[float, float, float, float], text: str = ""):
         """The registered box a paragraph belongs to, or None for pre-existing
-        text. Among boxes whose rect contains the paragraph's centre, one whose
-        content matches ``text`` wins (task 5 — overlapping boxes); ties break
-        to the TIGHTEST rect."""
+        text. MUST agree with the engine's ``_line_region`` (they are the two
+        halves of the SAME ownership question). Among boxes whose rect contains
+        the paragraph's centre: one whose fingerprint matches ``text`` wins
+        (WHITESPACE-NORMALIZED — a wrapped box's re-extracted `para.text` joins
+        visual lines with "\\n" but normalizes equal to its logical stored
+        text); ties break to the TIGHTEST rect. When ``text`` is supplied and
+        NO fingerprint matches, a fingerprinted box must NOT be returned for
+        foreign text under it (mirrors `_line_region` returning -1) — fall back
+        to fingerprint-less legacy boxes only, else None."""
         cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         containing = [
             box
@@ -375,14 +382,20 @@ class DocumentView(QWidget):
         ]
         if not containing:
             return None
-        if text:
-            matches = [box for box in containing if box.text == text]
-            if matches:
-                containing = matches
 
         def area(box) -> float:
             return max(0.0, box.rect[2] - box.rect[0]) * max(0.0, box.rect[3] - box.rect[1])
 
+        if text:
+            needle = normalize_box_text(text)
+            matches = [
+                box for box in containing if box.text and normalize_box_text(box.text) == needle
+            ]
+            if matches:
+                return min(matches, key=area)
+            # No content match: a fingerprinted box does not own foreign text.
+            legacy = [box for box in containing if not box.text]
+            return min(legacy, key=area) if legacy else None
         return min(containing, key=area)
 
     # --- read-only / edit mode (U0) ---------------------------------------
@@ -1898,10 +1911,18 @@ class DocumentView(QWidget):
 
         current = [(pn, pp) for pn, pp in self._multi_paragraphs if pn == n]
         # Fold a single text selection into the group so a modified marquee
-        # extends whatever is currently shown as selected.
-        if (shift or ctrl) and self._selection is not None and self._selection[0] == "text":
+        # extends whatever is currently shown as selected — but ONLY when the
+        # single selection is what's actually shown. A multi-selection has
+        # chrome priority (`_push_selection_chrome`), so a `_selection` set
+        # underneath it is invisible and must not be silently folded in.
+        if (
+            (shift or ctrl)
+            and not current
+            and self._selection is not None
+            and self._selection[0] == "text"
+        ):
             _k, sn, sp = self._selection
-            if sn == n and not any(self._same_box(sp, pp) for _pn, pp in current):
+            if sn == n:
                 current.append((n, sp))
 
         if ctrl:  # remove the marquee set from the selection
@@ -2163,58 +2184,90 @@ class DocumentView(QWidget):
         n = self._current_page
         return [pp for pn, pp in self._multi_paragraphs if pn == n]
 
+    def _scene_delta_to_page(self, dsx: float, dsy: float, n: int) -> tuple[float, float]:
+        """Convert a SCENE (on-screen) offset to a page offset — rotation-safe
+        (deltas transform linearly; the group move does the same via
+        `_drag_offset`). Align/distribute reason in scene space so 'left'/'top'
+        mean on-screen left/top even on a rotated page."""
+        x0, y0 = self._scene_point_to_page(0.0, 0.0, n)
+        x1, y1 = self._scene_point_to_page(dsx, dsy, n)
+        return (x1 - x0, y1 - y0)
+
+    def _member_scene_rects(self, members, n: int):
+        """Each member paired with its bbox in SCENE space (rotation applied)."""
+        zoom = self._canvas.render_zoom
+        rot = self._doc.page_rotation(n)
+        size = self._doc.page_size(n)
+        return [
+            (
+                p,
+                page_coords.page_rect_to_scene(
+                    p.bbox, render_zoom=zoom, rotation=rot, page_size_pts=size
+                ),
+            )
+            for p in members
+        ]
+
     def _align_selected_boxes(self, edge: str) -> None:
         """Line the selected boxes up on a shared edge/centre (task 2). Moves
         the BOXES, not the text inside them. Anchored on the group's bounding
-        box (leftmost for 'left', etc.), matching Office/Illustrator."""
+        box (leftmost for 'left', etc.), matching Office/Illustrator. Computed
+        in SCENE space so the edges are the on-screen ones on a rotated page."""
         members = self._selected_members()
         if len(members) < 2:
             return
-        x0 = min(p.bbox[0] for p in members)
-        y0 = min(p.bbox[1] for p in members)
-        x1 = max(p.bbox[2] for p in members)
-        y1 = max(p.bbox[3] for p in members)
+        n = self._current_page
+        rects = self._member_scene_rects(members, n)
+        x0 = min(r[0] for _p, r in rects)
+        y0 = min(r[1] for _p, r in rects)
+        x1 = max(r[2] for _p, r in rects)
+        y1 = max(r[3] for _p, r in rects)
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
 
-        def offset(p: Paragraph) -> tuple[float, float]:
+        def scene_off(r) -> tuple[float, float]:
             if edge == "left":
-                return (x0 - p.bbox[0], 0.0)
+                return (x0 - r[0], 0.0)
             if edge == "right":
-                return (x1 - p.bbox[2], 0.0)
+                return (x1 - r[2], 0.0)
             if edge == "hcenter":
-                return (cx - (p.bbox[0] + p.bbox[2]) / 2, 0.0)
+                return (cx - (r[0] + r[2]) / 2, 0.0)
             if edge == "top":
-                return (0.0, y0 - p.bbox[1])
+                return (0.0, y0 - r[1])
             if edge == "bottom":
-                return (0.0, y1 - p.bbox[3])
-            return (0.0, cy - (p.bbox[1] + p.bbox[3]) / 2)  # vcenter
+                return (0.0, y1 - r[3])
+            return (0.0, cy - (r[1] + r[3]) / 2)  # vcenter
 
-        self._apply_box_offsets(
-            self._current_page, [(p, offset(p)) for p in members], "Align text boxes"
-        )
+        offsets = [(p, self._scene_delta_to_page(*scene_off(r), n)) for p, r in rects]
+        self._apply_box_offsets(n, offsets, "Align text boxes")
 
     def _distribute_selected_boxes(self, axis: str) -> None:
         """Space the selected boxes with EQUAL edge-to-edge gaps (task 3),
         anchored on the first and last box along ``axis`` ('v' or 'h'). Needs
-        ≥ 3 boxes (two extremes plus something to move between them)."""
+        ≥ 3 boxes (two extremes plus something to move between them). Computed
+        in SCENE space so 'vertical'/'horizontal' are the on-screen axes on a
+        rotated page. A negative gap (oversized/overlapping boxes) is left as
+        is — the extremes still pin, matching PowerPoint/Illustrator."""
         members = self._selected_members()
         if len(members) < 3:
             self.editWarning.emit("Select three or more text boxes to distribute.")
             return
+        n = self._current_page
+        rects = self._member_scene_rects(members, n)
         vertical = axis == "v"
-        lo = (lambda p: p.bbox[1]) if vertical else (lambda p: p.bbox[0])
-        hi = (lambda p: p.bbox[3]) if vertical else (lambda p: p.bbox[2])
-        ordered = sorted(members, key=lo)
-        span = hi(ordered[-1]) - lo(ordered[0])
-        sizes = sum(hi(p) - lo(p) for p in ordered)
+        lo = (lambda r: r[1]) if vertical else (lambda r: r[0])
+        hi = (lambda r: r[3]) if vertical else (lambda r: r[2])
+        ordered = sorted(rects, key=lambda pr: lo(pr[1]))
+        span = hi(ordered[-1][1]) - lo(ordered[0][1])
+        sizes = sum(hi(r) - lo(r) for _p, r in ordered)
         gap = (span - sizes) / (len(ordered) - 1)  # may be negative (boxes overlap)
         offsets: list[tuple[Paragraph, tuple[float, float]]] = []
-        cursor = lo(ordered[0])
-        for p in ordered:
-            delta = cursor - lo(p)
-            offsets.append((p, (0.0, delta) if vertical else (delta, 0.0)))
-            cursor += (hi(p) - lo(p)) + gap
-        self._apply_box_offsets(self._current_page, offsets, "Distribute text boxes")
+        cursor = lo(ordered[0][1])
+        for p, r in ordered:
+            delta = cursor - lo(r)
+            scene_off = (0.0, delta) if vertical else (delta, 0.0)
+            offsets.append((p, self._scene_delta_to_page(scene_off[0], scene_off[1], n)))
+            cursor += (hi(r) - lo(r)) + gap
+        self._apply_box_offsets(n, offsets, "Distribute text boxes")
 
     def _on_escape(self) -> None:
         if self._canvas.is_armed:  # armed mode first, selection second
