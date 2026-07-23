@@ -56,12 +56,15 @@ def test_align_button_shows_the_active_option_with_the_others_in_its_menu(qapp):
         assert window._align_actions["left"].isChecked()
         assert not window._align_button.icon().isNull()
         assert window._align_button.toolTip()
-        # Every option is reachable from the ONE button's dropdown.
+        # Every option is reachable from the ONE button's dropdown. It follows
+        # the highlighter swatch's InstantPopup pattern (a click opens the
+        # list; no MenuButtonPopup split region, which was 31px wider and
+        # rendered a raised pill — user reports 2026-07-23/24).
         assert window._align_button.menu() is not None
         assert len(window._align_button.menu().actions()) == 3
         assert (
             window._align_button.popupMode()
-            == window._align_button.ToolButtonPopupMode.MenuButtonPopup
+            == window._align_button.ToolButtonPopupMode.InstantPopup
         )
         for action in window._align_actions.values():
             assert not action.icon().isNull()
@@ -77,6 +80,24 @@ def test_align_button_lives_on_the_style_toolbar_and_keeps_nofocus(qapp):
         bar = window.findChild(QToolBar, "text_style_toolbar")
         assert window._align_button.parent() is bar
         assert window._align_button.focusPolicy() == Qt.FocusPolicy.NoFocus
+    finally:
+        window.close()
+
+
+def test_dropdown_buttons_are_no_wider_than_a_plain_icon_button(qapp):
+    """User report (2026-07-24): the alignment button took up a lot more space
+    than the others — the MenuButtonPopup split reserved an extra arrow
+    region. As a flat InstantPopup button it matches a plain icon button, like
+    the highlighter swatch already does."""
+    window = MainWindow()
+    try:
+        window.resize(1500, 700)
+        window.show()
+        qapp.processEvents()
+        style_bar = window.findChild(QToolBar, "text_style_toolbar")
+        bold_w = style_bar.widgetForAction(window._bold_action).width()
+        assert window._align_button.width() == bold_w
+        assert window._highlight_color_button.width() == bold_w
     finally:
         window.close()
 

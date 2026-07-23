@@ -125,7 +125,7 @@ def test_view_menu_dark_toggle_switches_theme_and_rebrushes(theme_app, text_pdf)
     window.close()
 
 
-# --- split-button chrome (user report 2026-07-23) -------------------------
+# --- dropdown-button chrome (user reports 2026-07-23/24) ------------------
 
 
 def _rule_background(qss: str, selector: str) -> str:
@@ -150,20 +150,45 @@ def _accent_share(hex_color: str, theme) -> float:
     return abs(c.blue() - surface.blue()) / span
 
 
-def test_split_button_dropdown_is_flat_not_a_raised_pill(theme_app):
-    """User report: qt-material declares nothing for ::menu-button, so Qt's
-    Fusion style painted a raised light PILL on the alignment split button —
-    'horrible and totally out of place' against a flat toolbar. The addendum
-    flattens it and gives it the Office hover/press treatment instead."""
+def test_dropdown_buttons_are_flat_instant_popup_not_a_split_pill(theme_app):
+    """User reports: the alignment button (originally a MenuButtonPopup split
+    button) rendered its ::menu-button region as a raised light pill and was
+    31px wider than a plain icon button. It is now InstantPopup like the
+    highlighter swatch — one flat button (popupMode="2"), no ::menu-button
+    split at all."""
+    import re
+
     app, theme = theme_app
     theme.apply_theme(app, theme.DARK)
     qss = app.styleSheet()
-    assert "QToolButton::menu-button" in qss
-    assert "QToolButton::menu-button:hover" in qss  # the hovered half tints
-    assert "QToolButton::menu-button:pressed" in qss
-    assert 'QToolBar QToolButton[popupMode="1"]' in qss  # room for the arrow
-    # Idle really is flat: no background/border declared for the arrow half.
-    assert "background: transparent" in qss
+    assert 'QToolBar QToolButton[popupMode="2"]' in qss  # the flat dropdown rule
+    # Rules only — the addendum names the old sub-control in a comment.
+    rules = re.sub(r"/\*.*?\*/", "", theme._qss_addendum(theme.DARK), flags=re.S)
+    assert "::menu-button" not in rules  # the split region (and its pill) is gone
+    assert 'popupMode="1"' not in rules  # no MenuButtonPopup styling remains
+
+
+def test_dropdown_button_box_is_pinned_so_the_arrow_cannot_jump(theme_app):
+    """User report (2026-07-24): the corner arrow moved on hover. The rest-state
+    box must carry the SAME padding + radius as the hover box (only the
+    background differs) so the ::menu-indicator sub-control sits in one place."""
+    import re
+
+    app, theme = theme_app
+    theme.apply_theme(app, theme.DARK)
+    qss = app.styleSheet()
+
+    def box(selector: str) -> tuple[str, str]:
+        m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", qss)
+        assert m, selector
+        body = m.group(1)
+        pad = re.search(r"padding:\s*([^;]+);", body)
+        rad = re.search(r"border-radius:\s*([^;]+);", body)
+        return (pad.group(1).strip() if pad else "", rad.group(1).strip() if rad else "")
+
+    rest = box('QToolBar QToolButton[popupMode="2"]')
+    hover = box("QToolBar QToolButton:hover")
+    assert rest == hover  # identical box -> the arrow can't move
 
 
 def test_menu_indicator_is_left_to_the_style(theme_app):
@@ -180,6 +205,15 @@ def test_menu_indicator_is_left_to_the_style(theme_app):
         # in a warning comment, and that must not read as a rule.
         rules = re.sub(r"/\*.*?\*/", "", theme._qss_addendum(mode), flags=re.S)
         assert "menu-indicator" not in rules, mode
+
+
+def test_dropdown_chrome_is_defined_in_both_modes(theme_app):
+    app, theme = theme_app
+    for mode in (theme.DARK, theme.LIGHT):
+        theme.apply_theme(app, mode)
+        qss = app.styleSheet()
+        assert 'QToolBar QToolButton[popupMode="2"]' in qss, mode
+        assert "QToolBar QToolButton:checked:hover" in qss, mode
 
 
 def test_checked_button_does_not_dim_when_hovered(theme_app):
@@ -199,15 +233,6 @@ def test_checked_button_does_not_dim_when_hovered(theme_app):
         _rule_background(qss, "QToolBar QToolButton:checked:pressed"), theme
     )
     assert hover < checked < checked_hover < checked_press
-
-
-def test_split_button_chrome_is_defined_in_both_modes(theme_app):
-    app, theme = theme_app
-    for mode in (theme.DARK, theme.LIGHT):
-        theme.apply_theme(app, mode)
-        qss = app.styleSheet()
-        assert "QToolButton::menu-button:hover" in qss, mode
-        assert "QToolBar QToolButton:checked:hover" in qss, mode
 
 
 # --- S2: the two reconciled chrome spots ---------------------------------

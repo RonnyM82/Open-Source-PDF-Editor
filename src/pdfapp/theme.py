@@ -77,20 +77,17 @@ def _qss_addendum(mode: str) -> str:
     # qt-material's fat accent side-bar. Solid blend of accent over shell.
     surface = "#31363b" if dark else "#ffffff"
     toggle_tint = _mix(accent(), surface, 0.28)
-    # State layers for the same rounded container, weakest to strongest, so a
-    # hovered button never reads as loudly as a selected one.
-    # One ladder, weakest to strongest: hover < split-half < checked <
-    # pressed < checked+hover < checked+pressed. Every state a button can be
-    # in needs its own rung, because a CHECKED button is also hovered when the
-    # pointer is on it — and the plain hover rule outranks :checked, so
-    # without the last two rungs a selected button dims to "not selected" the
-    # moment you point at it (caught by an offscreen state render).
+    # State layers for the same rounded container, one ladder weakest to
+    # strongest: hover < checked < pressed < checked+hover < checked+pressed.
+    # Every state a button can be in needs its own rung, because a CHECKED
+    # button is also hovered when the pointer is on it — and the plain hover
+    # rule outranks :checked, so without the last two rungs a selected button
+    # dims to "not selected" the moment you point at it (caught by an offscreen
+    # state render).
     hover_tint = _mix(accent(), surface, 0.12)
-    half_tint = _mix(accent(), surface, 0.24)
     press_tint = _mix(accent(), surface, 0.32)
     checked_hover_tint = _mix(accent(), surface, 0.38)
     checked_press_tint = _mix(accent(), surface, 0.46)
-    split_sep = _mix(tab_fg, surface, 0.35)
     return f"""
 /* pdf-editor-addendum */
 
@@ -132,6 +129,26 @@ QToolButton:checked {{
     border-radius: 6px;
 }}
 
+/* Dropdown tool buttons (InstantPopup — the highlighter swatch and the
+   alignment button, the ONLY popupMode="2" buttons on any toolbar). Same
+   width as a plain icon button, with the base style's small corner
+   ::menu-indicator arrow (never stylesheet that sub-control — it then paints
+   nothing and the arrow vanishes). This rule PINS the rest-state box to the
+   hover box (same padding + radius, just transparent instead of tinted) so
+   the arrow does NOT jump when the tonal container appears on hover (user
+   report 2026-07-24: it moved; the hover position is the wanted one). Placed
+   BEFORE the :hover / :pressed rules so those win by order on their states
+   (equal specificity). InstantPopup replaced the old MenuButtonPopup split
+   button: that carved a ::menu-button region which Fusion drew as a raised
+   pill and forced 31px of extra width + asymmetric padding — gone with the
+   split. */
+QToolBar QToolButton[popupMode="2"] {{
+    background: transparent;
+    border: none;
+    padding: 3px 15px;
+    border-radius: 6px;
+}}
+
 /* Hover / pressed get the SAME rounded container (qt-material paints them as
    a square 12px-bordered slab, which next to the rounded checked state read
    as two different design languages). Weaker tints than checked, so hover
@@ -163,45 +180,12 @@ QToolBar QToolButton:checked:pressed {{
     border-radius: 6px;
 }}
 
-/* Split buttons (an icon plus a dropdown carrot — text alignment, the
-   highlighter swatch): the Office pattern. FLAT when idle: nothing but the
-   glyph and a small arrow. Qt's Fusion style otherwise paints ::menu-button
-   as a RAISED LIGHT PILL — a scrollbar-handle lookalike bolted to the side
-   of a flat toolbar button (user report 2026-07-23: "horrible and totally
-   out of place"). On hover the whole control takes the tonal container and a
-   HAIRLINE splits the two halves; whichever half the pointer is on takes the
-   stronger tint, so it is obvious whether a click re-applies the current
-   option or opens the list. The padding is restated for every state because
-   the generic rules above would otherwise reclaim the arrow's room mid-hover
-   and shift the glyph. */
-QToolBar QToolButton[popupMode="1"],
-QToolBar QToolButton[popupMode="1"]:hover,
-QToolBar QToolButton[popupMode="1"]:pressed,
-QToolBar QToolButton[popupMode="1"]:checked {{
-    padding-left: 15px;
-    padding-right: 22px;
-}}
-QToolButton::menu-button {{
-    background: transparent;
-    border: none;
-    width: 16px;
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
-}}
-QToolButton::menu-button:hover {{
-    background: {half_tint};
-    border-left: 1px solid {split_sep};
-}}
-QToolButton::menu-button:pressed {{
-    background: {press_tint};
-    border-left: 1px solid {split_sep};
-}}
-/* NOTE: do NOT add a ::menu-indicator rule here. InstantPopup buttons (the
-   highlighter swatch) draw their arrow through that sub-control, and once a
-   stylesheet touches it QStyleSheetStyle takes over the painting — with no
-   `image` declared it draws NOTHING, silently deleting the swatch's dropdown
-   arrow (A/B-rendered 2026-07-23). Fusion's default indicator is already a
-   small flat triangle; it was never the problem. */
+/* NOTE: do NOT add a ::menu-indicator rule. The dropdown buttons draw their
+   corner arrow through that sub-control, and once a stylesheet touches it
+   QStyleSheetStyle takes over the painting — with no `image` declared it
+   draws NOTHING, silently deleting the arrow (A/B-rendered 2026-07-23).
+   Fusion's default indicator is already a small flat triangle; the box is
+   pinned above so it no longer jumps on hover. */
 
 /* Toolbar input fields: ONE height for all of them (qt-material renders
    the size spinbox taller than the font combo beside it). */

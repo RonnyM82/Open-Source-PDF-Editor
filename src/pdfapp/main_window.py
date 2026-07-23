@@ -709,9 +709,12 @@ class MainWindow(QMainWindow):
         bar.addAction(self._sub_action)
 
         # Justification (user request): ONE button showing the ACTIVE option;
-        # its dropdown carrot offers the others. The pick is STICKY — persisted
-        # like the highlighter colour, so the button starts on the last-used
-        # option at the next launch and every insert uses it until changed.
+        # its dropdown lists all three. The pick is STICKY — persisted like the
+        # highlighter colour, so the button starts on the last-used option at
+        # the next launch and every insert uses it until changed. It follows
+        # the SAME InstantPopup pattern as the highlighter swatch (click opens
+        # the list; picking the already-active one re-applies it — the menu
+        # action fires regardless of its check state).
         self._text_align = self._startup_text_align()
         self._align_actions: dict[str, QAction] = {}
         align_menu = QMenu(self)
@@ -727,12 +730,7 @@ class MainWindow(QMainWindow):
             align_menu.addAction(action)
             self._align_actions[key] = action
             self._icon_keys[action] = f"align_{key}"
-        self._align_button = QToolButton(self)
-        self._align_button.setMenu(align_menu)
-        # MenuButtonPopup: the body re-applies the active alignment (useful
-        # with an editor open), the carrot opens the list.
-        self._align_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self._align_button.clicked.connect(lambda: self._pick_text_align(self._text_align))
+        self._align_button = self._make_dropdown_button(align_menu, "Text alignment")
         bar.addWidget(self._align_button)
 
         self._text_color = QColor(0, 0, 0)
@@ -767,7 +765,8 @@ class MainWindow(QMainWindow):
             self._super_action,
             self._sub_action,
         )
-        for widget in (self._font_combo, self._color_button, self._align_button):
+        # (The align button gets NoFocus from _make_dropdown_button.)
+        for widget in (self._font_combo, self._color_button):
             widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # The size spin ACCEPTS focus (click into it and type a size) — the
         # open editor stays open (overlays never cancel on focus-out), and
@@ -800,6 +799,27 @@ class MainWindow(QMainWindow):
         self.addToolBar(bar)
         self._capture_global_style()  # launch state IS the initial defaults
 
+    def _make_dropdown_button(self, menu: QMenu, tooltip: str) -> QToolButton:
+        """A flat icon button whose click opens ``menu`` — the InstantPopup
+        pattern the highlighter swatch established, now shared with the
+        alignment button.
+
+        InstantPopup (not MenuButtonPopup) is deliberate: the whole button is
+        one flat surface with a small corner dropdown arrow (the base style's
+        ``::menu-indicator``), so it is the same width as a plain icon button
+        and carries no ``::menu-button`` split region — which is exactly the
+        Fusion sub-control that rendered as a raised pill and forced the
+        asymmetric padding. NoFocus so an open in-place editor keeps the caret
+        (the same rule the other style controls follow). theme.py styles the
+        hover / pressed state layers; the arrow is left to the base style
+        (stylesheet it and it vanishes)."""
+        button = QToolButton(self)
+        button.setToolTip(tooltip)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setMenu(menu)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        return button
+
     def _build_annotate_toolbar(self) -> None:
         """The Annotate toolbar: highlight + colour swatch + comment + callout.
 
@@ -815,13 +835,10 @@ class MainWindow(QMainWindow):
         # Highlighter-colour swatch: a painted button whose dropdown is the
         # restricted palette — the SAME QActions as the Annotate ▸ Highlight
         # colour submenu, so the checkmarks stay in sync across both.
-        self._highlight_color_button = QToolButton(self)
-        self._highlight_color_button.setToolTip("Highlighter colour")
-        self._highlight_color_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         swatch_menu = QMenu(self)
         for action in self._highlight_color_actions.values():
             swatch_menu.addAction(action)
-        self._highlight_color_button.setMenu(swatch_menu)
+        self._highlight_color_button = self._make_dropdown_button(swatch_menu, "Highlighter colour")
         self._update_highlight_swatch()
         bar.addWidget(self._highlight_color_button)
 
