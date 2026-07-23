@@ -73,6 +73,16 @@ _NAMES = {
     "rotate_image_ccw": "mdi6.rotate-left",
     "copy": "mdi6.content-copy",
     "duplicate_text": "mdi6.content-duplicate",
+    # Box arrangement (align/distribute the boxes themselves — distinct from
+    # the format-align-* text-justification icons).
+    "box_align_left": "mdi6.align-horizontal-left",
+    "box_align_hcenter": "mdi6.align-horizontal-center",
+    "box_align_right": "mdi6.align-horizontal-right",
+    "box_align_top": "mdi6.align-vertical-top",
+    "box_align_vcenter": "mdi6.align-vertical-center",
+    "box_align_bottom": "mdi6.align-vertical-bottom",
+    "box_distribute_v": "mdi6.distribute-vertical-center",
+    "box_distribute_h": "mdi6.distribute-horizontal-center",
     # Text style
     "bold": "mdi6.format-bold",
     "italic": "mdi6.format-italic",

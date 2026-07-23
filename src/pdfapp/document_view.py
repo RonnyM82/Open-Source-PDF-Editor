@@ -81,6 +81,9 @@ _QT_ALIGNMENT = {
     "center": Qt.AlignmentFlag.AlignHCenter,
     "right": Qt.AlignmentFlag.AlignRight,
 }
+# The six box-alignment edges/centres (task 2), used to build the fly-out and
+# dispatch it.
+_ALIGN_EDGES = ("left", "hcenter", "right", "top", "vcenter", "bottom")
 
 
 def _save_failure_text(path, exc: Exception) -> str:
@@ -2111,6 +2114,90 @@ class DocumentView(QWidget):
         self._push_command("Merge text boxes", op, ("page", n))
         # after_command cleared the (now stale) selection; nothing else to do.
 
+    # --- grouped box geometry: move / align / distribute (E10.7, tasks 2-3) ---
+    def _apply_box_offsets(self, page_index: int, offsets, label: str) -> None:
+        """Translate several text boxes by per-box ``(dx, dy)`` in ONE undoable
+        command — the shared primitive for a grouped move, align and distribute.
+
+        Each box is rebuilt as rich runs (per-word styles + underline/strike
+        preserved, same as a single move) and its registry rect follows via
+        ``update_box_rect``. Zero-offset boxes are skipped, so an align that
+        leaves the anchor box put does not needlessly redact it."""
+        moves = [
+            (para, self._runs_from_paragraph(para), off)
+            for para, off in offsets
+            if off != (0.0, 0.0)
+        ]
+        if not moves:
+            return
+
+        def op(doc: PdfDocument) -> None:
+            for para, runs, off in moves:
+                box = self._box_for(doc, page_index, para.bbox)
+                result = doc.replace_paragraph_runs(page_index, para, runs, offset=off)
+                if box is not None and result.new_bbox is not None:
+                    doc.update_box_rect(box.id, result.new_bbox)
+
+        self._push_command(label, op, ("page", page_index))
+
+    def _selected_members(self) -> list[Paragraph]:
+        """The multi-selected paragraphs on the current page (the box group)."""
+        n = self._current_page
+        return [pp for pn, pp in self._multi_paragraphs if pn == n]
+
+    def _align_selected_boxes(self, edge: str) -> None:
+        """Line the selected boxes up on a shared edge/centre (task 2). Moves
+        the BOXES, not the text inside them. Anchored on the group's bounding
+        box (leftmost for 'left', etc.), matching Office/Illustrator."""
+        members = self._selected_members()
+        if len(members) < 2:
+            return
+        x0 = min(p.bbox[0] for p in members)
+        y0 = min(p.bbox[1] for p in members)
+        x1 = max(p.bbox[2] for p in members)
+        y1 = max(p.bbox[3] for p in members)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+
+        def offset(p: Paragraph) -> tuple[float, float]:
+            if edge == "left":
+                return (x0 - p.bbox[0], 0.0)
+            if edge == "right":
+                return (x1 - p.bbox[2], 0.0)
+            if edge == "hcenter":
+                return (cx - (p.bbox[0] + p.bbox[2]) / 2, 0.0)
+            if edge == "top":
+                return (0.0, y0 - p.bbox[1])
+            if edge == "bottom":
+                return (0.0, y1 - p.bbox[3])
+            return (0.0, cy - (p.bbox[1] + p.bbox[3]) / 2)  # vcenter
+
+        self._apply_box_offsets(
+            self._current_page, [(p, offset(p)) for p in members], "Align text boxes"
+        )
+
+    def _distribute_selected_boxes(self, axis: str) -> None:
+        """Space the selected boxes with EQUAL edge-to-edge gaps (task 3),
+        anchored on the first and last box along ``axis`` ('v' or 'h'). Needs
+        ≥ 3 boxes (two extremes plus something to move between them)."""
+        members = self._selected_members()
+        if len(members) < 3:
+            self.editWarning.emit("Select three or more text boxes to distribute.")
+            return
+        vertical = axis == "v"
+        lo = (lambda p: p.bbox[1]) if vertical else (lambda p: p.bbox[0])
+        hi = (lambda p: p.bbox[3]) if vertical else (lambda p: p.bbox[2])
+        ordered = sorted(members, key=lo)
+        span = hi(ordered[-1]) - lo(ordered[0])
+        sizes = sum(hi(p) - lo(p) for p in ordered)
+        gap = (span - sizes) / (len(ordered) - 1)  # may be negative (boxes overlap)
+        offsets: list[tuple[Paragraph, tuple[float, float]]] = []
+        cursor = lo(ordered[0])
+        for p in ordered:
+            delta = cursor - lo(p)
+            offsets.append((p, (0.0, delta) if vertical else (delta, 0.0)))
+            cursor += (hi(p) - lo(p)) + gap
+        self._apply_box_offsets(self._current_page, offsets, "Distribute text boxes")
+
     def _on_escape(self) -> None:
         if self._canvas.is_armed:  # armed mode first, selection second
             self.cancel_armed_mode()
@@ -2250,18 +2337,7 @@ class DocumentView(QWidget):
 
         if group is not None:
             group_page, members = group
-            moves = [(member, self._runs_from_paragraph(member)) for member in members]
-
-            def group_op(doc: PdfDocument) -> None:
-                for member, member_runs in moves:
-                    box = self._box_for(doc, group_page, member.bbox)
-                    result = doc.replace_paragraph_runs(
-                        group_page, member, member_runs, offset=offset
-                    )
-                    if box is not None and result.new_bbox is not None:
-                        doc.update_box_rect(box.id, result.new_bbox)
-
-            self._push_command("Move text boxes", group_op, ("page", group_page))
+            self._apply_box_offsets(group_page, [(m, offset) for m in members], "Move text boxes")
             return  # selection cleared by after_command (stale payloads)
 
         # Rebuild the paragraph as rich runs from its own spans — a move now
@@ -2348,6 +2424,28 @@ class DocumentView(QWidget):
             actions["merge"] = menu.addAction(
                 icons.icon("edit_paragraph"), f"Merge {multi_count} text boxes into one"
             )
+            # Align the BOXES themselves (not their text) — a fly-out of the
+            # six edges/centres (task 2).
+            align_menu = menu.addMenu(icons.icon("box_align_left"), "Align text boxes")
+            for key, icon_key, text in (
+                ("left", "box_align_left", "Left edges"),
+                ("hcenter", "box_align_hcenter", "Horizontal centres"),
+                ("right", "box_align_right", "Right edges"),
+                ("top", "box_align_top", "Top edges"),
+                ("vcenter", "box_align_vcenter", "Vertical centres"),
+                ("bottom", "box_align_bottom", "Bottom edges"),
+            ):
+                actions[f"align_{key}"] = align_menu.addAction(icons.icon(icon_key), text)
+            # Distribute evenly, anchored on the first & last box (task 3).
+            dist_menu = menu.addMenu(icons.icon("box_distribute_v"), "Distribute text boxes")
+            actions["dist_v"] = dist_menu.addAction(
+                icons.icon("box_distribute_v"), "Vertically (equal gaps)"
+            )
+            actions["dist_h"] = dist_menu.addAction(
+                icons.icon("box_distribute_h"), "Horizontally (equal gaps)"
+            )
+            for key in ("dist_v", "dist_h"):
+                actions[key].setEnabled(multi_count >= 3)  # need something between the ends
             menu.addSeparator()
         if para is not None or span is not None:
             actions["edit_text"] = menu.addAction(
@@ -2403,6 +2501,13 @@ class DocumentView(QWidget):
             self._open_comment_editor(n, px, py, None)
         elif chosen is actions.get("merge"):
             self._merge_selected_paragraphs()
+        elif chosen in (actions.get(f"align_{e}") for e in _ALIGN_EDGES):
+            edge = next(e for e in _ALIGN_EDGES if chosen is actions.get(f"align_{e}"))
+            self._align_selected_boxes(edge)
+        elif chosen is actions.get("dist_v"):
+            self._distribute_selected_boxes("v")
+        elif chosen is actions.get("dist_h"):
+            self._distribute_selected_boxes("h")
         elif chosen is actions.get("edit_text"):
             self._begin_text_edit(n, span)
         elif chosen is actions.get("edit_para"):

@@ -44,7 +44,10 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Shift adds, Ctrl removes",
             ),
             ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
-            ("Right-click (multi-selected)", "Merge the selected text boxes into one"),
+            (
+                "Right-click (multi-selected)",
+                "Merge · Align text boxes (6-way) · Distribute evenly (equal gaps)",
+            ),
             (
                 "Right-click",
                 "Edit text · Edit paragraph · Highlight · Duplicate text box · Delete text box",
