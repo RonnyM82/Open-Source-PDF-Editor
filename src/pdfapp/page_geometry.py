@@ -31,13 +31,12 @@ class PageGeometry:
     comments: tuple[CommentInfo, ...] = ()
 
 
-def collect_geometry(
-    doc: PdfDocument, n: int, boundaries: tuple[tuple[float, float, float, float], ...] = ()
-) -> PageGeometry:
+def collect_geometry(doc: PdfDocument, n: int, boundaries: tuple = ()) -> PageGeometry:
     """Extract page ``n``'s editable geometry (three engine passes).
 
-    ``boundaries`` (session-inserted text bboxes) isolate inserted boxes so
-    they are their own paragraphs, never merged with pre-existing lines.
+    ``boundaries`` (registered insert boxes, each ``(rect, fingerprint)``)
+    isolate inserted boxes so they are their own paragraphs, never merged with
+    pre-existing lines — content-aware so overlapping boxes don't cross-assign.
     """
     return PageGeometry(
         spans=tuple(doc.text_spans(n)),
@@ -206,12 +205,7 @@ class GeometryCache:
         # caller's insert-isolation boundaries change.
         self._pages: dict[int, tuple[PageGeometry, tuple]] = {}
 
-    def page(
-        self,
-        doc: PdfDocument,
-        n: int,
-        boundaries: tuple[tuple[float, float, float, float], ...] = (),
-    ) -> PageGeometry:
+    def page(self, doc: PdfDocument, n: int, boundaries: tuple = ()) -> PageGeometry:
         boundaries = tuple(boundaries)
         entry = self._pages.get(n)
         if entry is None or entry[1] != boundaries:

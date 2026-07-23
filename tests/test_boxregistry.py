@@ -135,3 +135,33 @@ def test_read_boxes_on_raw_document(tmp_path):
     with PdfDocument.open(src) as doc:
         doc.add_box(0, (9.0, 9.0, 11.0, 11.0))
         assert len(read_boxes(doc._doc)) == 1
+
+
+def test_content_fingerprint_roundtrips_and_move_preserves_it(tmp_path):
+    """Task 5: a box stores its content fingerprint; a MOVE (update_box_rect)
+    keeps it, an EDIT (update_box) replaces it."""
+    with PdfDocument.open(_blank_pdf(tmp_path)) as doc:
+        box = doc.add_box(0, (10.0, 20.0, 30.0, 40.0), text="hello world")
+        assert doc.boxes()[0].text == "hello world"
+
+        doc.update_box_rect(box.id, (50.0, 60.0, 70.0, 80.0))  # a move
+        moved = doc.boxes()[0]
+        assert moved.rect == (50.0, 60.0, 70.0, 80.0)
+        assert moved.text == "hello world"  # fingerprint preserved
+
+        doc.update_box(box.id, (50.0, 60.0, 70.0, 80.0), "goodbye world")  # an edit
+        assert doc.boxes()[0].text == "goodbye world"
+
+
+def test_legacy_record_without_text_reads_as_empty_fingerprint(tmp_path):
+    """A pre-fingerprint registry entry (no 'text' key) reads as text="" and
+    falls back to pure geometry — never raises."""
+    import json
+
+    with PdfDocument.open(_blank_pdf(tmp_path)) as doc:
+        cat = doc._doc.pdf_catalog()
+        payload = json.dumps([{"id": "abc123", "page": 0, "rect": [1.0, 2.0, 3.0, 4.0]}])
+        doc._doc.xref_set_key(cat, "PieceInfo/PDFEditor/Private", pymupdf.get_pdf_str(payload))
+        boxes = doc.boxes()
+        assert len(boxes) == 1
+        assert boxes[0].text == ""  # absent -> empty, backward compatible

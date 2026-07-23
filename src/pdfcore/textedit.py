@@ -1204,6 +1204,7 @@ def paragraph_at(
     embedded_by_font = _embedded_font_map(doc, page_index)
     keep = _comment_line_filter(doc, page_index)
     strokes = _page_line_strokes(page)
+    bounds = _normalize_boundaries(boundaries)
     # Hit-test in ORIGINAL block/line order — overlap ties (a box's line bbox
     # bleeding into a neighbour's) must resolve exactly as they always did.
     for block in page.get_text("rawdict")["blocks"]:
@@ -1216,13 +1217,13 @@ def paragraph_at(
                 break
         if hit is None:
             continue
-        if _line_owned(hit, boundaries):
+        if _line_owned(hit, bounds):
             # A registered-box region IS one paragraph — page-wide, even when
             # MuPDF put its lines in different blocks (E10.7).
-            region_lines, _plain = _partition_lines(page, boundaries, keep)
-            region = _line_region(hit, boundaries)
+            region_lines, _plain = _partition_lines(page, bounds, keep)
+            region = _line_region(hit, bounds)
             return _build_paragraph(page_index, region_lines[region], embedded_by_font, strokes)
-        kept = [line for line in lines if not _line_owned(line, boundaries)]
+        kept = [line for line in lines if not _line_owned(line, bounds)]
         seed = kept.index(hit)
         unit = next(u for u in _block_units(kept) if seed in u)
         unit_lines = [kept[i] for i in unit]
@@ -1231,10 +1232,11 @@ def paragraph_at(
     return None
 
 
-def _line_owned(line: dict, boundaries: Sequence[tuple[float, float, float, float]]) -> bool:
+def _line_owned(line: dict, bounds: Sequence[tuple[tuple[float, ...], str]]) -> bool:
     """True when a line belongs to a registered-box region (the ONE ownership
-    predicate — paragraph_at and _partition_lines must never disagree)."""
-    return bool(boundaries) and _line_region(line, boundaries) >= 0 and _line_rotation(line) == 0
+    predicate — paragraph_at and _partition_lines must never disagree).
+    ``bounds`` is the NORMALIZED ``[(rect, fingerprint)]`` list."""
+    return bool(bounds) and _line_region(line, bounds) >= 0 and _line_rotation(line) == 0
 
 
 def _comment_line_filter(doc: pymupdf.Document, page_index: int):
@@ -1260,29 +1262,30 @@ def _comment_line_filter(doc: pymupdf.Document, page_index: int):
 
 def _partition_lines(
     page: pymupdf.Page,
-    boundaries: Sequence[tuple[float, float, float, float]],
+    bounds: Sequence[tuple[tuple[float, ...], str]],
     keep=lambda line: True,
 ) -> tuple[dict[int, list[dict]], list[list[dict]]]:
     """Split the page's dict lines into region-owned and plain groups.
 
-    Lines whose centre falls inside a boundary rect (a registered insert box)
-    belong to that REGION — one paragraph each, ordered by baseline, however
-    MuPDF chose to block them. Everything else stays grouped per original
-    block for the geometric pitch flow. Rotated lines never join a region
-    (boxes are inserted horizontal; a rotated stray keeps its own rules).
+    ``bounds`` is the NORMALIZED ``[(rect, fingerprint)]`` list. Lines a
+    registered box OWNS (``_line_region`` — content-aware, task 5) form that
+    REGION's one paragraph, ordered by baseline, however MuPDF blocked them.
+    Everything else stays grouped per original block for the geometric pitch
+    flow. Rotated lines never join a region (boxes are inserted horizontal; a
+    rotated stray keeps its own rules).
     """
     region_lines: dict[int, list[dict]] = {}
     plain_blocks: list[list[dict]] = []
     for block in page.get_text("rawdict")["blocks"]:
         lines = [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
-        if not boundaries:
+        if not bounds:
             if lines:
                 plain_blocks.append(lines)
             continue
         kept: list[dict] = []
         for line in lines:
-            if _line_owned(line, boundaries):
-                region_lines.setdefault(_line_region(line, boundaries), []).append(line)
+            if _line_owned(line, bounds):
+                region_lines.setdefault(_line_region(line, bounds), []).append(line)
             else:
                 kept.append(line)
         if kept:
@@ -1312,7 +1315,7 @@ def paragraphs_on_page(
     strokes = _page_line_strokes(page)
     result: list[Paragraph] = []
     region_lines, plain_blocks = _partition_lines(
-        page, boundaries, _comment_line_filter(doc, page_index)
+        page, _normalize_boundaries(boundaries), _comment_line_filter(doc, page_index)
     )
     for region in sorted(region_lines):
         result.append(_build_paragraph(page_index, region_lines[region], embedded_by_font, strokes))
@@ -1343,21 +1346,78 @@ def _line_baseline(line: dict) -> float:
 _MIN_LINE_PITCH = 0.7
 
 
-def _line_region(line: dict, boundaries: Sequence[tuple[float, float, float, float]]) -> int:
+def _rect_area(rect: tuple[float, ...]) -> float:
+    return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
+
+
+def _normalize_text(s: str) -> str:
+    """Collapse all whitespace (incl. the U+00A0 an embedded TTF can emit) to
+    single spaces — so a fingerprint matches re-extracted text regardless of
+    word-wrap: a wrapped visual line is a contiguous SUBSTRING of the box's
+    logical text once whitespace is normalized."""
+    return " ".join(s.split())
+
+
+def _line_text(line: dict) -> str:
+    """A rawdict line's text (its spans carry per-char ``chars``, no 'text')."""
+    return _normalize_text(
+        "".join(ch["c"] for span in line["spans"] for ch in span.get("chars", ()))
+    )
+
+
+def _line_region(line: dict, bounds: Sequence[tuple[tuple[float, ...], str]]) -> int:
     """Index of the isolation region (insert box) a line belongs to, or -1.
 
-    A line whose bbox centre falls inside a boundary bbox is that region's;
-    lines in DIFFERENT regions — or a region vs none — never join one
-    paragraph (see ``_pitch_run``). The UI supplies boundaries for text it
-    inserted this session, so a moved pre-existing paragraph never swallows
-    an inserted box that happens to sit one line away.
+    ``bounds`` is the NORMALIZED ``[(rect, fingerprint)]`` list. A line is a
+    candidate for every box whose rect contains its centre. Ownership then
+    resolves by CONTENT (task 5 Level 1): among the containing boxes, one
+    whose fingerprint includes this line's text wins — so a box moved OVER
+    other text never absorbs it, and two overlapping boxes keep their own
+    lines. Ties (and fingerprint-less legacy boxes) fall back to the TIGHTEST
+    containing rect. A fingerprinted box does NOT claim a foreign line under
+    it (returns -1 -> the line stays in its normal dict-block paragraph).
     """
     bx0, by0, bx1, by1 = line["bbox"]
     cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
-    for i, (x0, y0, x1, y1) in enumerate(boundaries):
-        if x0 <= cx <= x1 and y0 <= cy <= y1:
-            return i
-    return -1
+    containing = [
+        i
+        for i, (rect, _fp) in enumerate(bounds)
+        if rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]
+    ]
+    if not containing:
+        return -1
+    text = _line_text(line)
+    matches = [i for i in containing if text and bounds[i][1] and text in bounds[i][1]]
+    if matches:
+        pool = matches
+    else:
+        # No content match: legacy (fingerprint-less) boxes still own by pure
+        # geometry, but a fingerprinted box must not grab a line that isn't its
+        # content.
+        pool = [i for i in containing if not bounds[i][1]]
+        if not pool:
+            return -1
+    return min(pool, key=lambda i: _rect_area(bounds[i][0]))
+
+
+def _normalize_boundaries(
+    boundaries: Sequence,
+) -> list[tuple[tuple[float, ...], str]]:
+    """Normalize the public ``boundaries`` arg to ``[(rect, fingerprint)]``.
+
+    Accepts a bare rect (legacy — geometry-only isolation, fingerprint "") OR
+    a ``(rect, text)`` pair (task 5 — content-aware). A ``(rect, text)`` pair
+    is a 2-tuple whose first element is itself a sequence; anything else is a
+    bare 4-number rect.
+    """
+    norm: list[tuple[tuple[float, ...], str]] = []
+    for entry in boundaries:
+        if len(entry) == 2 and isinstance(entry[0], (tuple, list)):
+            rect, text = entry
+            norm.append((tuple(float(v) for v in rect), _normalize_text(text)))
+        else:
+            norm.append((tuple(float(v) for v in entry), ""))
+    return norm
 
 
 def _pitch_run(lines: list[dict], seed: int, regions: list[int] | None = None) -> list[int]:

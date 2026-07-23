@@ -1559,6 +1559,81 @@ def test_boundaries_isolate_an_inserted_box_from_a_neighbour(tmp_path):
         assert len(pdoc.paragraphs(0, boundaries=[region])) == 2
 
 
+def test_fingerprint_boundary_does_not_absorb_foreign_text(tmp_path):
+    """Task 5 Level 1: a box moved so its rect overlaps OTHER text must not
+    claim that text. With a content fingerprint, the box owns only lines it
+    contains; a foreign line under the rect stays its own paragraph."""
+    path = tmp_path / "overlap.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((100, 200), "existing line one", fontname="helv", fontsize=9)
+    page.insert_text((100, 212), "existing line two", fontname="helv", fontsize=9)
+    page.insert_text((100, 260), "moved label", fontname="helv", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+
+    with PdfDocument.open(path) as pdoc:
+        # A box whose rect overlaps the existing paragraph but whose CONTENT is
+        # "moved label". Legacy geometry would absorb the existing lines; the
+        # fingerprint keeps them out.
+        big_rect = (95.0, 195.0, 260.0, 270.0)
+        geo = (big_rect, "moved label")
+        legacy = pdoc.paragraphs(0, boundaries=[big_rect])  # bare rect = geometry only
+        fp = pdoc.paragraphs(0, boundaries=[geo])  # (rect, text) = content-aware
+
+        # Geometry alone grabs the two existing lines into the box's region.
+        legacy_texts = {p.text for p in legacy}
+        assert "existing line one\nexisting line two\nmoved label" in legacy_texts
+
+        # The fingerprint keeps the existing paragraph intact and separate.
+        fp_texts = {p.text for p in fp}
+        assert "existing line one\nexisting line two" in fp_texts
+        assert "moved label" in fp_texts
+        # And hit-testing the existing text returns ONLY it, not the label.
+        hit = pdoc.paragraph_at(0, 150.0, 205.0, boundaries=[geo])
+        assert hit.text == "existing line one\nexisting line two"
+
+
+def test_two_overlapping_fingerprint_boxes_keep_their_own_lines(tmp_path):
+    """Two registered boxes whose rects overlap each keep their own content
+    (content match beats the shared geometry)."""
+    path = tmp_path / "twobox.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((100, 200), "alpha content", fontname="helv", fontsize=9)
+    page.insert_text((100, 214), "beta content", fontname="helv", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+
+    with PdfDocument.open(path) as pdoc:
+        # Both rects overlap both lines' centres.
+        a = ((95.0, 195.0, 200.0, 220.0), "alpha content")
+        b = ((95.0, 205.0, 200.0, 222.0), "beta content")
+        paras = pdoc.paragraphs(0, boundaries=[a, b])
+        texts = {p.text for p in paras}
+        assert texts == {"alpha content", "beta content"}
+
+
+def test_fingerprint_matches_a_wrapped_visual_line(tmp_path):
+    """A wrapped box's stored fingerprint is its LOGICAL text; a visual line is
+    a substring after whitespace-normalisation, so ownership still holds."""
+    path = tmp_path / "wrap.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    # Two visual lines that together are one logical sentence.
+    page.insert_text((100, 200), "the quick brown", fontname="helv", fontsize=9)
+    page.insert_text((100, 212), "fox jumps over", fontname="helv", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+
+    with PdfDocument.open(path) as pdoc:
+        rect = (95.0, 195.0, 220.0, 220.0)
+        geo = (rect, "the quick brown fox jumps over")  # logical text (as stored)
+        para = pdoc.paragraph_at(0, 150.0, 205.0, boundaries=[geo])
+        assert para is not None
+        assert len(para.lines) == 2  # both wrapped lines owned by the one box
+
+
 def test_boundaries_keep_a_genuine_multiline_paragraph_together(tmp_path):
     """Guard: a boundary must not split a real multi-line paragraph whose
     lines all sit OUTSIDE it (only lines inside the box are isolated)."""

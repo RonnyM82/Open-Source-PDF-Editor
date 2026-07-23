@@ -355,20 +355,35 @@ class DocumentView(QWidget):
         Insert-isolation boundaries come from the box REGISTRY stored in the
         document itself (E10) — undo/save/reopen carry it automatically, so
         isolation never silently lapses the way the old session tracking did.
+        Each boundary carries its content fingerprint (``box.text``) so
+        overlapping boxes disambiguate by content, not just geometry (task 5).
         """
-        boundaries = tuple(box.rect for box in self._doc.boxes(n))
+        boundaries = tuple((box.rect, box.text) for box in self._doc.boxes(n))
         return self._geometry.page(self._doc, n, boundaries)
 
     @staticmethod
-    def _box_for(doc: PdfDocument, n: int, bbox: tuple[float, float, float, float]):
-        """The registered box a paragraph belongs to (its centre inside the
-        box rect), or None for pre-existing text."""
+    def _box_for(doc: PdfDocument, n: int, bbox: tuple[float, float, float, float], text: str = ""):
+        """The registered box a paragraph belongs to, or None for pre-existing
+        text. Among boxes whose rect contains the paragraph's centre, one whose
+        content matches ``text`` wins (task 5 — overlapping boxes); ties break
+        to the TIGHTEST rect."""
         cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-        for box in doc.boxes(n):
-            x0, y0, x1, y1 = box.rect
-            if x0 - 2 <= cx <= x1 + 2 and y0 - 2 <= cy <= y1 + 2:
-                return box
-        return None
+        containing = [
+            box
+            for box in doc.boxes(n)
+            if box.rect[0] - 2 <= cx <= box.rect[2] + 2 and box.rect[1] - 2 <= cy <= box.rect[3] + 2
+        ]
+        if not containing:
+            return None
+        if text:
+            matches = [box for box in containing if box.text == text]
+            if matches:
+                containing = matches
+
+        def area(box) -> float:
+            return max(0.0, box.rect[2] - box.rect[0]) * max(0.0, box.rect[3] - box.rect[1])
+
+        return min(containing, key=area)
 
     # --- read-only / edit mode (U0) ---------------------------------------
     @property
@@ -1552,6 +1567,7 @@ class DocumentView(QWidget):
                             max(s.bbox[2] for s in new),
                             max(s.bbox[3] for s in new),
                         ),
+                        text=text,  # content fingerprint (task 5 overlap disambiguation)
                     )
 
             self._push_command("Insert text", insert_op, ("page", page_index))
@@ -1603,12 +1619,12 @@ class DocumentView(QWidget):
                 )
 
         def op(doc: PdfDocument) -> None:
-            box = self._box_for(doc, page_index, para.bbox)
+            box = self._box_for(doc, page_index, para.bbox, para.text)  # match on OLD content
             result = do_edit(doc)
             results.append(result)
-            if box is not None:  # keep the registry rect in step with the edit
+            if box is not None:  # keep the registry rect + fingerprint in step
                 if result.new_bbox is not None:
-                    doc.update_box_rect(box.id, result.new_bbox)
+                    doc.update_box(box.id, result.new_bbox, text)  # content changed
                 else:  # emptied — the box's text is gone, drop its identity
                     doc.remove_box(box.id)
 
@@ -2099,7 +2115,9 @@ class DocumentView(QWidget):
 
         def op(doc: PdfDocument) -> None:
             boxes = [
-                box for box in (self._box_for(doc, n, pp.bbox) for pp in paras) if box is not None
+                box
+                for box in (self._box_for(doc, n, pp.bbox, pp.text) for pp in paras)
+                if box is not None
             ]
             result = doc.replace_paragraph_runs(n, union, runs)
             seen: set[str] = set()
@@ -2109,7 +2127,7 @@ class DocumentView(QWidget):
                     doc.remove_box(box.id)
             if boxes and len(seen) == len(paras) and result.new_bbox is not None:
                 # EVERY member was an inserted box: the union stays one.
-                doc.add_box(n, result.new_bbox)
+                doc.add_box(n, result.new_bbox, text=union.text)
 
         self._push_command("Merge text boxes", op, ("page", n))
         # after_command cleared the (now stale) selection; nothing else to do.
@@ -2133,10 +2151,10 @@ class DocumentView(QWidget):
 
         def op(doc: PdfDocument) -> None:
             for para, runs, off in moves:
-                box = self._box_for(doc, page_index, para.bbox)
+                box = self._box_for(doc, page_index, para.bbox, para.text)
                 result = doc.replace_paragraph_runs(page_index, para, runs, offset=off)
                 if box is not None and result.new_bbox is not None:
-                    doc.update_box_rect(box.id, result.new_bbox)
+                    doc.update_box_rect(box.id, result.new_bbox)  # move: content unchanged
 
         self._push_command(label, op, ("page", page_index))
 
@@ -2346,7 +2364,7 @@ class DocumentView(QWidget):
         results: list = []
 
         def op(doc: PdfDocument) -> None:
-            box = self._box_for(doc, page_index, para.bbox)  # match BEFORE the move
+            box = self._box_for(doc, page_index, para.bbox, para.text)  # match BEFORE the move
             result = doc.replace_paragraph_runs(page_index, para, runs, offset=offset)
             results.append(result)
             if box is not None and result.new_bbox is not None:
@@ -2607,7 +2625,7 @@ class DocumentView(QWidget):
                     max(s.bbox[2] for s in new),
                     max(s.bbox[3] for s in new),
                 )
-                doc.add_box(page_index, rect)
+                doc.add_box(page_index, rect, text=para.text)  # copy shares the source text
                 created.append(rect)
 
         if not self._push_command("Duplicate text box", op, ("page", page_index)):
@@ -2640,7 +2658,7 @@ class DocumentView(QWidget):
         self._clear_selection()
 
         def op(doc: PdfDocument) -> None:
-            box = self._box_for(doc, page_index, para.bbox)
+            box = self._box_for(doc, page_index, para.bbox, para.text)
             doc.replace_paragraph(page_index, para, "")
             if box is not None:
                 doc.remove_box(box.id)

@@ -353,13 +353,23 @@ class PdfDocument:
         boxes = boxregistry.read_boxes(self._doc)
         return boxes if n is None else [b for b in boxes if b.page == n]
 
-    def add_box(self, n: int, rect: tuple[float, float, float, float]) -> BoxRecord:
-        """Register a newly inserted box on page ``n``; returns its record."""
-        return boxregistry.add_box(self._doc, n, rect)
+    def add_box(self, n: int, rect: tuple[float, float, float, float], text: str = "") -> BoxRecord:
+        """Register a newly inserted box on page ``n``; returns its record.
+
+        ``text`` is the box's content fingerprint (used to disambiguate
+        overlapping boxes — task 5); empty falls back to pure geometry.
+        """
+        return boxregistry.add_box(self._doc, n, rect, text)
 
     def update_box_rect(self, box_id: str, rect: tuple[float, float, float, float]) -> None:
-        """Record a registered box's new placement (after a move/resize)."""
+        """Record a registered box's new placement after a MOVE/resize (content
+        unchanged, so the fingerprint is preserved)."""
         boxregistry.update_box_rect(self._doc, box_id, rect)
+
+    def update_box(self, box_id: str, rect: tuple[float, float, float, float], text: str) -> None:
+        """Record a box's new placement AND content after an EDIT changed its
+        text (the fingerprint must follow the new content)."""
+        boxregistry.update_box(self._doc, box_id, rect, text)
 
     def remove_box(self, box_id: str) -> None:
         """Drop a box from the registry (e.g. its text was deleted)."""
