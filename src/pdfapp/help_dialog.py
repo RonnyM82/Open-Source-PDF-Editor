@@ -17,8 +17,9 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         "Modes",
         [
             (
-                "Edit mode (Ctrl+E)",
-                "Documents open read-only; the pencil toggle enables editing for this document",
+                "Markup / Edit mode (Ctrl+E)",
+                "Documents open in Markup mode — highlight, comment and callout freely; "
+                "Ctrl+E enables editing text and images for this document",
             ),
             ("Show editable areas", "Outlines every editable paragraph and image on the page"),
             (
@@ -68,13 +69,17 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Insert text / image",
                 "Arms click-to-place — a chip shows what to do next; Esc cancels",
             ),
-            ("Highlight text", "Arms a window drag across the text; Esc cancels"),
+            (
+                "Highlight text (Ctrl+Shift+H)",
+                "Highlights the current text selection, or arms a window drag across text",
+            ),
+            ("Highlighter colour", "Pick from the Annotate toolbar swatch or the Annotate menu"),
             ("Right-click the background", "Insert text, an image, or a comment at that spot"),
             (
                 "Insert comment / callout",
-                "Review markup — never prints unless chosen at print time",
+                "Review markup — works in Markup mode; never prints unless chosen at print time",
             ),
-            ("On a comment", "Double-click edits · Ctrl+drag moves · Delete removes"),
+            ("On a comment", "Double-click edits · drag moves · Delete removes"),
         ],
     ),
     (

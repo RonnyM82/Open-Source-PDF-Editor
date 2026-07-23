@@ -14,7 +14,7 @@ def test_cheat_sheet_documents_every_surface():
     html = gestures_html()
     for phrase in (
         "Edit mode (Ctrl+E)",
-        "read-only",
+        "Markup mode",
         "Show editable areas",
         "Double-click edits paragraph",
         "Ctrl+double-click",
@@ -22,6 +22,7 @@ def test_cheat_sheet_documents_every_surface():
         "Delete",
         "Esc",
         "Highlight",
+        "Ctrl+Shift+H",
         "Ctrl+Z",
         "Scroll at a page edge",
     ):

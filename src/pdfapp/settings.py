@@ -43,7 +43,9 @@ class Settings:
     def _save(self) -> None:
         try:
             self._store.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._store.with_suffix(self._store.suffix + ".tmp")
+            # Per-process temp name so two windows (File > New Window is a second
+            # process sharing this file) can't race on one .tmp.
+            tmp = self._store.with_name(f"{self._store.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
             os.replace(tmp, self._store)
         except OSError:
@@ -58,8 +60,13 @@ class Settings:
 
         A no-op (and no disk write) when the value is unchanged — keeps the
         theme-change / toggle callbacks from rewriting the file needlessly.
+
+        Read-modify-write: re-read the file first so a second window's writes
+        (File > New Window shares this file) survive — we only overwrite our own
+        key on top of the latest state, never clobber the whole dict.
         """
         if self._data.get(key, _MISSING) == value:
             return
+        self._data = self._load()
         self._data[key] = value
         self._save()

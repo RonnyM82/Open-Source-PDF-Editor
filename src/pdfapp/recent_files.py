@@ -59,7 +59,9 @@ class RecentFiles:
     def _save(self) -> None:
         try:
             self._store.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._store.with_suffix(self._store.suffix + ".tmp")
+            # Per-process temp name so two windows (File > New Window is a second
+            # process sharing this file) can't race on one .tmp.
+            tmp = self._store.with_name(f"{self._store.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(self._entries, indent=2), encoding="utf-8")
             os.replace(tmp, self._store)
         except OSError:
@@ -75,8 +77,10 @@ class RecentFiles:
         """Record ``file_path`` as the most-recent entry.
 
         Moves an existing entry to the front (case-insensitive match), caps the
-        list at ``MAX_ENTRIES``, and persists.
+        list at ``MAX_ENTRIES``, and persists. Re-reads first so a second
+        window's recent additions (shared file) survive the write.
         """
+        self._entries = self._load()  # merge a concurrent window's additions
         absolute = os.path.abspath(str(file_path))
         key = os.path.normcase(absolute)
         self._entries = [p for p in self._entries if os.path.normcase(p) != key]
@@ -86,6 +90,7 @@ class RecentFiles:
 
     def remove(self, file_path: Path) -> None:
         """Drop ``file_path`` from the list (used when a recent file has gone)."""
+        self._entries = self._load()  # against the latest on-disk state
         key = os.path.normcase(os.path.abspath(str(file_path)))
         kept = [p for p in self._entries if os.path.normcase(p) != key]
         if kept != self._entries:

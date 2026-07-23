@@ -198,7 +198,7 @@ class DocumentView(QWidget):
         # Review comments (E11): pending create (page, rect, callout target),
         # pending text edit (page, xref), and an in-flight Ctrl+drag move.
         self._pending_comment: tuple[int, tuple, tuple | None] | None = None
-        self._pending_comment_edit: tuple[int, int] | None = None
+        self._pending_comment_edit: tuple[int, int, str] | None = None
         self._move_comment: tuple[int, object] | None = None
         self._move_paragraph: tuple[int, Paragraph] | None = None
         # Ctrl/Shift multi-selection of text boxes (E10.7): grouped moves and
@@ -1322,7 +1322,7 @@ class DocumentView(QWidget):
     def _begin_comment_edit(self, n: int, comment) -> None:
         """Double-click a comment: edit its text in place."""
         self._clear_selection()
-        self._pending_comment_edit = (n, comment.xref)
+        self._pending_comment_edit = (n, comment.xref, comment.text)
         scene_rect = page_coords.page_rect_to_scene(
             comment.rect,
             render_zoom=self._canvas.render_zoom,
@@ -1416,8 +1416,10 @@ class DocumentView(QWidget):
             self._push_command("Add comment", comment_op, ("page", page_index))
             return
         if self._pending_comment_edit is not None:
-            page_index, xref = self._pending_comment_edit
+            page_index, xref, original = self._pending_comment_edit
             self._pending_comment_edit = None
+            if text == original:
+                return  # unchanged — don't recreate the comment or dirty the doc
 
             def comment_edit_op(doc: PdfDocument) -> None:
                 if text.strip():
@@ -1639,6 +1641,10 @@ class DocumentView(QWidget):
             self._select_and_drag_comment(n, px, py, target)
             return
         if not self._edit_mode:
+            # A press off any selected comment deselects it (parity with the
+            # edit-mode click-away below) before starting a marquee — otherwise
+            # the comment stays selected and a later Delete would remove it.
+            self._clear_selection()
             self._begin_text_selection(sx, sy)  # Markup: marquee text selection (X4)
             return
         if target is None:
@@ -1665,6 +1671,7 @@ class DocumentView(QWidget):
         undoable, so it is exempt from the U6 click-first rule (which protects
         CONTENT from stray drags); a press without a real drag still only
         selects (sub-1pt offsets are ignored on release)."""
+        self._clear_text_selection()  # a comment selection replaces any marquee (X4)
         if self._selection != ("comment", n, target.payload):
             self._selection = ("comment", n, target.payload)
             self._push_selection_chrome()

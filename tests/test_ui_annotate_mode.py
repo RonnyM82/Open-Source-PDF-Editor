@@ -207,6 +207,63 @@ def test_comment_moved_and_deleted_in_markup(qapp, quote_pdf):
         window.close()
 
 
+def test_markup_click_away_deselects_comment(qapp, quote_pdf):
+    """A click off a selected comment deselects it, so a later Delete doesn't
+    silently remove it (review finding — Markup parity with edit mode)."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        comment = _place_comment(view, "keep me")
+        z = view._canvas.render_zoom
+        cx, cy = comment.rect[0] + 5.0, comment.rect[1] + 5.0
+        view._on_select_drag_started(cx * z, cy * z)  # select the comment
+        view._on_move_drag_finished(cx * z, cy * z, cx * z, cy * z)  # release, no move
+        assert view._selection is not None and view._selection[0] == "comment"
+
+        view._on_select_drag_started(*_sp(view, 550.0, 30.0))  # click blank space
+        assert view._selection is None
+        view._on_delete_selection()  # nothing selected → no-op
+        assert len(view.document.comments(0)) == 1
+    finally:
+        window.close()
+
+
+def test_selecting_comment_clears_marquee_selection(qapp, quote_pdf):
+    """Clicking a comment clears an active marquee text selection (review
+    finding — otherwise Highlight would target the stale selection)."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        comment = _place_comment(view, "note")
+        _select_span(view, _span(view, quote_pdf.price))
+        assert view.has_text_selection()
+
+        z = view._canvas.render_zoom
+        cx, cy = comment.rect[0] + 5.0, comment.rect[1] + 5.0
+        view._on_select_drag_started(cx * z, cy * z)
+        assert not view.has_text_selection()
+        assert view._selection[0] == "comment"
+    finally:
+        window.close()
+
+
+def test_reading_comment_then_entering_edit_mode_adds_no_command(qapp, quote_pdf):
+    """Opening a comment editor to READ it (no edits) then switching to Edit
+    mode must not recreate the comment or dirty the doc (review finding)."""
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        comment = _place_comment(view, "read-only note")
+        count_before = view.undo_stack.count()  # the Add command
+
+        view._on_point_activated(*_scene_center(view, comment.rect))  # double-click to read
+        assert not view._para_editor.isHidden()
+        view.set_edit_mode(True)  # commits the open editor — unchanged, so no-op
+        assert view.undo_stack.count() == count_before
+    finally:
+        window.close()
+
+
 def test_callout_two_click_in_markup(qapp, quote_pdf):
     window = MainWindow()
     try:

@@ -89,3 +89,16 @@ def test_non_list_store_degrades_to_empty(tmp_path):
     store = tmp_path / "recent_files.json"
     store.write_text(json.dumps({"a": 1}), encoding="utf-8")
     assert RecentFiles(store).entries() == []
+
+
+def test_concurrent_instances_merge_additions(tmp_path):
+    """Two windows sharing one file: each add() re-reads first, so neither
+    window's recent additions are lost (read-modify-write)."""
+    path = tmp_path / "recent_files.json"
+    a = RecentFiles(path)  # window A
+    b = RecentFiles(path)  # window B (independent snapshot)
+    a.add(tmp_path / "a.pdf")
+    b.add(tmp_path / "b.pdf")  # B re-reads, sees a.pdf, adds b.pdf on top
+    names = [p.name for p in RecentFiles(path).entries()]
+    assert names[0] == "b.pdf"  # most recent
+    assert "a.pdf" in names  # A's entry survived

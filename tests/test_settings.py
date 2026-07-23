@@ -62,3 +62,16 @@ def test_non_dict_store_degrades_to_empty(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
     assert Settings(path).get("theme", "dark") == "dark"
+
+
+def test_concurrent_instances_do_not_clobber_each_others_keys(tmp_path):
+    """Two windows (File > New Window is a second process) share one file; a
+    write must not revert the other window's different key (read-modify-write)."""
+    path = tmp_path / "settings.json"
+    a = Settings(path)  # window A
+    b = Settings(path)  # window B (independent snapshot)
+    a.set("theme", "light")
+    b.set("thumbnails_visible", False)  # B's stale dict must NOT reset theme
+    fresh = Settings(path)
+    assert fresh.get("theme") == "light"
+    assert fresh.get("thumbnails_visible") is False
