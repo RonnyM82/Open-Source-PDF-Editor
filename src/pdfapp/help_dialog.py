@@ -36,6 +36,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Double-click", "Edits the line (or the paragraph, per the toggle)"),
             ("Ctrl+double-click", "Edits the other one — a momentary override"),
             ("Ctrl+drag", "Moves the paragraph directly, no selection needed"),
+            ("Hold Shift while moving", "Snaps the move to one axis (keeps a row/column aligned)"),
             ("Ctrl+click / Shift+click", "Adds the box to a multi-selection (click again removes)"),
             ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
             ("Right-click (multi-selected)", "Merge the selected text boxes into one"),

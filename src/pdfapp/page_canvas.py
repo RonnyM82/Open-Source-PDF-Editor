@@ -509,6 +509,26 @@ class PageCanvas(QGraphicsView):
         self._move_band.setGeometry(QRect(anchor, anchor))
         self._move_band.show()
 
+    def _axis_snapped(self, current: QPointF, press: QPointF | None = None) -> QPointF:
+        """With Shift held, snap a move to its dominant axis (horizontal OR
+        vertical), so a nudge keeps an existing column/row alignment.
+
+        Scene space == on-screen axes (the pixmap is rotation-applied), so a
+        pure-x or pure-y scene delta is a pure-x/pure-y SCREEN move; the view's
+        ``_drag_offset`` maps it back to a rotation-correct page offset. The
+        larger component wins ties toward horizontal. Modifiers are read LIVE
+        (U-series rule — never tracked via key events), so holding Shift PART
+        WAY through a drag snaps from that point and releasing it unsnaps."""
+        press = press if press is not None else self._move_press
+        shift = QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+        if press is None or not shift:
+            return current
+        dx = current.x() - press.x()
+        dy = current.y() - press.y()
+        if abs(dx) >= abs(dy):
+            return QPointF(current.x(), press.y())  # horizontal only
+        return QPointF(press.x(), current.y())  # vertical only
+
     # --- hover affordances (U2a) ------------------------------------------
     def set_hover(
         self,
@@ -777,7 +797,8 @@ class PageCanvas(QGraphicsView):
             if self._resize_anchor is not None:  # resize: anchor corner -> cursor
                 top_left = self.mapFromScene(self._resize_anchor)
                 bottom_right = event.position().toPoint()
-            else:  # move: translate the whole rect
+            else:  # move: translate the whole rect (Shift snaps to one axis)
+                current = self._axis_snapped(current)
                 shifted = self._move_base_rect.translated(current - self._move_press)
                 top_left = self.mapFromScene(shifted.topLeft())
                 bottom_right = self.mapFromScene(shifted.bottomRight())
@@ -842,12 +863,15 @@ class PageCanvas(QGraphicsView):
             and event.button() == Qt.MouseButton.LeftButton
         ):
             press = self._move_press
+            was_resize = self._resize_anchor is not None
             self._move_press = None
             self._move_base_rect = None
             self._resize_anchor = None
             if self._move_band is not None:
                 self._move_band.hide()
             current = self.mapToScene(event.position().toPoint())
+            if not was_resize:  # Shift snaps the committed offset to one axis too
+                current = self._axis_snapped(current, press)
             self.moveDragFinished.emit(press.x(), press.y(), current.x(), current.y())
             event.accept()
             return
