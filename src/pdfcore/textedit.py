@@ -1792,13 +1792,18 @@ def insert_new_runs(
     runs: list[StyledRun],
     *,
     align: str = "left",
+    pitch: float | None = None,
 ) -> None:
     """Insert NEW rich text at a baseline point (E9). Additive.
 
     Hard ``\\n`` breaks only (no wrap width for free-standing text); line
-    pitch = 1.2 × the first run's base size. The point (and every line's
-    baseline) is validated against the unrotated page bounds — PyMuPDF's
-    ``insert_text`` accepts off-page points without complaint.
+    pitch defaults to 1.2 × the first run's base size. The point (and every
+    line's baseline) is validated against the unrotated page bounds —
+    PyMuPDF's ``insert_text`` accepts off-page points without complaint.
+
+    ``pitch`` sets the baseline spacing explicitly — what a COPY of an
+    existing paragraph needs: real blocks are often set tighter than 1.2 em,
+    and the default would space the copy visibly looser than its original.
 
     ``align`` justifies the lines against EACH OTHER — free-standing text has
     no box, so the widest line is the box: "left" starts every line at the
@@ -1825,7 +1830,10 @@ def insert_new_runs(
     base_size = next(
         (frag.style.size for line in lines for frag in line if frag.text.strip()), 11.0
     )
-    pitch = 1.2 * base_size
+    if pitch is None:
+        pitch = 1.2 * base_size
+    elif pitch <= 0:
+        raise ValueError("pitch must be positive")
     if y + (len(lines) - 1) * pitch > height:
         raise ValueError("the text runs off the page bottom — remove some lines")
     widths = [(line[-1].x + line[-1].width) if line else 0.0 for line in lines]

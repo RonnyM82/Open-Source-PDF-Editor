@@ -39,7 +39,10 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Ctrl+click / Shift+click", "Adds the box to a multi-selection (click again removes)"),
             ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
             ("Right-click (multi-selected)", "Merge the selected text boxes into one"),
-            ("Right-click", "Edit text · Edit paragraph · Highlight this text"),
+            (
+                "Right-click",
+                "Edit text · Edit paragraph · Highlight · Duplicate text box · Delete text box",
+            ),
         ],
     ),
     (
@@ -48,6 +51,10 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Enter / Ctrl+Enter", "Commits a line edit / applies a paragraph edit"),
             ("Esc", "Cancels the edit"),
             ("Style toolbar", "Formats the selected characters (bold two words, colour one)"),
+            (
+                "Alignment button",
+                "Left / centre / right for the WHOLE box — the dropdown remembers your last pick",
+            ),
             ("Drag right edge / corner", "Sets the paragraph wrap width / resizes the box"),
         ],
     ),

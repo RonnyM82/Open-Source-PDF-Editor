@@ -303,9 +303,14 @@ class PdfDocument:
         runs: list[StyledRun],
         *,
         align: str = "left",
+        pitch: float | None = None,
     ) -> None:
-        """Insert NEW rich text at a baseline point on page ``n`` (E9)."""
-        textedit.insert_new_runs(self._doc, n, point, runs, align=align)
+        """Insert NEW rich text at a baseline point on page ``n`` (E9).
+
+        ``pitch`` overrides the default 1.2-em baseline spacing (a copy of an
+        existing paragraph reproduces that paragraph's own pitch).
+        """
+        textedit.insert_new_runs(self._doc, n, point, runs, align=align, pitch=pitch)
 
     def highlight(
         self, n: int, span: TextSpan, color: tuple[float, float, float] | None = None

@@ -1726,6 +1726,35 @@ def test_insert_new_text_multiline(quote_pdf, tmp_path):
     assert second.origin[1] > first.origin[1]  # laid out downward
 
 
+def test_insert_runs_pitch_override_reproduces_tight_spacing(tmp_path):
+    """A COPY of a tight-set paragraph must keep ITS pitch — the 1.2-em
+    default would space the copy visibly looser than its original."""
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    out = tmp_path / "pitched.pdf"
+    doc = pymupdf.open()
+    doc.new_page()
+    pdoc = PdfDocument(doc)
+    runs = [StyledRun("copy line one\ncopy line two", TextStyle(size=8))]
+    pdoc.insert_runs(0, (72.0, 200.0), runs, pitch=8.0)
+    pdoc.save(out)
+    pdoc.close()
+
+    spans = sorted(_spans_for(out), key=lambda s: s.origin[1])
+    assert len(spans) == 2
+    assert spans[1].origin[1] - spans[0].origin[1] == pytest.approx(8.0, abs=0.1)
+
+
+def test_insert_runs_rejects_a_non_positive_pitch(tmp_path):
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    doc = pymupdf.open()
+    doc.new_page()
+    with PdfDocument(doc) as pdoc:
+        with pytest.raises(ValueError, match="pitch"):
+            pdoc.insert_runs(0, (72.0, 200.0), [StyledRun("x\ny", TextStyle())], pitch=0)
+
+
 def test_insert_new_text_rejects_blank_and_off_page(quote_pdf):
     with PdfDocument.open(quote_pdf.path) as doc:
         with pytest.raises(ValueError, match="no text"):

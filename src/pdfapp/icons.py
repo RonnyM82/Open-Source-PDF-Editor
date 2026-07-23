@@ -72,6 +72,7 @@ _NAMES = {
     "rotate_image_cw": "mdi6.rotate-right",
     "rotate_image_ccw": "mdi6.rotate-left",
     "copy": "mdi6.content-copy",
+    "duplicate_text": "mdi6.content-duplicate",
     # Text style
     "bold": "mdi6.format-bold",
     "italic": "mdi6.format-italic",

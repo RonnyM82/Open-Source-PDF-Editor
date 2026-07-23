@@ -2283,6 +2283,10 @@ class DocumentView(QWidget):
             actions["edit_para"].setEnabled(para is not None)
             actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
             actions["highlight"].setEnabled(span is not None)
+            actions["duplicate_text_box"] = menu.addAction(
+                icons.icon("duplicate_text"), "Duplicate text box"
+            )
+            actions["duplicate_text_box"].setEnabled(para is not None)
             actions["delete_text_box"] = menu.addAction(
                 icons.icon("delete_image"), "Delete text box"
             )
@@ -2328,6 +2332,8 @@ class DocumentView(QWidget):
             self._begin_paragraph_edit(n, para)
         elif chosen is actions.get("highlight"):
             self._highlight_rect(n, span.bbox)
+        elif chosen is actions.get("duplicate_text_box"):
+            self._duplicate_paragraph_at(n, para)
         elif chosen is actions.get("delete_text_box"):
             self._delete_paragraph_at(n, para)
         elif chosen is actions.get("replace"):
@@ -2357,6 +2363,58 @@ class DocumentView(QWidget):
         path = self._prompt_image_path()
         if path is not None:
             self._place_image(page_index, px, py, path)
+
+    def _duplicate_paragraph_at(self, page_index: int, para) -> None:
+        """Context menu: drop an independent COPY of a text box (user request).
+
+        ADDITIVE — the copy goes in through ``insert_runs``, so the original
+        is never redacted and no bystander text is touched. The copy carries
+        the original's runs (per-word styles and underline/strike rules
+        survive, same conversion the move path uses), its own pitch and its
+        justification, so it looks identical, and it lands one box-height
+        BELOW the original — never on top of it, and flipped to ABOVE when
+        the page bottom is too close. It registers as its own box (E10): the
+        copy sits one line-pitch from its source, which is exactly the
+        arrangement MuPDF blocks into ONE paragraph, and the boundary is what
+        keeps them two separate, independently editable text boxes.
+        """
+        if not self._edit_mode or para is None:
+            return
+        self._clear_selection()
+        runs = self._runs_from_paragraph(para)
+        page_w, page_h = self._doc.page_size(page_index)
+        if self._doc.page_rotation(page_index) % 180 == 90:
+            page_w, page_h = page_h, page_w  # the engine speaks unrotated space
+        x0, y0, _x1, y1 = para.bbox
+        first_y = para.first_origin[1]
+        gap = max(y1 - y0, para.pitch) + 0.4 * para.pitch
+        # Below unless the copy's last baseline would run off the page.
+        last_baseline_drop = y1 - first_y
+        dy = gap if first_y + gap + last_baseline_drop <= page_h else -gap
+        point = (max(0.0, min(x0, page_w - 1.0)), first_y + dy)
+        if not (0 < point[1] <= page_h):
+            self.editWarning.emit("There is no room on the page for a copy of this text box.")
+            return
+
+        def op(doc: PdfDocument) -> None:
+            # Register INSIDE the op so the snapshot carries content +
+            # registry together and undo can never split them (E10).
+            before = {(s.text, s.bbox) for s in doc.text_spans(page_index)}
+            doc.insert_runs(page_index, point, runs, align=para.align, pitch=para.pitch)
+            new = [s for s in doc.text_spans(page_index) if (s.text, s.bbox) not in before]
+            if new:
+                doc.add_box(
+                    page_index,
+                    (
+                        min(s.bbox[0] for s in new),
+                        min(s.bbox[1] for s in new),
+                        max(s.bbox[2] for s in new),
+                        max(s.bbox[3] for s in new),
+                    ),
+                )
+
+        if self._push_command("Duplicate text box", op, ("page", page_index)):
+            self.editWarning.emit("Copy placed below — Ctrl+drag it where you want it.")
 
     def _delete_paragraph_at(self, page_index: int, para) -> None:
         """Context menu: delete a whole text block in one step — the same
