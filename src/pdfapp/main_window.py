@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSpinBox,
     QTabWidget,
@@ -169,6 +170,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_style_toolbar()
+        self._build_annotate_toolbar()
         self._assign_icons()
         # Permanent read-only/editing indicator for the ACTIVE tab (U0).
         self._mode_label = QLabel("", self)
@@ -767,6 +769,36 @@ class MainWindow(QMainWindow):
         self.addToolBar(bar)
         self._capture_global_style()  # launch state IS the initial defaults
 
+    def _build_annotate_toolbar(self) -> None:
+        """The Annotate toolbar: highlight + colour swatch + comment + callout.
+
+        Always visible and enabled outside edit mode (its actions are in
+        _annotate_actions, enabled on `has` in _sync_chrome) — the whole point
+        of Markup mode. objectName so saveState persists its position.
+        """
+        bar = QToolBar("Annotate", self)
+        bar.setObjectName("annotate_toolbar")
+        bar.setIconSize(QSize(20, 20))
+        bar.addAction(self._highlight_action)
+
+        # Highlighter-colour swatch: a painted button whose dropdown is the
+        # restricted palette — the SAME QActions as the Annotate ▸ Highlight
+        # colour submenu, so the checkmarks stay in sync across both.
+        self._highlight_color_button = QToolButton(self)
+        self._highlight_color_button.setToolTip("Highlighter colour")
+        self._highlight_color_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        swatch_menu = QMenu(self)
+        for action in self._highlight_color_actions.values():
+            swatch_menu.addAction(action)
+        self._highlight_color_button.setMenu(swatch_menu)
+        self._update_highlight_swatch()
+        bar.addWidget(self._highlight_color_button)
+
+        bar.addSeparator()
+        bar.addAction(self._insert_comment_action)
+        bar.addAction(self._insert_callout_action)
+        self.addToolBar(bar)
+
     def _refocus_open_editor(self) -> None:
         """After typing a size, put the caret back in the in-place editor."""
         if (view := self.active_view) is not None:
@@ -889,11 +921,19 @@ class MainWindow(QMainWindow):
             view.set_highlight_color(rgb)
 
     def _refresh_highlight_color_chrome(self) -> None:
-        """Reflect the current highlighter colour in the menu checkmarks (A5
-        extends this to repaint the toolbar swatch)."""
+        """Reflect the current highlighter colour in the menu checkmarks and the
+        Annotate toolbar swatch."""
         current = self._highlight_color.name().upper()
         for hexstr, action in self._highlight_color_actions.items():
             action.setChecked(hexstr == current)
+        self._update_highlight_swatch()
+
+    def _update_highlight_swatch(self) -> None:
+        """Repaint the toolbar swatch button to the current colour. Its painted
+        pixmap IS its meaning (like the text-colour swatch), so it is excluded
+        from _icon_keys and never re-baked on a theme change."""
+        if hasattr(self, "_highlight_color_button"):
+            self._highlight_color_button.setIcon(QIcon(self._swatch_pixmap(self._highlight_color)))
 
     def _highlight_color_rgb(self) -> tuple[float, float, float]:
         """The current highlighter colour as engine ``(r, g, b)`` 0-1 floats."""
