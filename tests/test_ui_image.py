@@ -268,7 +268,9 @@ def test_highlight_window_selection_and_undo(qapp, quote_pdf):
         window.close()
 
 
-def test_highlight_tiny_drag_falls_back_to_span(qapp, quote_pdf):
+def test_highlight_tiny_drag_highlights_the_word(qapp, quote_pdf):
+    """An armed highlight click / double-click highlights the WORD under it
+    (the price is a single word, so one annot covers it)."""
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
@@ -280,10 +282,10 @@ def test_highlight_tiny_drag_falls_back_to_span(qapp, quote_pdf):
         cx = (span.bbox[0] + span.bbox[2]) / 2
         cy = (span.bbox[1] + span.bbox[3]) / 2
         z = view._canvas.render_zoom
-        view._canvas.regionSelected.emit(cx * z, cy * z, cx * z + 0.2, cy * z + 0.2)
+        view._canvas.regionSelected.emit(cx * z, cy * z, cx * z, cy * z)  # a click (zero drag)
 
         page = view.document._doc[0]
-        assert len(list(page.annots())) == 1  # the span under the click
+        assert len(list(page.annots())) == 1  # the word under the click
     finally:
         window.close()
 

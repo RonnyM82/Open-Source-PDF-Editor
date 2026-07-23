@@ -127,6 +127,40 @@ def test_highlight_the_text_selection(qapp, quote_pdf):
         window.close()
 
 
+def test_armed_click_highlights_only_the_word(qapp, tmp_path):
+    """With the highlight tool armed, a click / double-click on a word highlights
+    exactly that WORD, not the whole line/span under it."""
+    import pymupdf
+
+    src = tmp_path / "line.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 100), "alpha beta gamma", fontsize=12)
+    doc.save(str(src))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        view = _markup_view(window, src)
+        beta = next(w for ln in view.document.text_lines(0) for w in ln if w.text == "beta")
+        cx = (beta.bbox[0] + beta.bbox[2]) / 2
+        cy = (beta.bbox[1] + beta.bbox[3]) / 2
+
+        window.highlight_text()  # no selection → arms the highlight tool
+        assert view.armed_action == "highlight"
+        s = _sp(view, cx, cy)
+        view._canvas.regionSelected.emit(s[0], s[1], s[0], s[1])  # a click (zero drag)
+
+        page = view.document._doc[0]  # keep the page alive — annots orphan otherwise
+        annots = list(page.annots())
+        assert len(annots) == 1
+        xs = [p[0] for p in annots[0].vertices]
+        # Hugs "beta" only — not "alpha beta gamma".
+        assert min(xs) >= beta.bbox[0] - 2.0
+        assert max(xs) <= beta.bbox[2] + 2.0
+    finally:
+        window.close()
+
+
 def test_highlight_action_without_selection_arms_marquee(qapp, quote_pdf):
     """With no selection the Highlight action falls back to the area marquee."""
     window = MainWindow()

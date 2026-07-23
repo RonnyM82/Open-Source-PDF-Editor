@@ -1191,7 +1191,9 @@ class DocumentView(QWidget):
         if not self._canvas.has_page:
             return
         self._click_action = None
-        self._canvas.arm_region_select("Drag a window across the text to highlight · Esc cancels")
+        self._canvas.arm_region_select(
+            "Drag across text — or double-click a word — to highlight · Esc cancels"
+        )
 
     @property
     def armed_action(self) -> str | None:
@@ -1212,7 +1214,9 @@ class DocumentView(QWidget):
         """Highlight everything inside the dragged window (one undo step).
 
         Corners convert through the seam individually (rotation-safe), then
-        normalize in page space. A tiny drag falls back to the span under it.
+        normalize in page space. A tiny drag (a click, or the first press of a
+        double-click) highlights just the WORD under the point — Qt suppresses
+        the trailing double-click, so double-clicking a word lands on the word.
         """
         n = self._current_page
         ax, ay = self._scene_point_to_page(sx0, sy0, n)
@@ -1220,22 +1224,39 @@ class DocumentView(QWidget):
         x0, x1 = sorted((ax, bx))
         y0, y1 = sorted((ay, by))
         spans = self._doc.text_spans(n)
-        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click: the span under it
-            span = page_coords.span_at(spans, (x0 + x1) / 2, (y0 + y1) / 2)
+        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click / double-click: the word
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            word = textselect.word_region_at(self._page_text_lines(), cx, cy)
+            if word:  # a native word — highlight exactly it (its bbox IS the word,
+                self._highlight_word_rects(n, textselect.region_rects(word))  # no re-clip
+                return
+            # no native word (outline / scanned text): fall back to the span
+            span = page_coords.span_at(spans, cx, cy)
             if span is None:
                 self.editWarning.emit("No text there to highlight.")
                 return
-            rect = span.bbox
-        else:
-            rect = (x0, y0, x1, y1)
-            if not any(
-                s.bbox[0] < x1 and s.bbox[2] > x0 and s.bbox[1] < y1 and s.bbox[3] > y0
-                for s in spans
-            ):
-                self.editWarning.emit("No text in the selection.")
-                return
-
+            self._highlight_rect(n, span.bbox)
+            return
+        rect = (x0, y0, x1, y1)
+        if not any(
+            s.bbox[0] < x1 and s.bbox[2] > x0 and s.bbox[1] < y1 and s.bbox[3] > y0 for s in spans
+        ):
+            self.editWarning.emit("No text in the selection.")
+            return
         self._highlight_rect(n, rect)
+
+    def _highlight_word_rects(
+        self, page_index: int, rects: list[tuple[float, float, float, float]]
+    ) -> None:
+        """Highlight the given word rects DIRECTLY (one undo step) — the native
+        word bbox is exactly the word, so no character re-clipping (which can
+        drop a tight bbox whose char centres fall on the border)."""
+        color = self._highlight_color
+
+        def op(doc: PdfDocument) -> None:
+            doc.highlight_rects(page_index, rects, color)
+
+        self._push_command("Highlight text", op, ("page", page_index))
 
     def _highlight_rect(self, page_index: int, rect: tuple[float, float, float, float]) -> None:
         """Highlight all text inside ``rect`` as one undo step (region drag
