@@ -340,6 +340,29 @@ class Paragraph:
 # Line edges within this many points of each other count as "aligned".
 _ALIGN_TOL = 1.5
 
+# The justifications the text ops accept. "left" is the do-no-harm default
+# everywhere: a single line, an ambiguous block, and an unspecified insert
+# all lay out from their own left edge.
+ALIGNMENTS = ("left", "center", "right")
+
+
+def _check_align(align: str) -> str:
+    """Validate a caller-supplied justification (typo -> ValueError, never a
+    silent left-align of text the user asked to centre)."""
+    if align not in ALIGNMENTS:
+        raise ValueError(f"alignment must be one of {ALIGNMENTS}, not {align!r}")
+    return align
+
+
+def _align_shift(align: str, box_width: float, line_width: float) -> float:
+    """The x-shift that justifies a laid-out line within a box of
+    ``box_width``. A line WIDER than the box (the wrap grace, or an
+    unbreakable word) overflows in the alignment's natural direction."""
+    if align == "left":
+        return 0.0
+    slack = box_width - line_width
+    return slack if align == "right" else slack / 2.0
+
 
 def _detect_alignment(line_tuples: tuple[tuple[TextSpan, ...], ...]) -> str:
     """Infer a paragraph's justification from its lines' x-extents.
@@ -1527,6 +1550,7 @@ def replace_paragraph_text(
     offset: tuple[float, float] = (0.0, 0.0),
     style: TextStyle | None = None,
     width: float | None = None,
+    align: str | None = None,
 ) -> ParagraphReplaceResult:
     """Replace a whole paragraph: band-redact every member span, then
     re-insert the new text wrapped WITHIN the paragraph's own box.
@@ -1547,7 +1571,9 @@ def replace_paragraph_text(
 
     ``offset`` translates the re-insertion box (unrotated page points) —
     passing the paragraph's own text with an offset MOVES it. The translated
-    box is clamped to stay on the page.
+    box is clamped to stay on the page. ``align`` overrides the paragraph's
+    DETECTED justification (``None`` reproduces it — see
+    ``replace_paragraph_runs``).
     """
     new_text = new_text.replace("\r\n", "\n").replace("\r", "\n")
     if style is None:  # automatic matching of the paragraph's dominant style
@@ -1568,6 +1594,7 @@ def replace_paragraph_text(
         width=width,
         pitch=pitch,
         exact_font=exact_font,
+        align=align,
     )
 
 
@@ -1588,6 +1615,7 @@ def replace_paragraph_runs(
     width: float | None = None,
     pitch: float | None = None,
     exact_font: bool = True,
+    align: str | None = None,
 ) -> ParagraphReplaceResult:
     """Replace a paragraph with RICH runs, laid out by the engine (E9).
 
@@ -1610,12 +1638,19 @@ def replace_paragraph_runs(
     watching the rubber band. ``exact_font`` is reporting-only (the caller
     knows whether its font choices were honoured).
 
+    ``align`` ("left" / "center" / "right") is the user's explicit
+    justification, applied within the paragraph's own box; ``None`` keeps the
+    justification DETECTED from the original lines (``para.align``), which is
+    what a move, a merge or a plain edit wants — nothing re-justifies itself
+    behind the user's back.
+
     Rotated text is refused here (BEFORE any mutation): rotated lines are
     singleton paragraphs by construction, and the UI edits them through the
     single-span path, which re-inserts with the rotation preserved.
     """
     if any(span.rotation != 0 for span in para.spans):
         raise ValueError("rotated text is edited as a single line, not a paragraph")
+    align_val = para.align if align is None else _check_align(align)
     pitch_val = pitch if pitch is not None else para.pitch
     wrap = max(20.0, width if width is not None else (para.bbox[2] - para.bbox[0]))
     lines = _layout_runs(runs, wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
@@ -1643,12 +1678,10 @@ def replace_paragraph_runs(
 
         def line_shift(line: list[_Fragment]) -> float:
             """Justification x-shift (E9.6): right/centre-aligned paragraphs
-            keep their right edge / midpoint; a line wider than the box (the
-            wrap grace) overflows in the alignment's natural direction."""
-            if para.align == "left" or not line:
+            keep their right edge / midpoint within the box."""
+            if not line:
                 return 0.0
-            slack = wrap - (line[-1].x + line[-1].width)
-            return slack if para.align == "right" else slack / 2.0
+            return _align_shift(align_val, wrap, line[-1].x + line[-1].width)
 
         # Clamp onto the page: ascender room at the top, slide up at the bottom.
         lowest_first = page_h - descent - (len(lines) - 1) * pitch_val
@@ -1739,15 +1772,17 @@ def insert_new_text(
     text: str,
     *,
     style: TextStyle | None = None,
+    align: str = "left",
 ) -> None:
     """Insert NEW text at a baseline point (unrotated page space).
 
     Additive — nothing is redacted. ``\\n`` starts extra lines below.
     ``style`` defaults to non-embedded 11pt black helv; an explicit fontfile
-    style embeds a subset of the chosen system font.
+    style embeds a subset of the chosen system font. ``align`` justifies the
+    lines against each other (see ``insert_new_runs``).
     """
     style = style or TextStyle()
-    insert_new_runs(doc, page_index, point, [StyledRun(text, style)])
+    insert_new_runs(doc, page_index, point, [StyledRun(text, style)], align=align)
 
 
 def insert_new_runs(
@@ -1755,6 +1790,8 @@ def insert_new_runs(
     page_index: int,
     point: tuple[float, float],
     runs: list[StyledRun],
+    *,
+    align: str = "left",
 ) -> None:
     """Insert NEW rich text at a baseline point (E9). Additive.
 
@@ -1762,7 +1799,16 @@ def insert_new_runs(
     pitch = 1.2 × the first run's base size. The point (and every line's
     baseline) is validated against the unrotated page bounds — PyMuPDF's
     ``insert_text`` accepts off-page points without complaint.
+
+    ``align`` justifies the lines against EACH OTHER — free-standing text has
+    no box, so the widest line is the box: "left" starts every line at the
+    point (unchanged), "right"/"center" line the shorter ones up on the
+    widest one's right edge / midpoint. The point stays the block's left
+    edge either way, so the bounds check means the same thing for all three
+    (and a single-line insert is identical in all three, honestly — there is
+    nothing to justify against).
     """
+    _check_align(align)
     if not _runs_have_text(runs):
         raise ValueError("no text to insert")
     page = doc[page_index]
@@ -1782,8 +1828,10 @@ def insert_new_runs(
     pitch = 1.2 * base_size
     if y + (len(lines) - 1) * pitch > height:
         raise ValueError("the text runs off the page bottom — remove some lines")
+    widths = [(line[-1].x + line[-1].width) if line else 0.0 for line in lines]
+    block = max(widths, default=0.0)
     for i, line in enumerate(lines):
-        _insert_line(page, x, y + i * pitch, line)
+        _insert_line(page, x + _align_shift(align, block, widths[i]), y + i * pitch, line)
 
 
 def add_highlight(

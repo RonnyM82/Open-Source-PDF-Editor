@@ -352,6 +352,23 @@ class _RichOverlayBase(QTextEdit):
             block = block.next()
         return pieces
 
+    def set_alignment(self, alignment: Qt.AlignmentFlag) -> None:
+        """Justify the WHOLE editor (alignment is a paragraph property, not a
+        selection one) — the on-page layout the commit will produce, shown
+        while it is still being typed. The fit anchor follows, so a later
+        content-fit widening keeps the anchored edge over the page text."""
+        block_fmt = QTextBlockFormat()  # alignment ONLY — a merge leaves the
+        block_fmt.setAlignment(alignment)  # pinned line heights untouched
+        cursor = self.textCursor()
+        everything = QTextCursor(self.document())
+        everything.select(QTextCursor.SelectionType.Document)
+        everything.mergeBlockFormat(block_fmt)
+        self.setTextCursor(cursor)  # merging must not move the caret/selection
+        self._fit_anchor = {
+            Qt.AlignmentFlag.AlignRight: "right",
+            Qt.AlignmentFlag.AlignHCenter: "center",
+        }.get(alignment, "left")
+
     # --- selection formatting (driven by the style toolbar) ----------------
     def merge_selection_format(self, fmt: QTextCharFormat) -> None:
         """Apply to the selection, or set the typing format at the cursor."""

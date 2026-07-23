@@ -981,6 +981,127 @@ def test_centered_paragraph_detected_and_kept(tmp_path):
             assert (s.bbox[0] + s.bbox[2]) / 2 == pytest.approx(200.0, abs=2.5)
 
 
+# --- explicit justification (the alignment toolbar) --------------------------
+
+
+def test_replace_paragraph_align_override_right_justifies(tmp_path):
+    """The user picks Right for a left-aligned paragraph: the replacement
+    lines share a right edge and the left edges go ragged."""
+    path = _paragraph_fixture(tmp_path)
+    out = tmp_path / "right.pdf"
+    with PdfDocument.open(path) as doc:
+        para = doc.paragraph_at(0, 100, 118)
+        assert para.align == "left"
+        doc.replace_paragraph(0, para, "one short\ntwo rather longer line\nmid line", align="right")
+        doc.save(out)
+    spans = [
+        s
+        for s in _spans_for(out)
+        if s.text.strip() in ("one short", "two rather longer line", "mid line")
+    ]
+    assert len(spans) == 3
+    right_edges = [s.bbox[2] for s in spans]
+    assert max(right_edges) - min(right_edges) < 1.0  # one right edge
+    left_edges = [s.bbox[0] for s in spans]
+    assert max(left_edges) - min(left_edges) > 10  # genuinely ragged left
+
+
+def test_replace_paragraph_align_override_center(tmp_path):
+    path = _paragraph_fixture(tmp_path)
+    out = tmp_path / "center.pdf"
+    with PdfDocument.open(path) as doc:
+        para = doc.paragraph_at(0, 100, 118)
+        doc.replace_paragraph(
+            0, para, "one short\ntwo rather longer line\nmid line", align="center"
+        )
+        doc.save(out)
+    mids = [
+        (s.bbox[0] + s.bbox[2]) / 2
+        for s in _spans_for(out)
+        if s.text.strip() in ("one short", "two rather longer line", "mid line")
+    ]
+    assert len(mids) == 3
+    assert max(mids) - min(mids) < 1.0  # shared midpoint
+
+
+def test_replace_paragraph_align_none_keeps_detected(tmp_path):
+    """The default (None) reproduces the DETECTED justification — a move, a
+    merge or a plain edit must never re-justify behind the user's back."""
+    path = _right_aligned_pdf(tmp_path)
+    out = tmp_path / "kept.pdf"
+    with PdfDocument.open(path) as doc:
+        para = _para_at_span(doc, "Subtotal ex GST")
+        assert para.align == "right"
+        doc.replace_paragraph(0, para, "Subtotal excluding GST\nFreight (UPS - 1234)", align=None)
+        doc.save(out)
+    spans = [s for s in _spans_for(out) if "Subtotal excl" in s.text or "Freight" in s.text]
+    assert len(spans) == 2
+    for span in spans:
+        assert span.bbox[2] == pytest.approx(300.0, abs=2.0)
+
+
+def test_replace_paragraph_left_override_beats_detected_right(tmp_path):
+    """The override wins over detection: a right-aligned block explicitly set
+    to Left comes back with equal LEFT edges."""
+    path = _right_aligned_pdf(tmp_path)
+    out = tmp_path / "flattened.pdf"
+    with PdfDocument.open(path) as doc:
+        para = _para_at_span(doc, "Subtotal ex GST")
+        doc.replace_paragraph(0, para, "Subtotal excluding GST\nFreight (UPS - 1234)", align="left")
+        doc.save(out)
+    spans = [s for s in _spans_for(out) if "Subtotal excl" in s.text or "Freight" in s.text]
+    assert len(spans) == 2
+    x0s = [s.bbox[0] for s in spans]
+    assert max(x0s) - min(x0s) < 1.0
+
+
+def test_unknown_align_raises_before_any_mutation(tmp_path):
+    path = _paragraph_fixture(tmp_path)
+    with PdfDocument.open(path) as doc:
+        para = doc.paragraph_at(0, 100, 118)
+        with pytest.raises(ValueError, match="alignment"):
+            doc.replace_paragraph(0, para, "replacement text", align="justified")
+        # Nothing redacted, nothing inserted — the check is pre-mutation.
+        assert doc.paragraph_at(0, 100, 118).text == para.text
+        with pytest.raises(ValueError, match="alignment"):
+            doc.insert_text(0, (72, 300), "new text", align="middle")
+        assert not [s for s in doc.text_spans(0) if s.text.strip() == "new text"]
+
+
+def test_insert_runs_justify_lines_against_the_widest(tmp_path):
+    """Free-standing new text has no box, so the widest line IS the box:
+    right/centre line the shorter lines up on it, left leaves them at the
+    click point. The point stays the block's left edge in all three."""
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    style = TextStyle(size=10)
+    runs = [StyledRun("a much longer first line\nshort\nmiddle one", style)]
+    edges = {}
+    for align in ("left", "center", "right"):
+        out = tmp_path / f"insert_{align}.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        pdoc = PdfDocument(doc)
+        pdoc.insert_runs(0, (72, 200), runs, align=align)
+        pdoc.save(out)
+        pdoc.close()
+        spans = sorted(_spans_for(out), key=lambda s: s.origin[1])
+        assert [s.text.strip() for s in spans] == [
+            "a much longer first line",
+            "short",
+            "middle one",
+        ]
+        edges[align] = spans
+
+    for span in edges["left"]:  # unchanged behaviour: every line at the point
+        assert span.bbox[0] == pytest.approx(72.0, abs=1.0)
+    rights = [s.bbox[2] for s in edges["right"]]
+    assert max(rights) - min(rights) < 1.0
+    assert min(s.bbox[0] for s in edges["right"]) == pytest.approx(72.0, abs=1.0)
+    mids = [(s.bbox[0] + s.bbox[2]) / 2 for s in edges["center"]]
+    assert max(mids) - min(mids) < 1.0
+
+
 def test_real_quote_totals_block_right_aligned(real_quote_pdf):
     """The quote's totals labels ('Subtotal ex GST' / 'Shipping Cost…' /
     'Total inc GST') are right-aligned and must extract that way."""

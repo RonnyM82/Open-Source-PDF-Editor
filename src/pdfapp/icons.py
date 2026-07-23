@@ -79,6 +79,9 @@ _NAMES = {
     "strikethrough": "mdi6.format-strikethrough",
     "superscript": "mdi6.format-superscript",
     "subscript": "mdi6.format-subscript",
+    "align_left": "mdi6.format-align-left",
+    "align_center": "mdi6.format-align-center",
+    "align_right": "mdi6.format-align-right",
     # Tools
     "extract_text": "mdi6.text-box-search-outline",
     # Search (SR2)

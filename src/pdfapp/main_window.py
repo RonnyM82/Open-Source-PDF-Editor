@@ -58,6 +58,7 @@ from pdfapp.settings import Settings
 from pdfcore import pages
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
+    ALIGNMENTS,
     FLAG_BOLD,
     FLAG_ITALIC,
     SCRIPT_NORMAL,
@@ -581,6 +582,9 @@ class MainWindow(QMainWindow):
         """(Re-)bake themed icons for every action — build time + theme change."""
         for action, key in self._icon_keys.items():
             action.setIcon(icons.icon(key))
+        # The alignment button borrows the active option's freshly-baked icon
+        # (it is a QToolButton, so it isn't in the action map itself).
+        self._update_align_button()
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
@@ -704,6 +708,33 @@ class MainWindow(QMainWindow):
         bar.addAction(self._super_action)
         bar.addAction(self._sub_action)
 
+        # Justification (user request): ONE button showing the ACTIVE option;
+        # its dropdown carrot offers the others. The pick is STICKY — persisted
+        # like the highlighter colour, so the button starts on the last-used
+        # option at the next launch and every insert uses it until changed.
+        self._text_align = self._startup_text_align()
+        self._align_actions: dict[str, QAction] = {}
+        align_menu = QMenu(self)
+        align_group = QActionGroup(self)
+        align_group.setExclusive(True)
+        for key, label in (("left", "Align left"), ("center", "Centre"), ("right", "Align right")):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(key == self._text_align)
+            action.setToolTip(f"{label} (paragraphs and inserted text)")
+            action.triggered.connect(lambda _checked=False, k=key: self._pick_text_align(k))
+            align_group.addAction(action)
+            align_menu.addAction(action)
+            self._align_actions[key] = action
+            self._icon_keys[action] = f"align_{key}"
+        self._align_button = QToolButton(self)
+        self._align_button.setMenu(align_menu)
+        # MenuButtonPopup: the body re-applies the active alignment (useful
+        # with an editor open), the carrot opens the list.
+        self._align_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self._align_button.clicked.connect(lambda: self._pick_text_align(self._text_align))
+        bar.addWidget(self._align_button)
+
         self._text_color = QColor(0, 0, 0)
         self._color_button = QToolButton(self)
         self._color_button.setToolTip("Text colour")
@@ -736,7 +767,7 @@ class MainWindow(QMainWindow):
             self._super_action,
             self._sub_action,
         )
-        for widget in (self._font_combo, self._color_button):
+        for widget in (self._font_combo, self._color_button, self._align_button):
             widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # The size spin ACCEPTS focus (click into it and type a size) — the
         # open editor stays open (overlays never cancel on focus-out), and
@@ -871,6 +902,48 @@ class MainWindow(QMainWindow):
         else:
             swatch.fill(self._text_color)
         self._color_button.setIcon(swatch)
+
+    # --- text justification -----------------------------------------------
+    def _startup_text_align(self) -> str:
+        """The persisted last-used justification (a hand-edited/sanitized
+        value falls back to the do-no-harm left)."""
+        value = self._settings.get("last_text_align", "left")
+        return value if value in ALIGNMENTS else "left"
+
+    def current_text_align(self) -> str:
+        """The toolbar's justification — what a commit applies (align_provider)."""
+        return self._text_align
+
+    def _pick_text_align(self, align: str) -> None:
+        """A deliberate user pick: reflect it, persist it as the last-used
+        option, and apply it to an open paragraph editor so the change shows
+        immediately (the commit reads the same value)."""
+        if align not in ALIGNMENTS or self._populating_style:
+            return
+        self._reflect_text_align(align)
+        self._settings.set("last_text_align", align)
+        if (view := self.active_view) is not None:
+            view.apply_alignment_to_editor(align)
+        self._maybe_capture_global_style()  # no editor -> a default change
+
+    def _reflect_text_align(self, align: str) -> None:
+        """Show ``align`` as the active option (state + button + checkmarks).
+        Display only — reflection from a clicked paragraph must not persist a
+        choice the user never made (the E11.3 independence rule)."""
+        if align not in ALIGNMENTS:
+            return
+        self._text_align = align
+        for key, action in self._align_actions.items():
+            action.setChecked(key == align)
+        self._update_align_button()
+
+    def _update_align_button(self) -> None:
+        """The button wears the ACTIVE option's icon and name."""
+        if not hasattr(self, "_align_button"):
+            return
+        action = self._align_actions[self._text_align]
+        self._align_button.setIcon(action.icon())
+        self._align_button.setToolTip(f"{action.text()} — click the arrow for other options")
 
     # --- highlighter colour (A4) ------------------------------------------
     def _startup_highlight_hex(self) -> str:
@@ -1035,6 +1108,7 @@ class MainWindow(QMainWindow):
             "size": float(self._size_spin.value()),
             "family": self._font_combo.currentFont().family(),
             "color": QColor(self._text_color),
+            "align": self._text_align,
         }
 
     def _maybe_capture_global_style(self) -> None:
@@ -1061,6 +1135,7 @@ class MainWindow(QMainWindow):
             self._font_combo.setCurrentFont(QFont(style["family"]))
             self._text_color = QColor(style["color"])
             self._update_color_swatch()
+            self._reflect_text_align(style["align"])
         finally:
             self._populating_style = False
 
@@ -1096,6 +1171,10 @@ class MainWindow(QMainWindow):
             self._strike_action.setChecked(bool(getattr(info, "strike", False)))
             self._super_action.setChecked(False)
             self._sub_action.setChecked(False)
+            # A Paragraph carries a DETECTED justification; a single span has
+            # none (nothing to justify against) — leave the button alone then,
+            # so the user's last-used option stays visible.
+            self._reflect_text_align(getattr(info, "align", self._text_align))
         finally:
             self._populating_style = False
         self._style_family_override = family
@@ -1240,6 +1319,7 @@ class MainWindow(QMainWindow):
         view.selectionFormatChanged.connect(self._on_selection_format_changed)
         view.editorClosed.connect(self._on_editor_closed)
         view.style_provider = self.current_text_style
+        view.align_provider = self.current_text_align
         self._undo_group.addStack(view.undo_stack)
         index = self._tabs.addTab(view, view.title)
         if view.path is not None:

@@ -69,6 +69,13 @@ _CACHE_BYTES = 256 * 1024 * 1024
 # Default size for newly inserted text (helv, black). 9pt on every launch —
 # the quotes' body size (user decision; the toolbar spin starts there too).
 _INSERT_TEXT_SIZE = 9.0
+# Engine justification -> the editor overlay's Qt alignment (the ONE mapping;
+# both the open-with-detected-alignment path and the toolbar picker use it).
+_QT_ALIGNMENT = {
+    "left": Qt.AlignmentFlag.AlignLeft,
+    "center": Qt.AlignmentFlag.AlignHCenter,
+    "right": Qt.AlignmentFlag.AlignRight,
+}
 
 
 def _save_failure_text(path, exc: Exception) -> str:
@@ -233,12 +240,18 @@ class DocumentView(QWidget):
         # Set by MainWindow: () -> (TextStyle, QFont preview). None = match
         # the original style (headless/tests without a style toolbar).
         self.style_provider = None
+        # Set by MainWindow: () -> "left" | "center" | "right" (the alignment
+        # toolbar button). None = the engine default / detected justification.
+        self.align_provider = None
         # State captured when an editor opens: the toolbar style (fallback
         # no-op detection), the rich-content signature (rich no-op detection)
         # and the zoom (pixel-size -> pt conversion at commit).
         self._edit_open_style = None
         self._edit_open_sig: tuple = ()
         self._edit_open_zoom: float = 1.0
+        # The justification the editor opened with — a change to it is a real
+        # edit (otherwise a re-justify with untouched text reads as a no-op).
+        self._edit_open_align: str | None = None
         # (family, bold, italic) -> (code, fontfile, resolved); shared default.
         self.format_resolver = font_choice
 
@@ -1110,8 +1123,13 @@ class DocumentView(QWidget):
         bottom_right = self._canvas.mapFromScene(QPointF(scene_rect[2], scene_rect[3]))
         rect = QRect(top_left, bottom_right).normalized().adjusted(-2, -2, 2, 8)
         self._pending_paragraph = (page_index, para)
+        # Emitted BEFORE the align capture: the toolbar reflects the
+        # paragraph's own justification, and that reflected value is what the
+        # commit compares against (so opening a right-aligned block and
+        # committing unchanged text does NOT re-justify it).
         self.styleContextChanged.emit(para)
         self._edit_open_style = self._current_style()
+        self._edit_open_align = self._current_align()
         self._edit_open_zoom = self._canvas.zoom
         # Rich prefill from the paragraph's own spans: existing bold words,
         # colours etc. survive an edit untouched instead of flattening.
@@ -1129,10 +1147,9 @@ class DocumentView(QWidget):
         # blocks then look in the editor like they do on the page, instead of
         # at QTextEdit's looser natural spacing.
         line_height = para.pitch * font.pixelSize() / para.size if para.size > 0 else None
-        alignment = {
-            "right": Qt.AlignmentFlag.AlignRight,
-            "center": Qt.AlignmentFlag.AlignHCenter,
-        }.get(para.align)
+        # The editor opens justified the way the paragraph IS; a toolbar pick
+        # re-justifies it live (apply_alignment_to_editor).
+        alignment = _QT_ALIGNMENT.get(para.align)
         self._para_editor.open_pieces(
             rect,
             pieces,
@@ -1454,6 +1471,11 @@ class DocumentView(QWidget):
         color = style.color if self.style_provider is not None else 0
         fmt.setForeground(QColor((color >> 16) & 255, (color >> 8) & 255, color & 255))
         self._para_editor.merge_selection_format(fmt)
+        # New text is justified the way the toolbar says — visible while it is
+        # typed, and the same value the commit passes to the engine.
+        self._edit_open_align = self._current_align()
+        if self._edit_open_align is not None:
+            self.apply_alignment_to_editor(self._edit_open_align)
         self.editWarning.emit("Type the new text — Ctrl+Enter inserts, Esc cancels.")
 
     def _on_paragraph_committed(self, text: str) -> None:
@@ -1493,16 +1515,17 @@ class DocumentView(QWidget):
             if not text.strip():
                 return
             pieces = self._para_editor.committed_pieces_for(text)
+            align = self._current_align() or "left"
             if pieces is not None:  # rich path: styles typed/applied in the editor
                 runs, _resolved = self._runs_from_pieces(pieces)
 
                 def do_insert(doc: PdfDocument) -> None:
-                    doc.insert_runs(page_index, point, runs)
+                    doc.insert_runs(page_index, point, runs, align=align)
             else:  # direct-call fallback: uniform toolbar style
                 style = self._current_style()
 
                 def do_insert(doc: PdfDocument) -> None:
-                    doc.insert_text(page_index, point, text, style=style)
+                    doc.insert_text(page_index, point, text, style=style, align=align)
 
             def insert_op(doc: PdfDocument) -> None:
                 # Register the new box INSIDE the op: the command's snapshot
@@ -1534,23 +1557,41 @@ class DocumentView(QWidget):
             width_pts = max(30.0, (self._para_editor.user_sized_width - 8) / self._canvas.zoom)
 
         pieces = self._para_editor.committed_pieces_for(text)
+        # None (no alignment toolbar) keeps the paragraph's detected
+        # justification; a change since the editor opened is a real edit.
+        align = self._current_align()
+        same_align = align == self._edit_open_align
         results: list = []
         resolved = True
         if pieces is not None:  # rich path — per-word styles preserved/applied
             runs, resolved = self._runs_from_pieces(pieces)
             signature = tuple((run.text, run.style) for run in runs)
-            if text == para.text and width_pts is None and signature == self._edit_open_sig:
-                return  # nothing changed — text, width and styling all identical
+            if (
+                text == para.text
+                and width_pts is None
+                and signature == self._edit_open_sig
+                and same_align
+            ):
+                return  # nothing changed — text, width, styling and alignment
 
             def do_edit(doc: PdfDocument):
-                return doc.replace_paragraph_runs(page_index, para, runs, width=width_pts)
+                return doc.replace_paragraph_runs(
+                    page_index, para, runs, width=width_pts, align=align
+                )
         else:  # direct-call fallback: one uniform style for the whole block
             style = self._current_style()
-            if text == para.text and width_pts is None and style == self._edit_open_style:
+            if (
+                text == para.text
+                and width_pts is None
+                and style == self._edit_open_style
+                and same_align
+            ):
                 return
 
             def do_edit(doc: PdfDocument):
-                return doc.replace_paragraph(page_index, para, text, style=style, width=width_pts)
+                return doc.replace_paragraph(
+                    page_index, para, text, style=style, width=width_pts, align=align
+                )
 
         def op(doc: PdfDocument) -> None:
             box = self._box_for(doc, page_index, para.bbox)
@@ -2417,12 +2458,30 @@ class DocumentView(QWidget):
         editor.merge_selection_format(fmt)
         return True
 
+    def apply_alignment_to_editor(self, align: str) -> bool:
+        """Justify the open PARAGRAPH editor (what the commit will apply).
+
+        Alignment is a paragraph property: the single-line span editor has
+        nothing to justify and its commit path ignores it, so it is left
+        alone rather than shown a change that wouldn't land on the page.
+        False = no paragraph editor open (the pick only affects the next one).
+        """
+        if not self._para_editor.is_editing:
+            return False
+        self._para_editor.set_alignment(_QT_ALIGNMENT.get(align, Qt.AlignmentFlag.AlignLeft))
+        return True
+
     def _current_style(self):
         """The style toolbar's TextStyle, or None (match the original)."""
         if self.style_provider is None:
             return None
         style, _preview = self.style_provider()
         return style
+
+    def _current_align(self) -> str | None:
+        """The alignment toolbar's justification, or None (headless/tests
+        without the toolbar — the engine then keeps what it detected)."""
+        return self.align_provider() if self.align_provider is not None else None
 
     def _on_edit_cancelled(self) -> None:
         self._pending_edit = None

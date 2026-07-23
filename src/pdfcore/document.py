@@ -133,9 +133,13 @@ class PdfDocument:
         text: str,
         *,
         style: TextStyle | None = None,
+        align: str = "left",
     ) -> None:
-        """Insert NEW text at a baseline point on page ``n`` (additive)."""
-        textedit.insert_new_text(self._doc, n, point, text, style=style)
+        """Insert NEW text at a baseline point on page ``n`` (additive).
+
+        ``align`` justifies multi-line text against its widest line.
+        """
+        textedit.insert_new_text(self._doc, n, point, text, style=style, align=align)
 
     def paragraph_at(
         self,
@@ -167,16 +171,26 @@ class PdfDocument:
         offset: tuple[float, float] = (0.0, 0.0),
         style: TextStyle | None = None,
         width: float | None = None,
+        align: str | None = None,
     ) -> textedit.ParagraphReplaceResult:
         """Replace a whole paragraph, re-wrapped within its own box.
 
         ``offset`` translates the box (page points) — same text + offset MOVES
         the paragraph. ``style`` overrides the dominant style (style toolbar).
-        ``width`` overrides the wrap width (a resized editor). Raises
+        ``width`` overrides the wrap width (a resized editor). ``align``
+        overrides the detected justification (None keeps it). Raises
         ValueError (before any mutation) if the text will not fit.
         """
         return textedit.replace_paragraph_text(
-            self._doc, n, para, new_text, fill=fill, offset=offset, style=style, width=width
+            self._doc,
+            n,
+            para,
+            new_text,
+            fill=fill,
+            offset=offset,
+            style=style,
+            width=width,
+            align=align,
         )
 
     # --- page operations (mutate the open document) ---------------------
@@ -272,15 +286,26 @@ class PdfDocument:
         fill: tuple[float, float, float] | bool = False,
         offset: tuple[float, float] = (0.0, 0.0),
         width: float | None = None,
+        align: str | None = None,
     ) -> textedit.ParagraphReplaceResult:
-        """Replace ``para`` with RICH runs (per-word styles preserved, E9)."""
+        """Replace ``para`` with RICH runs (per-word styles preserved, E9).
+
+        ``align`` overrides the detected justification (None keeps it).
+        """
         return textedit.replace_paragraph_runs(
-            self._doc, n, para, runs, fill=fill, offset=offset, width=width
+            self._doc, n, para, runs, fill=fill, offset=offset, width=width, align=align
         )
 
-    def insert_runs(self, n: int, point: tuple[float, float], runs: list[StyledRun]) -> None:
+    def insert_runs(
+        self,
+        n: int,
+        point: tuple[float, float],
+        runs: list[StyledRun],
+        *,
+        align: str = "left",
+    ) -> None:
         """Insert NEW rich text at a baseline point on page ``n`` (E9)."""
-        textedit.insert_new_runs(self._doc, n, point, runs)
+        textedit.insert_new_runs(self._doc, n, point, runs, align=align)
 
     def highlight(
         self, n: int, span: TextSpan, color: tuple[float, float, float] | None = None
