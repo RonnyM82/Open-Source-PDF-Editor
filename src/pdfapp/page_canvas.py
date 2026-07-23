@@ -114,6 +114,12 @@ class PageCanvas(QGraphicsView):
     # owns the selection (page space); the canvas only draws the rects.
     textSelectMoved = Signal(float, float)
     textSelectFinished = Signal(float, float)
+    # Edit-mode box marquee (task 1). A plain press on EMPTY page area emits
+    # selectDragStarted; the view accepts it by calling begin_box_marquee(), and
+    # the canvas draws the rubber band and reports the release rectangle here.
+    # Direction (window vs crossing) and modifier (replace/add/remove) are the
+    # view's business — the canvas only reports press+release scene points.
+    boxMarqueeFinished = Signal(float, float, float, float)
     # Ctrl+C on the focused canvas — the view copies the read-only selection.
     copyRequested = Signal()
 
@@ -159,6 +165,7 @@ class PageCanvas(QGraphicsView):
         self._region_click_scene: QPointF | None = None
         self._region_press = None  # scene QPointF while a region drag is live
         self._text_select_press = None  # scene QPointF while a text drag is live (X4)
+        self._box_marquee_press = None  # scene QPointF while a box marquee is live (task 1)
         self._text_hover = False  # read-only I-beam cursor is showing (X4)
         self._suppress_dblclick = False  # armed press consumed -> eat the dblclick
         self._move_press = None  # scene QPointF while a Ctrl+drag is live
@@ -509,6 +516,22 @@ class PageCanvas(QGraphicsView):
         self._move_band.setGeometry(QRect(anchor, anchor))
         self._move_band.show()
 
+    def begin_box_marquee(self, sx: float, sy: float) -> None:
+        """Accept the pending plain press as an edit-mode box marquee (task 1).
+
+        The view calls this synchronously from its ``selectDragStarted``
+        handler when the press lands on EMPTY page area in edit mode. The
+        canvas draws a rubber-band rectangle while dragging and reports the
+        release corners via ``boxMarqueeFinished``; the view decides which
+        boxes fall in it (window vs crossing) and how the modifier folds them
+        into the multi-selection."""
+        self._box_marquee_press = QPointF(sx, sy)
+        if self._move_band is None:
+            self._move_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+        anchor = self.mapFromScene(self._box_marquee_press)
+        self._move_band.setGeometry(QRect(anchor, anchor))
+        self._move_band.show()
+
     def _axis_snapped(self, current: QPointF, press: QPointF | None = None) -> QPointF:
         """With Shift held, snap a move to its dominant axis (horizontal OR
         vertical), so a nudge keeps an existing column/row alignment.
@@ -768,11 +791,16 @@ class PageCanvas(QGraphicsView):
                 self._move_press = scene_pos
                 self._move_base_rect = None
                 self._text_select_press = None
+                self._box_marquee_press = None
                 self.selectDragStarted.emit(scene_pos.x(), scene_pos.y())
                 if self._move_base_rect is not None:  # edit: move/resize accepted
                     event.accept()
                     return
                 if self._text_select_press is not None:  # read-only: text selection
+                    self._move_press = None
+                    event.accept()
+                    return
+                if self._box_marquee_press is not None:  # edit: box marquee (task 1)
                     self._move_press = None
                     event.accept()
                     return
@@ -817,6 +845,16 @@ class PageCanvas(QGraphicsView):
                 bottom_right = self.mapFromScene(current)
                 self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
             self.textSelectMoved.emit(current.x(), current.y())
+            event.accept()
+            return
+        if self._box_marquee_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            # Edit-mode box marquee (task 1): grow the band. Selection is
+            # resolved on release (window vs crossing by drag direction).
+            current = self.mapToScene(event.position().toPoint())
+            if self._move_band is not None:
+                top_left = self.mapFromScene(self._box_marquee_press)
+                bottom_right = self.mapFromScene(current)
+                self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
             event.accept()
             return
         if not event.buttons():
@@ -883,6 +921,15 @@ class PageCanvas(QGraphicsView):
             self.textSelectFinished.emit(current.x(), current.y())
             event.accept()
             return
+        if self._box_marquee_press is not None and event.button() == Qt.MouseButton.LeftButton:
+            press = self._box_marquee_press
+            self._box_marquee_press = None
+            if self._move_band is not None:
+                self._move_band.hide()
+            current = self.mapToScene(event.position().toPoint())
+            self.boxMarqueeFinished.emit(press.x(), press.y(), current.x(), current.y())
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event) -> None:
@@ -899,6 +946,7 @@ class PageCanvas(QGraphicsView):
         # single clicks and drags keep their scroll/select behaviour).
         # Ctrl+double-click edits the whole paragraph instead of one span.
         self._text_select_press = None  # a dblclick's release must not clear it (X4)
+        self._box_marquee_press = None  # ditto for a box marquee (task 1)
         if self._move_band is not None:
             self._move_band.hide()  # drop any marquee band from the first press
         if self._region_armed and event.button() == Qt.MouseButton.LeftButton:

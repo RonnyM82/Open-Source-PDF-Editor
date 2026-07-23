@@ -35,6 +35,8 @@ from pdfapp.page_geometry import (
     corner_hit,
     hover_target,
     nearest_span_in_paragraph,
+    rect_encloses,
+    rect_intersects,
 )
 from pdfapp.qt_image import rendered_page_to_qpixmap
 from pdfapp.render_cache import RenderCache
@@ -181,6 +183,7 @@ class DocumentView(QWidget):
         self._canvas.selectDragStarted.connect(self._on_select_drag_started)
         self._canvas.textSelectMoved.connect(self._on_text_select_moved)
         self._canvas.textSelectFinished.connect(self._on_text_select_finished)
+        self._canvas.boxMarqueeFinished.connect(self._on_box_marquee_finished)
         self._canvas.copyRequested.connect(self.copy_selection)
         self._canvas.escapePressed.connect(self._on_escape)
         self._canvas.deleteSelectionRequested.connect(self._on_delete_selection)
@@ -1750,7 +1753,12 @@ class DocumentView(QWidget):
             self._begin_text_selection(sx, sy)  # Markup: marquee text selection (X4)
             return
         if target is None:
-            self._clear_selection()
+            # Edit mode, empty page: start a BOX marquee (task 1). Selection is
+            # resolved on release — the modifier (replace/add/remove) is read
+            # then, so we must NOT clear here (a Shift/Ctrl marquee extends the
+            # current selection). A plain click that never drags clears via the
+            # finish handler's click branch.
+            self._canvas.begin_box_marquee(sx, sy)
             return
         modifiers = QApplication.keyboardModifiers()  # read LIVE (U-series rule)
         if (
@@ -1819,12 +1827,78 @@ class DocumentView(QWidget):
         if not self._edit_mode:
             return
         for i, (page, member) in enumerate(self._multi_paragraphs):
-            if page == n and member.bbox == para.bbox and member.text == para.text:
+            if page == n and self._same_box(member, para):
                 self._multi_paragraphs.pop(i)
                 break
         else:
             self._multi_paragraphs.append((n, para))
         self._selection = None  # multi replaces the single selection
+        self._push_selection_chrome()
+
+    @staticmethod
+    def _same_box(a: Paragraph, b: Paragraph) -> bool:
+        """Identity match for multi-selection membership (E10.7). The ONE rule,
+        shared by click-toggle and the marquee add/remove (task 1)."""
+        return a.bbox == b.bbox and a.text == b.text
+
+    def _on_box_marquee_finished(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
+        """Resolve an edit-mode box marquee (task 1).
+
+        Direction picks the mode (CAD convention): a LEFT→RIGHT drag selects
+        boxes fully ENCLOSED (window); RIGHT→LEFT selects any box the rectangle
+        TOUCHES (crossing) — decided in screen/scene x before the page convert.
+        The live modifier folds the marquee set into the multi-selection:
+        plain replaces, Shift adds (union), Ctrl removes (subtract). A drag too
+        small to be deliberate is a click: plain clears, modified is a no-op.
+        """
+        if not self._edit_mode:
+            return
+        n = self._current_page
+        crossing = sx1 < sx0  # release left of press -> crossing window (screen x)
+        px0, py0 = self._scene_point_to_page(sx0, sy0, n)
+        px1, py1 = self._scene_point_to_page(sx1, sy1, n)
+        rect = (min(px0, px1), min(py0, py1), max(px0, px1), max(py0, py1))
+
+        modifiers = QApplication.keyboardModifiers()  # read LIVE (U-series rule)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+        if (rect[2] - rect[0]) < 2.0 and (rect[3] - rect[1]) < 2.0:
+            # A click, not a drag: plain clears (parity with X4); a modified
+            # click keeps the current selection (CAD convention).
+            if not shift and not ctrl:
+                self._clear_selection()
+            return
+
+        hit = tuple(
+            para
+            for para in self.page_geometry(n).paragraphs
+            if not any(s.rotation != 0 for s in para.spans)
+            and (rect_intersects(rect, para.bbox) if crossing else rect_encloses(rect, para.bbox))
+        )
+
+        current = [(pn, pp) for pn, pp in self._multi_paragraphs if pn == n]
+        # Fold a single text selection into the group so a modified marquee
+        # extends whatever is currently shown as selected.
+        if (shift or ctrl) and self._selection is not None and self._selection[0] == "text":
+            _k, sn, sp = self._selection
+            if sn == n and not any(self._same_box(sp, pp) for _pn, pp in current):
+                current.append((n, sp))
+
+        if ctrl:  # remove the marquee set from the selection
+            members = [
+                (pn, pp) for pn, pp in current if not any(self._same_box(pp, h) for h in hit)
+            ]
+        elif shift:  # add (union), preserving order
+            members = list(current)
+            for para in hit:
+                if not any(self._same_box(pp, para) for _pn, pp in members):
+                    members.append((n, para))
+        else:  # replace
+            members = [(n, para) for para in hit]
+
+        self._multi_paragraphs = members
+        self._selection = None
         self._push_selection_chrome()
 
     def _clear_selection(self) -> None:

@@ -60,7 +60,11 @@ def test_click_selects_text_then_empty_click_deselects(qapp, quote_pdf):
         assert view._selection[0] == "text"
         assert view._canvas._selection_rect is not None
 
-        view._on_select_drag_started(*_scene_point(view, 10.0, 10.0))  # empty page
+        # A click on empty page now starts a box marquee (task 1); the clear
+        # lands on release when the "drag" turns out to be a click (< 2 pt).
+        empty = _scene_point(view, 10.0, 10.0)
+        view._on_select_drag_started(*empty)  # press: starts the marquee
+        view._on_box_marquee_finished(*empty, *empty)  # release at same point = click
         assert view._selection is None
         assert view._canvas._selection_rect is None
     finally:

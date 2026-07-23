@@ -38,6 +38,11 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Ctrl+drag", "Moves the paragraph directly, no selection needed"),
             ("Hold Shift while moving", "Snaps the move to one axis (keeps a row/column aligned)"),
             ("Ctrl+click / Shift+click", "Adds the box to a multi-selection (click again removes)"),
+            (
+                "Drag a box (empty area)",
+                "Marquee-select boxes — left→right encloses, right→left crosses; "
+                "Shift adds, Ctrl removes",
+            ),
             ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
             ("Right-click (multi-selected)", "Merge the selected text boxes into one"),
             (

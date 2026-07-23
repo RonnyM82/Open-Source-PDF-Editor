@@ -104,6 +104,25 @@ def _area(bbox: tuple[float, float, float, float]) -> float:
     return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
 
 
+def rect_encloses(
+    outer: tuple[float, float, float, float], inner: tuple[float, float, float, float]
+) -> bool:
+    """True when ``inner`` sits entirely within ``outer`` (window marquee)."""
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
+
+
+def rect_intersects(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> bool:
+    """True when the two axis-aligned rects overlap at all (crossing marquee)."""
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+
+
 def hover_target(
     geometry: PageGeometry, px: float, py: float, pad: float = 1.0
 ) -> HoverTarget | None:
