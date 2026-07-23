@@ -43,6 +43,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Right-click",
                 "Edit text · Edit paragraph · Highlight · Duplicate text box · Delete text box",
             ),
+            ("Duplicate text box", "Drops a selected copy alongside — drag it into place"),
         ],
     ),
     (

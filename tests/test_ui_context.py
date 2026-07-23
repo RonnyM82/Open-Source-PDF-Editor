@@ -136,9 +136,9 @@ def _para_for(view, text):
     )
 
 
-def test_duplicate_text_box_copies_it_below_the_original(qapp, quote_pdf):
-    """User request (2026-07-23): right-click → Duplicate text box. ADDITIVE —
-    the original survives untouched and the copy lands below it."""
+def test_duplicate_text_box_offsets_the_copy_in_both_axes(qapp, quote_pdf):
+    """User request (2026-07-23): right-click → Duplicate text box, the copy
+    offset in X AND Y. ADDITIVE — the original survives untouched."""
     window = MainWindow()
     try:
         window.open_path(quote_pdf.path)
@@ -153,13 +153,70 @@ def test_duplicate_text_box_copies_it_below_the_original(qapp, quote_pdf):
         original = min(copies, key=lambda s: s.origin[1])
         copy = max(copies, key=lambda s: s.origin[1])
         assert original.origin == pytest.approx(para.first_origin, abs=0.5)  # untouched
-        assert copy.origin[1] > original.bbox[3]  # clear of the original
-        assert copy.origin[0] == pytest.approx(para.bbox[0], abs=0.5)  # same left edge
+        nudge, drop = view._duplicate_offset(para)
+        assert copy.origin[0] - original.origin[0] == pytest.approx(nudge, abs=0.5)  # X
+        assert copy.origin[1] - original.origin[1] == pytest.approx(drop, abs=0.5)  # Y
+        assert copy.bbox[1] > original.bbox[3]  # clear of the original's box
         assert view.undo_stack.count() == 1
 
         view.undo_stack.undo()
         remaining = [s for s in view.document.text_spans(0) if s.text.strip() == quote_pdf.price]
         assert len(remaining) == 1
+    finally:
+        window.close()
+
+
+def test_duplicate_text_box_comes_out_selected(qapp, quote_pdf):
+    """User request: the copy is pre-selected, so it can be dragged straight
+    away (a press on the SELECTED box accepts the move drag — U6)."""
+    window = MainWindow()
+    try:
+        window.open_path(quote_pdf.path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = _para_for(view, quote_pdf.price)
+        view._duplicate_paragraph_at(0, para)
+
+        assert view._selection is not None
+        kind, page, payload = view._selection
+        assert (kind, page) == ("text", 0)
+        assert payload.text.strip() == quote_pdf.price
+        # It is the COPY that is selected, not the original.
+        assert payload.first_origin[1] > para.first_origin[1]
+        assert payload.first_origin[0] > para.first_origin[0]
+    finally:
+        window.close()
+
+
+def test_duplicate_copy_never_merges_with_its_source(qapp, tmp_path):
+    """Box ownership is centre-in-rect, so a copy whose box OVERLAPS its
+    source claims the source's lower lines (probe: an 8 pt drop on a 3-line
+    block partitioned into one mangled 5-line paragraph). The offset must
+    clear the original's box — this is the invariant that guards it."""
+    import pymupdf
+
+    path = tmp_path / "block.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for i, line in enumerate(("first line of the block", "second line here", "third line ends")):
+        page.insert_text((72, 300 + i * 9), line, fontsize=8)
+    doc.save(str(path))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        para = view.document.paragraph_at(0, 100, 305)
+        assert para is not None and len(para.lines) == 3
+
+        view._duplicate_paragraph_at(0, para)
+        paragraphs = view.page_geometry(0).paragraphs
+        assert len(paragraphs) == 2
+        for candidate in paragraphs:  # each is the WHOLE block, and only it
+            assert len(candidate.lines) == 3
+            assert candidate.text == para.text
     finally:
         window.close()
 

@@ -69,6 +69,9 @@ _CACHE_BYTES = 256 * 1024 * 1024
 # Default size for newly inserted text (helv, black). 9pt on every launch —
 # the quotes' body size (user decision; the toolbar spin starts there too).
 _INSERT_TEXT_SIZE = 9.0
+# Minimum cascade nudge (pt) for a duplicated text box; it scales up with the
+# paragraph's pitch so a big heading's copy is offset proportionally.
+_DUPLICATE_NUDGE_PTS = 8.0
 # Engine justification -> the editor overlay's Qt alignment (the ONE mapping;
 # both the open-with-detected-alignment path and the toolbar picker use it).
 _QT_ALIGNMENT = {
@@ -2364,6 +2367,23 @@ class DocumentView(QWidget):
         if path is not None:
             self._place_image(page_index, px, py, path)
 
+    def _duplicate_offset(self, para) -> tuple[float, float]:
+        """Where a copy of ``para`` goes, relative to the original (page pts).
+
+        A cascade nudge right, and DOWN far enough to clear the original's own
+        box. The vertical clearance is NOT cosmetic: box ownership is
+        centre-in-rect (``_line_region``), so a copy whose registered box
+        overlaps its source claims the source's lower lines too — probe:
+        an 8 pt drop on a 3-line block partitioned into one mangled 5-line
+        paragraph plus a stray. Two boxes that overlap are geometrically
+        indistinguishable to the paragraph model, so clearing the box is what
+        keeps the copy an independent, separately editable object. For the
+        common single-line box that clearance IS a slight nudge (~1 line).
+        """
+        nudge = max(_DUPLICATE_NUDGE_PTS, 0.75 * para.pitch)
+        height = max(para.bbox[3] - para.bbox[1], para.pitch)
+        return nudge, height + 0.4 * para.pitch
+
     def _duplicate_paragraph_at(self, page_index: int, para) -> None:
         """Context menu: drop an independent COPY of a text box (user request).
 
@@ -2371,12 +2391,10 @@ class DocumentView(QWidget):
         is never redacted and no bystander text is touched. The copy carries
         the original's runs (per-word styles and underline/strike rules
         survive, same conversion the move path uses), its own pitch and its
-        justification, so it looks identical, and it lands one box-height
-        BELOW the original — never on top of it, and flipped to ABOVE when
-        the page bottom is too close. It registers as its own box (E10): the
-        copy sits one line-pitch from its source, which is exactly the
-        arrangement MuPDF blocks into ONE paragraph, and the boundary is what
-        keeps them two separate, independently editable text boxes.
+        justification, so it looks identical; it is offset in BOTH axes (see
+        ``_duplicate_offset``), flipping left/up when the page edge is too
+        close. It registers as its own box (E10) — content and registry in ONE
+        command — and comes out SELECTED, ready to drag (user request).
         """
         if not self._edit_mode or para is None:
             return
@@ -2385,16 +2403,17 @@ class DocumentView(QWidget):
         page_w, page_h = self._doc.page_size(page_index)
         if self._doc.page_rotation(page_index) % 180 == 90:
             page_w, page_h = page_h, page_w  # the engine speaks unrotated space
-        x0, y0, _x1, y1 = para.bbox
+        x0, _y0, x1, y1 = para.bbox
         first_y = para.first_origin[1]
-        gap = max(y1 - y0, para.pitch) + 0.4 * para.pitch
-        # Below unless the copy's last baseline would run off the page.
-        last_baseline_drop = y1 - first_y
-        dy = gap if first_y + gap + last_baseline_drop <= page_h else -gap
-        point = (max(0.0, min(x0, page_w - 1.0)), first_y + dy)
+        nudge, drop = self._duplicate_offset(para)
+        dx = nudge if x1 + nudge <= page_w else -nudge
+        # Below unless the copy's last baseline would run off the page bottom.
+        dy = drop if first_y + drop + (y1 - first_y) <= page_h else -drop
+        point = (max(0.0, min(x0 + dx, page_w - 1.0)), first_y + dy)
         if not (0 < point[1] <= page_h):
             self.editWarning.emit("There is no room on the page for a copy of this text box.")
             return
+        created: list[tuple[float, float, float, float]] = []
 
         def op(doc: PdfDocument) -> None:
             # Register INSIDE the op so the snapshot carries content +
@@ -2403,18 +2422,35 @@ class DocumentView(QWidget):
             doc.insert_runs(page_index, point, runs, align=para.align, pitch=para.pitch)
             new = [s for s in doc.text_spans(page_index) if (s.text, s.bbox) not in before]
             if new:
-                doc.add_box(
-                    page_index,
-                    (
-                        min(s.bbox[0] for s in new),
-                        min(s.bbox[1] for s in new),
-                        max(s.bbox[2] for s in new),
-                        max(s.bbox[3] for s in new),
-                    ),
+                rect = (
+                    min(s.bbox[0] for s in new),
+                    min(s.bbox[1] for s in new),
+                    max(s.bbox[2] for s in new),
+                    max(s.bbox[3] for s in new),
                 )
+                doc.add_box(page_index, rect)
+                created.append(rect)
 
-        if self._push_command("Duplicate text box", op, ("page", page_index)):
-            self.editWarning.emit("Copy placed below — Ctrl+drag it where you want it.")
+        if not self._push_command("Duplicate text box", op, ("page", page_index)):
+            return
+        # after_command has just cleared the selection (the pre-op objects may
+        # be gone) — so select the COPY afterwards, never before.
+        copy = self._paragraph_in_box(page_index, created[0]) if created else None
+        if copy is not None:
+            self._selection = ("text", page_index, copy)
+            self._push_selection_chrome()
+            self.editWarning.emit("Copy selected — drag it where you want it.")
+
+    def _paragraph_in_box(self, page_index: int, rect: tuple[float, float, float, float]):
+        """The paragraph owned by a registered box rect — ``_box_for``'s
+        centre-in-rect ownership run the other way (box → paragraph)."""
+        x0, y0, x1, y1 = rect
+        for candidate in self.page_geometry(page_index).paragraphs:
+            cx = (candidate.bbox[0] + candidate.bbox[2]) / 2
+            cy = (candidate.bbox[1] + candidate.bbox[3]) / 2
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                return candidate
+        return None
 
     def _delete_paragraph_at(self, page_index: int, para) -> None:
         """Context menu: delete a whole text block in one step — the same
