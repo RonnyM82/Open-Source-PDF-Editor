@@ -16,10 +16,12 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QIcon,
     QKeySequence,
     QPainter,
     QPen,
@@ -46,7 +48,7 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
-from pdfapp import diagnostics, icons, portable, theme
+from pdfapp import diagnostics, highlight_colors, icons, portable, theme
 from pdfapp.document_view import DocumentView
 from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
@@ -143,6 +145,8 @@ class MainWindow(QMainWindow):
         self._thumbs_visible = self._settings.get("thumbnails_visible", True)
         self._last_hover_hint = ""
         self._print_options = PrintOptions()
+        # Current highlighter colour (persisted; restricted to the palette).
+        self._highlight_color = QColor(self._startup_highlight_hex())
         # Recent-files list (File → Open Recent), persisted across launches.
         self._recent_files = RecentFiles(portable.data_dir() / "recent_files.json")
         # One stack per document (owned by its DocumentView); the group routes
@@ -531,6 +535,7 @@ class MainWindow(QMainWindow):
         # transient menu wrappers; A4 adds the highlight-colour submenu here).
         self._annotate_menu = self.menuBar().addMenu("&Annotate")
         self._annotate_menu.addAction(self._highlight_action)
+        self._build_highlight_color_menu(self._annotate_menu)
         self._annotate_menu.addSeparator()
         self._annotate_menu.addAction(self._insert_comment_action)
         self._annotate_menu.addAction(self._insert_callout_action)
@@ -835,6 +840,66 @@ class MainWindow(QMainWindow):
             swatch.fill(self._text_color)
         self._color_button.setIcon(swatch)
 
+    # --- highlighter colour (A4) ------------------------------------------
+    def _startup_highlight_hex(self) -> str:
+        """The persisted highlighter colour, restricted to the palette (a
+        sanitized/hand-edited value falls back to the default yellow)."""
+        hexstr = self._settings.get("last_highlight_color", highlight_colors.DEFAULT_HIGHLIGHT)
+        if highlight_colors.is_palette_hex(hexstr):
+            return hexstr
+        return highlight_colors.DEFAULT_HIGHLIGHT
+
+    def _swatch_pixmap(self, color: QColor, size: int = 16) -> QPixmap:
+        """A rounded filled swatch — reused by the colour menu + toolbar button."""
+        pix = QPixmap(size, size)
+        pix.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(color)
+        painter.setPen(QPen(QColor(128, 128, 128)))
+        painter.drawRoundedRect(1, 1, size - 2, size - 2, 3, 3)
+        painter.end()
+        return pix
+
+    def _build_highlight_color_menu(self, parent) -> None:
+        """A 'Highlight colour' submenu of the restricted palette (exclusive
+        checkable actions). Reused as the toolbar swatch's dropdown (A5)."""
+        submenu = parent.addMenu("Highlight &colour")
+        self._highlight_color_menu = submenu
+        self._highlight_color_group = QActionGroup(self)
+        self._highlight_color_group.setExclusive(True)
+        self._highlight_color_actions: dict[str, QAction] = {}
+        current = self._highlight_color.name().upper()
+        for name, hexstr in highlight_colors.HIGHLIGHTER_COLORS:
+            action = submenu.addAction(QIcon(self._swatch_pixmap(QColor(hexstr))), name)
+            action.setCheckable(True)
+            action.setChecked(hexstr.upper() == current)
+            self._highlight_color_group.addAction(action)
+            action.triggered.connect(lambda _c=False, h=hexstr: self._pick_highlight_color(h))
+            self._highlight_color_actions[hexstr.upper()] = action
+
+    def _pick_highlight_color(self, hexstr: str) -> None:
+        """Set the highlighter colour: persist it, reflect it in the chrome, and
+        push it to every open view so subsequent highlights use it."""
+        self._highlight_color = QColor(hexstr)
+        self._settings.set("last_highlight_color", hexstr)
+        self._refresh_highlight_color_chrome()
+        rgb = self._highlight_color_rgb()
+        for view in self._views():
+            view.set_highlight_color(rgb)
+
+    def _refresh_highlight_color_chrome(self) -> None:
+        """Reflect the current highlighter colour in the menu checkmarks (A5
+        extends this to repaint the toolbar swatch)."""
+        current = self._highlight_color.name().upper()
+        for hexstr, action in self._highlight_color_actions.items():
+            action.setChecked(hexstr == current)
+
+    def _highlight_color_rgb(self) -> tuple[float, float, float]:
+        """The current highlighter colour as engine ``(r, g, b)`` 0-1 floats."""
+        c = self._highlight_color
+        return (c.redF(), c.greenF(), c.blueF())
+
     def _on_font_combo_changed(self, _font) -> None:
         if not self._populating_style:
             self._style_family_override = None  # deliberate user choice wins
@@ -1127,6 +1192,7 @@ class MainWindow(QMainWindow):
         # choice becomes the default every new document opens with).
         view.set_show_editable_areas(self._settings.get("show_editable_areas", True))
         view.set_dblclick_paragraph(self._settings.get("dblclick_paragraph", True))
+        view.set_highlight_color(self._highlight_color_rgb())  # current picker colour
         view.stateChanged.connect(lambda v=view: self._on_view_state_changed(v))
         view.editWarning.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         view.hoverHintChanged.connect(self._show_hover_hint)
