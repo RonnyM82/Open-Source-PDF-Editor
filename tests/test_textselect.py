@@ -12,6 +12,7 @@ import pymupdf
 
 from pdfcore.document import PdfDocument
 from pdfcore.textselect import (
+    line_region_at,
     page_lines,
     region_rects,
     region_text,
@@ -83,6 +84,19 @@ def test_word_at_hits_and_misses():
     lines = group_lines([a, b])
     assert word_at(lines, 30.0, 105.0) == (0, 0)
     assert word_at(lines, 120.0, 105.0) is None  # in the gap between them
+
+
+def test_line_region_at_selects_the_whole_line():
+    # Two words on one baseline, a third on another line below.
+    a, b = W("alpha", 10, 100), W("beta", 60, 100)
+    c = W("gamma", 10, 130)
+    lines = group_lines([a, b, c])
+    # A point over "alpha" selects the whole first line (alpha + beta).
+    assert region_text(line_region_at(lines, 30.0, 105.0)) == "alpha beta"
+    # A point over "gamma" selects only its line.
+    assert region_text(line_region_at(lines, 30.0, 135.0)) == "gamma"
+    # Off any word → None.
+    assert line_region_at(lines, 300.0, 300.0) is None
 
 
 # --- real documents ---------------------------------------------------------

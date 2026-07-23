@@ -151,6 +151,9 @@ class DocumentView(QWidget):
         # default yellow. Set by MainWindow from the Annotate toolbar swatch
         # (A4); all highlight paths (marquee, span, selection) read it.
         self._highlight_color: tuple[float, float, float] | None = None
+        # Undo index of a word highlight made by a highlight-tool click, so a
+        # following triple-click can replace it with the whole-line highlight.
+        self._word_click_index: int | None = None
 
         self._canvas = PageCanvas(self)
         self._canvas.renderNeeded.connect(self._on_render_needed)
@@ -1186,13 +1189,16 @@ class DocumentView(QWidget):
         self._canvas.arm_insert_point("Click what the arrowhead should point AT · Esc cancels")
 
     def begin_highlight(self) -> None:
-        """Arm a window selection: drag across the text to highlight it.
-        An ANNOTATION — available in Markup mode."""
+        """Arm the highlighter (STAYS on until Esc / a click off the page): drag
+        a window over text, double-click a word, or triple-click a line to
+        highlight it. An ANNOTATION — available in Markup mode."""
         if not self._canvas.has_page:
             return
         self._click_action = None
+        self._word_click_index = None
         self._canvas.arm_region_select(
-            "Drag across text — or double-click a word — to highlight · Esc cancels"
+            "Highlighter on: drag · double-click a word · triple-click a line · Esc to stop",
+            sticky=True,
         )
 
     @property
@@ -1224,17 +1230,25 @@ class DocumentView(QWidget):
         x0, x1 = sorted((ax, bx))
         y0, y1 = sorted((ay, by))
         spans = self._doc.text_spans(n)
-        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click / double-click: the word
+        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click / double / triple-click
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            word = textselect.word_region_at(self._page_text_lines(), cx, cy)
-            if word:  # a native word — highlight exactly it (its bbox IS the word,
-                self._highlight_word_rects(n, textselect.region_rects(word))  # no re-clip
+            lines = self._page_text_lines()
+            if self._canvas.region_click_count >= 3:  # triple-click: the whole line
+                line = textselect.line_region_at(lines, cx, cy)
+                if line is not None:
+                    self._replace_word_with_line(n, textselect.region_rects(line))
+                    return
+                # no native line under the point — fall through to word/span
+            word = textselect.word_region_at(lines, cx, cy)
+            if word:  # a native word — highlight exactly it (its bbox IS the word)
+                self._highlight_word_rects(n, textselect.region_rects(word))
                 return
             # no native word (outline / scanned text): fall back to the span
             span = page_coords.span_at(spans, cx, cy)
             if span is None:
                 self.editWarning.emit("No text there to highlight.")
                 return
+            self._word_click_index = None
             self._highlight_rect(n, span.bbox)
             return
         rect = (x0, y0, x1, y1)
@@ -1250,13 +1264,36 @@ class DocumentView(QWidget):
     ) -> None:
         """Highlight the given word rects DIRECTLY (one undo step) — the native
         word bbox is exactly the word, so no character re-clipping (which can
-        drop a tight bbox whose char centres fall on the border)."""
+        drop a tight bbox whose char centres fall on the border). Remembers the
+        undo position so a following triple-click can replace it with the line."""
         color = self._highlight_color
 
         def op(doc: PdfDocument) -> None:
             doc.highlight_rects(page_index, rects, color)
 
-        self._push_command("Highlight text", op, ("page", page_index))
+        if self._push_command("Highlight text", op, ("page", page_index)):
+            self._word_click_index = self._undo_stack.index()
+
+    def _replace_word_with_line(
+        self, page_index: int, rects: list[tuple[float, float, float, float]]
+    ) -> None:
+        """Triple-click: highlight the whole line, replacing the word mark the
+        first click of this sequence just made (undo it first when it is still
+        the top of the stack, so the line becomes one clean undo step)."""
+        if (
+            self._word_click_index is not None
+            and self._undo_stack.count() == self._word_click_index
+            and self._undo_stack.index() == self._word_click_index
+            and self._undo_stack.canUndo()
+        ):
+            self._undo_stack.undo()  # remove the intermediate word mark
+        self._word_click_index = None
+        color = self._highlight_color
+
+        def op(doc: PdfDocument) -> None:
+            doc.highlight_rects(page_index, rects, color)
+
+        self._push_command("Highlight line", op, ("page", page_index))
 
     def _highlight_rect(self, page_index: int, rect: tuple[float, float, float, float]) -> None:
         """Highlight all text inside ``rect`` as one undo step (region drag

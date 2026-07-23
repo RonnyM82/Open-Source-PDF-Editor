@@ -151,7 +151,12 @@ class PageCanvas(QGraphicsView):
         self._scroll_hold = False  # swallowing the stream after a page flip
 
         self._insert_armed = False  # one-shot click-to-place for new text
-        self._region_armed = False  # one-shot window selection (highlight)
+        self._region_armed = False  # window selection (highlight)
+        self._region_sticky = False  # highlight tool STAYS armed after each mark
+        # Consecutive-click counter for the highlight tool (1/2 = word, 3 = line).
+        self._region_click_count = 0
+        self._region_click_ms = float("-inf")
+        self._region_click_scene: QPointF | None = None
         self._region_press = None  # scene QPointF while a region drag is live
         self._text_select_press = None  # scene QPointF while a text drag is live (X4)
         self._text_hover = False  # read-only I-beam cursor is showing (X4)
@@ -386,6 +391,11 @@ class PageCanvas(QGraphicsView):
         return self._region_armed
 
     @property
+    def region_click_count(self) -> int:
+        """Consecutive-click count for the last highlight click (1/2 word, 3 line)."""
+        return self._region_click_count
+
+    @property
     def is_armed(self) -> bool:
         return self._insert_armed or self._region_armed
 
@@ -407,11 +417,17 @@ class PageCanvas(QGraphicsView):
             self._armed_chip.hide()
             self.armedChanged.emit()
 
-    def arm_region_select(self, chip_text: str = "") -> None:
-        """One-shot mode: press-drag-release selects a window on the page."""
+    def arm_region_select(self, chip_text: str = "", sticky: bool = False) -> None:
+        """Arm window selection: press-drag-release marks a window on the page,
+        a click/double-click marks the word, a triple-click the line. When
+        ``sticky`` the tool STAYS armed after each mark (highlighter pen) until
+        Esc / a click off the page / re-triggering the action."""
         self.clear_hover()  # armed modes own the cursor
         self._insert_armed = False  # modes are mutually exclusive
         self._region_armed = True
+        self._region_sticky = sticky
+        self._region_click_count = 0
+        self._region_click_scene = None
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         self._show_chip(chip_text)
         self.armedChanged.emit()
@@ -419,11 +435,31 @@ class PageCanvas(QGraphicsView):
     def disarm_region_select(self) -> None:
         was = self._region_armed
         self._region_armed = False
+        self._region_sticky = False
         self._region_press = None
+        self._region_click_count = 0
+        self._region_click_scene = None
         self.viewport().unsetCursor()
         if was:
             self._armed_chip.hide()
             self.armedChanged.emit()
+
+    def _bump_region_click(self, scene_pos: QPointF) -> None:
+        """Advance the highlight click counter: consecutive clicks near the same
+        spot within the double-click interval accumulate (1/2 = word, 3 = line);
+        a distant or late click restarts at 1."""
+        interval = QApplication.doubleClickInterval()
+        now = _now_ms()
+        near = self._region_click_scene is not None and (
+            abs(scene_pos.x() - self._region_click_scene.x()) < 6.0
+            and abs(scene_pos.y() - self._region_click_scene.y()) < 6.0
+        )
+        if near and (now - self._region_click_ms) <= interval:
+            self._region_click_count += 1
+        else:
+            self._region_click_count = 1
+        self._region_click_ms = now
+        self._region_click_scene = scene_pos
 
     # --- armed-mode chip (U4) ----------------------------------------------
     def _show_chip(self, text: str) -> None:
@@ -660,6 +696,7 @@ class PageCanvas(QGraphicsView):
         ):
             scene_pos = self.mapToScene(event.position().toPoint())
             if self._item.boundingRect().contains(scene_pos):
+                self._bump_region_click(scene_pos)  # 1st / 3rd click of a sequence
                 self._region_press = scene_pos
                 if self._move_band is None:
                     self._move_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
@@ -789,7 +826,9 @@ class PageCanvas(QGraphicsView):
     def mouseReleaseEvent(self, event) -> None:
         if self._region_press is not None and event.button() == Qt.MouseButton.LeftButton:
             press = self._region_press
-            self.disarm_region_select()
+            self._region_press = None
+            if not self._region_sticky:
+                self.disarm_region_select()  # one-shot: done after this mark
             if self._move_band is not None:
                 self._move_band.hide()
             current = self.mapToScene(event.position().toPoint())
@@ -838,6 +877,16 @@ class PageCanvas(QGraphicsView):
         self._text_select_press = None  # a dblclick's release must not clear it (X4)
         if self._move_band is not None:
             self._move_band.hide()  # drop any marquee band from the first press
+        if self._region_armed and event.button() == Qt.MouseButton.LeftButton:
+            # The 2nd click of a highlight double/triple sequence: count it (so a
+            # following press reaches count 3 = whole line) and consume it — the
+            # word was already marked on the first click's release.
+            self._region_click_count += 1
+            self._region_click_ms = _now_ms()
+            self._region_click_scene = self.mapToScene(event.position().toPoint())
+            self._suppress_dblclick = False
+            event.accept()
+            return
         if self._suppress_dblclick:
             self._suppress_dblclick = False
             event.accept()

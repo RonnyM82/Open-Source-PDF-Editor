@@ -173,6 +173,129 @@ def test_highlight_action_without_selection_arms_marquee(qapp, quote_pdf):
         window.close()
 
 
+def test_triple_click_highlights_line_replacing_word(qapp, tmp_path):
+    """A triple-click highlights the whole LINE, replacing the word the first
+    click marked — one clean undo step for the gesture."""
+    import pymupdf
+
+    src = tmp_path / "line.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 100), "alpha beta gamma", fontsize=12)
+    doc.save(str(src))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        view = _markup_view(window, src)
+        beta = next(w for ln in view.document.text_lines(0) for w in ln if w.text == "beta")
+        cx = (beta.bbox[0] + beta.bbox[2]) / 2
+        cy = (beta.bbox[1] + beta.bbox[3]) / 2
+        s = _sp(view, cx, cy)
+        window.highlight_text()  # arm the highlighter
+
+        # Click 1 → the word.
+        view._canvas._region_click_count = 1
+        view._canvas.regionSelected.emit(s[0], s[1], s[0], s[1])
+        assert view.undo_stack.count() == 1
+        page = view.document._doc[0]
+        word_xs = [p[0] for p in list(page.annots())[0].vertices]
+        word_w = max(word_xs) - min(word_xs)
+
+        # Triple-click at the same spot → the whole line, REPLACING the word.
+        view._canvas._region_click_count = 3
+        view._canvas.regionSelected.emit(s[0], s[1], s[0], s[1])
+        assert view.undo_stack.count() == 1  # replaced (not a 2nd annotation)
+        page = view.document._doc[0]
+        annots = list(page.annots())
+        assert len(annots) == 1
+        line_xs = [p[0] for p in annots[0].vertices]
+        assert (max(line_xs) - min(line_xs)) > word_w + 10  # spans the whole line
+
+        view.undo_stack.undo()  # one undo clears the whole triple gesture
+        assert len(list(view.document._doc[0].annots())) == 0
+    finally:
+        window.close()
+
+
+def test_highlighter_is_sticky(qapp, quote_pdf):
+    """The highlighter STAYS armed after each mark (until Esc / re-trigger)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        canvas = view._canvas
+        window.highlight_text()  # arm the sticky highlighter
+        assert canvas.region_armed
+
+        span = _span(view, quote_pdf.price)
+        s = _sp(view, (span.bbox[0] + span.bbox[2]) / 2, (span.bbox[1] + span.bbox[3]) / 2)
+        pos = QPointF(canvas.mapFromScene(QPointF(s[0], s[1])))
+        canvas.mousePressEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                pos,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        canvas.mouseReleaseEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonRelease,
+                pos,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert canvas.region_armed  # still armed after highlighting
+        assert view.armed_action == "highlight"
+
+        view.cancel_armed_mode()  # Esc / re-trigger turns it off
+        assert not canvas.region_armed
+    finally:
+        window.close()
+
+
+def test_region_click_counter_counts_a_triple(qapp, quote_pdf):
+    """Press + double-click + press near the same spot reaches count 3 (line)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    window = MainWindow()
+    try:
+        view = _markup_view(window, quote_pdf.path)
+        canvas = view._canvas
+        window.highlight_text()
+        span = _span(view, quote_pdf.price)
+        s = _sp(view, (span.bbox[0] + span.bbox[2]) / 2, (span.bbox[1] + span.bbox[3]) / 2)
+        pos = QPointF(canvas.mapFromScene(QPointF(s[0], s[1])))
+
+        def press(kind):
+            canvas_evt = QMouseEvent(
+                kind,
+                pos,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            if kind == QEvent.Type.MouseButtonPress:
+                canvas.mousePressEvent(canvas_evt)
+            else:
+                canvas.mouseDoubleClickEvent(canvas_evt)
+
+        press(QEvent.Type.MouseButtonPress)  # click 1
+        assert canvas.region_click_count == 1
+        press(QEvent.Type.MouseButtonDblClick)  # click 2
+        assert canvas.region_click_count == 2
+        press(QEvent.Type.MouseButtonPress)  # click 3
+        assert canvas.region_click_count == 3
+    finally:
+        window.close()
+
+
 def test_highlight_selection_applies_current_colour(qapp, quote_pdf):
     """The view's highlighter colour reaches the annotation end to end."""
     window = MainWindow()

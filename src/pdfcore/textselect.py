@@ -106,6 +106,16 @@ def word_region_at(lines: Lines, px: float, py: float, pad: float = 1.0) -> Regi
     return [[lines[pos[0]][pos[1]]]]
 
 
+def line_region_at(lines: Lines, px: float, py: float, pad: float = 1.0) -> Region | None:
+    """The whole reading-order line under a point AS a selection (triple-click),
+    or None if the point is not over any word. All the words of the line the
+    hit word belongs to."""
+    pos = word_at(lines, px, py, pad)
+    if pos is None:
+        return None
+    return [list(lines[pos[0]])]
+
+
 def region_text(region: Region) -> str:
     """The selected text: words space-joined, lines newline-joined (matching
     :func:`textsource.words_to_text` conventions)."""
