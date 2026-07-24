@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pdfcore.comments import CommentInfo
 from pdfcore.document import PdfDocument
 from pdfcore.imageedit import ImageInfo
+from pdfcore.links import LinkInfo
 from pdfcore.textedit import Paragraph, TextSpan
 
 
@@ -29,10 +30,11 @@ class PageGeometry:
     paragraphs: tuple[Paragraph, ...]
     images: tuple[ImageInfo, ...]
     comments: tuple[CommentInfo, ...] = ()
+    links: tuple[LinkInfo, ...] = ()
 
 
 def collect_geometry(doc: PdfDocument, n: int, boundaries: tuple = ()) -> PageGeometry:
-    """Extract page ``n``'s editable geometry (three engine passes).
+    """Extract page ``n``'s editable geometry.
 
     ``boundaries`` (registered insert boxes, each ``(rect, fingerprint)``)
     isolate inserted boxes so they are their own paragraphs, never merged with
@@ -43,6 +45,7 @@ def collect_geometry(doc: PdfDocument, n: int, boundaries: tuple = ()) -> PageGe
         paragraphs=tuple(doc.paragraphs(n, boundaries=boundaries)),
         images=tuple(doc.images(n)),
         comments=tuple(doc.comments(n)),
+        links=tuple(doc.links(n)),
     )
 
 
@@ -56,7 +59,7 @@ class HoverTarget:
     underlying Paragraph or ImageInfo (U6 selection stores it).
     """
 
-    kind: str  # "text" | "image" | "image_corner"
+    kind: str  # "text" | "image" | "image_corner" | "comment" | "link_move" | "link_corner"
     bbox: tuple[float, float, float, float]
     corner: tuple[float, float] | None = None
     corner_zone: float = 0.0
@@ -153,7 +156,7 @@ def hover_target(
         default=None,
     )
     if image is None:
-        return None
+        return _link_target(geometry, px, py)
     hit = corner_hit(image.bbox, px, py)
     if hit is not None:
         return HoverTarget(
@@ -164,6 +167,35 @@ def hover_target(
             payload=image,
         )
     return HoverTarget("image", image.bbox, corner_zone=corner_zone(image.bbox), payload=image)
+
+
+def _link_target(geometry: PageGeometry, px: float, py: float) -> HoverTarget | None:
+    """A link hotspot under the point — the LOWEST hover priority.
+
+    Because links usually sit over text (which wins above), a link is only the
+    hover target where nothing else covers it — so grabbing a link never steals
+    a text/image edit gesture. Links buried under text are edited via the
+    right-click menu instead, and follow the text when it moves (the engine's
+    link guard). A press near a corner RESIZES (``link_corner``); the body
+    MOVES (``link_move``).
+    """
+    link = min(
+        (lk for lk in geometry.links if _contains(lk.bbox, px, py)),
+        key=lambda lk: _area(lk.bbox),
+        default=None,
+    )
+    if link is None:
+        return None
+    hit = corner_hit(link.bbox, px, py)
+    if hit is not None:
+        return HoverTarget(
+            "link_corner",
+            link.bbox,
+            corner=hit[0],
+            corner_zone=corner_zone(link.bbox),
+            payload=link,
+        )
+    return HoverTarget("link_move", link.bbox, corner_zone=corner_zone(link.bbox), payload=link)
 
 
 def nearest_span_in_paragraph(para: Paragraph, px: float, py: float) -> TextSpan | None:

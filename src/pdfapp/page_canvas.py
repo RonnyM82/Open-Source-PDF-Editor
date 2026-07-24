@@ -60,6 +60,9 @@ _EDGE_THRESHOLD_ANGLE = 120.0  # same for sub-notch angle streams (one notch)
 # rounding leave a few px of slack); a range this small counts as fully
 # visible, so a scroll flips instead of nibbling invisible pixels first.
 _EDGE_FIT_SLACK_PX = 8
+# Hyperlink hotspot chrome — a teal distinct from the accent-blue reveal/hover
+# so link zones read as their own thing in both themes over the white page.
+_LINK_COLOR = QColor(0, 150, 136)
 
 
 class PageCanvas(QGraphicsView):
@@ -82,6 +85,10 @@ class PageCanvas(QGraphicsView):
     # Armed window selection (highlighting): press-drag-release draws a
     # rubber band; fires with the press -> release scene positions.
     regionSelected = Signal(float, float, float, float)
+    # Armed link-rectangle draw (create a hyperlink): press-drag-release draws a
+    # rubber band; fires with the press -> release scene positions. One-shot
+    # (mirrors arm_insert_point), unlike the sticky highlighter region.
+    linkRectSelected = Signal(float, float, float, float)
     # Right-click on the page (scene px) — the view offers a context menu.
     contextMenuRequested = Signal(float, float)
     # Cursor moved over the page with no buttons and no armed mode (U2a).
@@ -159,6 +166,9 @@ class PageCanvas(QGraphicsView):
         self._insert_armed = False  # one-shot click-to-place for new text
         self._region_armed = False  # window selection (highlight)
         self._region_sticky = False  # highlight tool STAYS armed after each mark
+        self._linkrect_armed = False  # one-shot draw-a-rectangle for a new link
+        self._linkrect_press = None  # scene QPointF while a link-rect drag is live
+        self._link_hover = False  # read-only pointing-hand cursor over a link
         # Consecutive-click counter for the highlight tool (1/2 = word, 3 = line).
         self._region_click_count = 0
         self._region_click_ms = float("-inf")
@@ -187,6 +197,9 @@ class PageCanvas(QGraphicsView):
         self._multi_selection_rects: list[QRectF] = []  # ctrl/shift multi (E10.7)
         # Reveal-all outlines (U5): every editable area, faint dashed.
         self._reveal_rects: list[QRectF] = []
+        # Hyperlink hotspots: every link on the page, in a DISTINCT colour so
+        # they read differently from the editable-area reveal (scene px).
+        self._link_rects: list[QRectF] = []
         # Search highlights (SR2): all hits + the current hit, scene px.
         # Display only — the view owns the hit list and the current index.
         self._search_rects: list[QRectF] = []
@@ -403,18 +416,46 @@ class PageCanvas(QGraphicsView):
         return self._region_click_count
 
     @property
+    def link_rect_armed(self) -> bool:
+        return self._linkrect_armed
+
+    @property
     def is_armed(self) -> bool:
-        return self._insert_armed or self._region_armed
+        return self._insert_armed or self._region_armed or self._linkrect_armed
 
     def arm_insert_point(self, chip_text: str = "") -> None:
         """One-shot mode: the next left-click on the page picks a point."""
         self.clear_hover()  # armed modes own the cursor
         self._region_armed = False  # modes are mutually exclusive
         self._region_press = None
+        self._linkrect_armed = False
         self._insert_armed = True
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         self._show_chip(chip_text)
         self.armedChanged.emit()
+
+    def arm_link_rect(self, chip_text: str = "") -> None:
+        """One-shot mode: press-drag-release draws the new link's rectangle,
+        reported via ``linkRectSelected`` (mirrors arm_insert_point, but the
+        gesture is a drag). Disarms on release."""
+        self.clear_hover()  # armed modes own the cursor
+        self._insert_armed = False  # modes are mutually exclusive
+        self._region_armed = False
+        self._region_press = None
+        self._linkrect_press = None
+        self._linkrect_armed = True
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        self._show_chip(chip_text)
+        self.armedChanged.emit()
+
+    def disarm_link_rect(self) -> None:
+        was = self._linkrect_armed
+        self._linkrect_armed = False
+        self._linkrect_press = None
+        self.viewport().unsetCursor()
+        if was:
+            self._armed_chip.hide()
+            self.armedChanged.emit()
 
     def disarm_insert_point(self) -> None:
         was = self._insert_armed
@@ -431,6 +472,7 @@ class PageCanvas(QGraphicsView):
         Esc / a click off the page / re-triggering the action."""
         self.clear_hover()  # armed modes own the cursor
         self._insert_armed = False  # modes are mutually exclusive
+        self._linkrect_armed = False
         self._region_armed = True
         self._region_sticky = sticky
         self._region_click_count = 0
@@ -597,6 +639,9 @@ class PageCanvas(QGraphicsView):
         if self._text_hover:
             self._text_hover = False
             self.viewport().unsetCursor()
+        if self._link_hover:
+            self._link_hover = False
+            self.viewport().unsetCursor()
         if self._hover_kind is None:
             return
         self._hover_kind = None
@@ -612,7 +657,7 @@ class PageCanvas(QGraphicsView):
         # events, which stick when focus leaves with Ctrl held (a stationary
         # Ctrl press updates on the next mouse move; accepted).
         ctrl = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
-        if self._hover_kind == "image_corner":
+        if self._hover_kind in ("image_corner", "link_corner"):
             rect, corner = self._hover_rect, self._hover_corner
             if rect is not None and corner is not None:
                 # SCENE-side comparison keeps the diagonal right on rotated
@@ -633,6 +678,7 @@ class PageCanvas(QGraphicsView):
             self._item is None
             or self._insert_armed
             or self._region_armed
+            or self._linkrect_armed
             or self._move_press is not None
         ):
             return
@@ -687,6 +733,29 @@ class PageCanvas(QGraphicsView):
             return
         self._reveal_rects = rects
         self.viewport().update()
+
+    # --- hyperlink hotspots -------------------------------------------------
+    def set_link_rects(self, scene_rects: list[tuple[float, float, float, float]]) -> None:
+        """Outline every hyperlink hotspot in the link colour (empty clears)."""
+        rects = [QRectF(x0, y0, x1 - x0, y1 - y0) for (x0, y0, x1, y1) in scene_rects]
+        if rects == self._link_rects:
+            return
+        self._link_rects = rects
+        self.viewport().update()
+
+    def set_link_hover(self, on: bool) -> None:
+        """Read-only follow affordance: a pointing-hand cursor over a link.
+
+        Independent of the edit-mode hover outline, like ``set_text_hover``;
+        reset by ``clear_hover`` / ``leaveEvent`` so the cursor never sticks."""
+        on = bool(on)
+        if on == self._link_hover:
+            return
+        self._link_hover = on
+        if on:
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.viewport().unsetCursor()
 
     # --- search highlights (SR2) ------------------------------------------
     def set_search_hits(
@@ -750,6 +819,22 @@ class PageCanvas(QGraphicsView):
                 return
             self.disarm_region_select()  # clicked off the page — cancel
         if (
+            self._linkrect_armed
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._item is not None
+        ):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self._item.boundingRect().contains(scene_pos):
+                self._linkrect_press = scene_pos
+                if self._move_band is None:
+                    self._move_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+                anchor = self.mapFromScene(scene_pos)
+                self._move_band.setGeometry(QRect(anchor, anchor))
+                self._move_band.show()
+                event.accept()
+                return
+            self.disarm_link_rect()  # clicked off the page — cancel
+        if (
             self._insert_armed
             and event.button() == Qt.MouseButton.LeftButton
             and self._item is not None
@@ -811,6 +896,14 @@ class PageCanvas(QGraphicsView):
         if self._region_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
             current = self.mapToScene(event.position().toPoint())
             top_left = self.mapFromScene(self._region_press)
+            bottom_right = self.mapFromScene(current)
+            if self._move_band is not None:
+                self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
+            event.accept()
+            return
+        if self._linkrect_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            current = self.mapToScene(event.position().toPoint())
+            top_left = self.mapFromScene(self._linkrect_press)
             bottom_right = self.mapFromScene(current)
             if self._move_band is not None:
                 self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
@@ -893,6 +986,17 @@ class PageCanvas(QGraphicsView):
             current = self.mapToScene(event.position().toPoint())
             self._suppress_dblclick = True  # eat a dblclick right after release
             self.regionSelected.emit(press.x(), press.y(), current.x(), current.y())
+            event.accept()
+            return
+        if self._linkrect_press is not None and event.button() == Qt.MouseButton.LeftButton:
+            press = self._linkrect_press
+            self._linkrect_press = None
+            self.disarm_link_rect()  # one-shot: done after this rectangle
+            if self._move_band is not None:
+                self._move_band.hide()
+            current = self.mapToScene(event.position().toPoint())
+            self._suppress_dblclick = True  # eat a dblclick right after release
+            self.linkRectSelected.emit(press.x(), press.y(), current.x(), current.y())
             event.accept()
             return
         if (
@@ -1018,6 +1122,17 @@ class PageCanvas(QGraphicsView):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for reveal in self._reveal_rects:
                 painter.drawRect(reveal)
+        if self._link_rects:  # hyperlink hotspots — a DISTINCT (teal) colour
+            line = QColor(_LINK_COLOR)
+            pen = QPen(line)
+            pen.setCosmetic(True)
+            pen.setWidthF(1.5)
+            painter.setPen(pen)
+            fill = QColor(line)
+            fill.setAlpha(28)
+            painter.setBrush(fill)
+            for link in self._link_rects:
+                painter.drawRect(link)
         if self._hover_rect is not None:
             accent = QColor(theme.accent())
             pen = QPen(accent)
@@ -1053,7 +1168,7 @@ class PageCanvas(QGraphicsView):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rect)
-        if self._selection_kind != "image":
+        if self._selection_kind not in ("image", "link"):
             return
         # Filled square handles, constant ON-SCREEN size (scene px shrink as
         # the view transform scales up).

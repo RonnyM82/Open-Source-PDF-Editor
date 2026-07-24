@@ -13,10 +13,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QTextCharFormat, QUndoStack
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QTextCharFormat, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QMessageBox,
     QSplitter,
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
 from pdfapp import icons, page_coords, theme
 from pdfapp.font_files import font_choice
 from pdfapp.gestures import hover_hint
+from pdfapp.link_cache import LinkCache
+from pdfapp.link_dialog import LinkDialog
 from pdfapp.ocr_cache import OcrWordCache
 from pdfapp.page_canvas import PageCanvas
 from pdfapp.page_geometry import (
@@ -44,8 +47,9 @@ from pdfapp.search_bar import SearchBar
 from pdfapp.text_editor_overlay import PT_PROPERTY, ParagraphEditorOverlay, TextEditorOverlay
 from pdfapp.thumbnail_panel import ThumbnailPanel
 from pdfapp.undo import SnapshotCommand, undo_limit_for
-from pdfcore import textselect
+from pdfcore import links, textselect
 from pdfcore.document import PdfDocument
+from pdfcore.links import LinkInfo
 from pdfcore.textedit import (
     FLAG_BOLD,
     FLAG_ITALIC,
@@ -138,6 +142,9 @@ class DocumentView(QWidget):
         # fill (~1–2 s/page), shared by search and Extract Text so either
         # pre-warms the other.
         self._ocr_words = OcrWordCache()
+        # Hyperlink hotspots per page — fourth cache on the same funnel. Feeds
+        # follow-on-click, the reveal chrome and edit-mode hit-testing.
+        self._links = LinkCache()
 
         # All mutations flow through this stack (SnapshotCommand); dirty state
         # derives from it. The depth cap MUST be set while the stack is empty
@@ -179,6 +186,7 @@ class DocumentView(QWidget):
         self._canvas.moveDragFinished.connect(self._on_move_drag_finished)
         self._canvas.backgroundPressed.connect(self._commit_open_editor)
         self._canvas.regionSelected.connect(self._on_region_selected)
+        self._canvas.linkRectSelected.connect(self._on_link_rect_selected)
         self._canvas.contextMenuRequested.connect(self._on_context_menu)
         self._canvas.hoverMoved.connect(self._on_hover_moved)
         self._canvas.hoverKindChanged.connect(
@@ -227,6 +235,12 @@ class DocumentView(QWidget):
         self._move_group: tuple[int, list[Paragraph]] | None = None
         self._move_image_target: tuple[int, object] | None = None
         self._resize_image: tuple[int, object, tuple[float, float]] | None = None
+        # In-flight link move/resize (edit mode), mirroring the image fields.
+        self._move_link: tuple[int, LinkInfo] | None = None
+        self._resize_link: tuple[int, LinkInfo, tuple[float, float]] | None = None
+        # A markup-mode plain click on a link opens it — the candidate is set on
+        # press and resolved (click vs drag) on release.
+        self._pending_link_follow: LinkInfo | None = None
         # Click-to-select state (U6): ("text"|"image", page, Paragraph|ImageInfo).
         # The canvas only displays the chrome; this is the source of truth.
         self._selection: tuple[str, int, object] | None = None
@@ -362,6 +376,23 @@ class DocumentView(QWidget):
         boundaries = tuple((box.rect, box.text) for box in self._doc.boxes(n))
         return self._geometry.page(self._doc, n, boundaries)
 
+    def page_links(self, n: int) -> list[LinkInfo]:
+        """Cached hyperlinks on page ``n`` (unrotated page points)."""
+        return self._links.links(self._doc, n)
+
+    def _link_at(self, n: int, px: float, py: float) -> LinkInfo | None:
+        """The link under an unrotated page point (smallest area wins), from the
+        cache — the priority-independent hit-test used by follow and the menus."""
+        best: LinkInfo | None = None
+        best_area = float("inf")
+        for info in self.page_links(n):
+            x0, y0, x1, y1 = info.bbox
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                area = (x1 - x0) * (y1 - y0)
+                if area < best_area:
+                    best, best_area = info, area
+        return best
+
     @staticmethod
     def _box_for(doc: PdfDocument, n: int, bbox: tuple[float, float, float, float], text: str = ""):
         """The registered box a paragraph belongs to, or None for pre-existing
@@ -424,6 +455,7 @@ class DocumentView(QWidget):
         self._clear_text_selection()  # the marquee selection is Markup-mode only (X4)
         self._canvas.clear_hover()  # reset the I-beam / hover outline
         self._push_reveal_chrome()  # reveal-all displays only in edit mode
+        self._push_link_chrome()  # link hotspots follow the same gate
         self.stateChanged.emit()
 
     # --- "show editable areas" (U5) ----------------------------------------
@@ -437,6 +469,7 @@ class DocumentView(QWidget):
             return
         self._show_areas = on
         self._push_reveal_chrome()
+        self._push_link_chrome()
         self.stateChanged.emit()
 
     # --- double-click sub-mode (U8) ------------------------------------------
@@ -472,6 +505,26 @@ class DocumentView(QWidget):
             for bbox in ([p.bbox for p in geometry.paragraphs] + [i.bbox for i in geometry.images])
         ]
         self._canvas.set_reveal_rects(rects)
+
+    def _push_link_chrome(self) -> None:
+        """(Re-)display the hyperlink hotspots — shown in edit mode with reveal
+        on (same gate as the editable-area reveal), in the distinct link colour
+        so they read differently. Re-pushed after page switches and re-renders,
+        like every other scene-space chrome."""
+        if not (self._edit_mode and self._show_areas and self._canvas.has_page):
+            self._canvas.set_link_rects([])
+            return
+        n = self._current_page
+        zoom = self._canvas.render_zoom
+        rot = self._doc.page_rotation(n)
+        size = self._doc.page_size(n)
+        rects = [
+            page_coords.page_rect_to_scene(
+                info.bbox, render_zoom=zoom, rotation=rot, page_size_pts=size
+            )
+            for info in self.page_links(n)
+        ]
+        self._canvas.set_link_rects(rects)
 
     # --- navigation -----------------------------------------------------
     def go_to_page(self, index: int) -> None:
@@ -1228,6 +1281,13 @@ class DocumentView(QWidget):
         self._click_action = ("comment", None)
         self._canvas.arm_insert_point("Click where the comment should go · Esc cancels")
 
+    def begin_insert_link(self) -> None:
+        """Arm the draw-a-rectangle gesture for a NEW hyperlink (edit mode).
+        On release the link dialog opens for the address / destination."""
+        if not self._edit_mode or not self._canvas.has_page:
+            return
+        self._canvas.arm_link_rect("Drag a rectangle over the area to link · Esc cancels")
+
     def begin_insert_callout(self) -> None:
         """Arm a TWO-click callout: first the arrow target, then the box.
         An ANNOTATION — available in Markup mode."""
@@ -1259,9 +1319,11 @@ class DocumentView(QWidget):
 
     @property
     def armed_action(self) -> str | None:
-        """The armed one-shot mode: "text" | "image" | "highlight" | None."""
+        """The armed one-shot mode: "text" | "image" | "highlight" | "link" | None."""
         if self._canvas.region_armed:
             return "highlight"
+        if self._canvas.link_rect_armed:
+            return "link"
         if self._canvas.insert_armed and self._click_action is not None:
             return self._click_action[0]
         return None
@@ -1271,6 +1333,7 @@ class DocumentView(QWidget):
         self._click_action = None
         self._canvas.disarm_insert_point()
         self._canvas.disarm_region_select()
+        self._canvas.disarm_link_rect()
 
     def _on_region_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
         """Highlight everything inside the dragged window (one undo step).
@@ -1363,6 +1426,85 @@ class DocumentView(QWidget):
 
         if self._push_command("Highlight text", op, ("page", page_index)) and results[0] == 0:
             self.editWarning.emit("No text in the selection.")
+
+    # --- hyperlinks --------------------------------------------------------
+    def _on_link_rect_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
+        """Finish a create-link rectangle drag: convert + normalize in page
+        space, refuse a too-small area, then open the link dialog."""
+        if not self._edit_mode:
+            return
+        n = self._current_page
+        ax, ay = self._scene_point_to_page(sx0, sy0, n)
+        bx, by = self._scene_point_to_page(sx1, sy1, n)
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        if (x1 - x0) < 4.0 and (y1 - y0) < 4.0:
+            self.editWarning.emit("Draw a rectangle over the area you want to link.")
+            return
+        self._create_link_dialog(n, (x0, y0, x1, y1))
+
+    def _create_link_dialog(self, n: int, rect: tuple[float, float, float, float]) -> None:
+        if not self.isVisible():
+            return  # offscreen tests drive _commit_add_link directly
+        dlg = LinkDialog(self, self._doc.page_count, current_page=n)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._commit_add_link(n, rect, dlg.spec())
+
+    def _commit_add_link(self, n: int, rect: tuple[float, float, float, float], spec: dict) -> None:
+        def op(doc: PdfDocument) -> None:
+            doc.add_link(n, rect, **spec)
+
+        self._push_command("Add link", op, ("page", n))
+
+    def _edit_link_at(self, n: int, info: LinkInfo) -> None:
+        """Open the link dialog for an existing link (change target or remove)."""
+        if not self._edit_mode:
+            return
+        if not info.editable:
+            self.editWarning.emit("This kind of link can't be edited here.")
+            return
+        if not self.isVisible():
+            return  # offscreen tests drive _commit_update_link / _delete_link_at directly
+        dlg = LinkDialog(self, self._doc.page_count, initial=info, current_page=n)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.removed:
+            self._delete_link_at(n, info.xref)
+            return
+        self._commit_update_link(n, info.xref, dlg.spec())
+
+    def _commit_update_link(self, n: int, xref: int, spec: dict) -> None:
+        def op(doc: PdfDocument) -> None:
+            doc.update_link(n, xref, **spec)
+
+        self._push_command("Edit link", op, ("page", n))
+
+    def _delete_link_at(self, n: int, xref: int) -> None:
+        def op(doc: PdfDocument) -> None:
+            doc.delete_link(n, xref)
+
+        self._push_command("Remove link", op, ("page", n))
+
+    def _follow_link(self, info: LinkInfo | None) -> None:
+        """Open a link's target: a URI in the default browser, a go-to-page by
+        navigating there. A pure read — never touches the undo stack."""
+        if info is None:
+            return
+        if info.kind == links.URI and info.uri:
+            QDesktopServices.openUrl(QUrl(info.uri))
+        elif info.kind == links.GOTO and info.dest_page is not None:
+            self.go_to_page(info.dest_page)
+        else:
+            self.editWarning.emit("This link has no target to open.")
+
+    def _link_label(self, info: LinkInfo) -> str:
+        """Short human description of a link's target (for hints/menus)."""
+        if info.kind == links.URI:
+            return info.uri or "link"
+        if info.kind == links.GOTO and info.dest_page is not None:
+            return f"page {info.dest_page + 1}"
+        return "link"
 
     def set_highlight_color(self, rgb: tuple[float, float, float] | None) -> None:
         """Set the highlighter colour for subsequent highlights ((r,g,b) 0-1 or
@@ -1706,18 +1848,23 @@ class DocumentView(QWidget):
     def _accept_target_drag(self, n: int, px: float, py: float, target) -> None:
         """Accept a pending canvas drag for ``target``.
 
-        Text paragraphs take priority over images (hover_target's rule, the
-        same one the hover affordance shows); an image press near a corner
-        RESIZES from the opposite corner, elsewhere it moves.
+        Text paragraphs take priority over images and links (hover_target's
+        rule, the same one the hover affordance shows); an image/link press
+        near a corner RESIZES from the opposite corner, elsewhere it moves.
+        The drag-state fields are mutually exclusive — clear all, then set one.
         """
         zoom = self._canvas.render_zoom
         rot = self._doc.page_rotation(n)
         size = self._doc.page_size(n)
+        self._move_comment = None
+        self._move_paragraph = None
+        self._move_group = None
+        self._move_image_target = None
+        self._resize_image = None
+        self._move_link = None
+        self._resize_link = None
         if target.kind == "comment":
             self._move_comment = (n, target.payload)
-            self._move_paragraph = None
-            self._move_image_target = None
-            self._resize_image = None
             scene_rect = page_coords.page_rect_to_scene(
                 target.bbox, render_zoom=zoom, rotation=rot, page_size_pts=size
             )
@@ -1727,8 +1874,6 @@ class DocumentView(QWidget):
             if any(s.rotation != 0 for s in target.payload.spans):
                 return  # rotated text can't be drag-moved (engine refuses)
             self._move_paragraph = (n, target.payload)
-            self._move_image_target = None
-            self._resize_image = None
             feedback = target.bbox
             members = [pp for pn, pp in self._multi_paragraphs if pn == n]
             if len(members) >= 2 and any(
@@ -1748,19 +1893,30 @@ class DocumentView(QWidget):
             )
             self._canvas.begin_move_feedback(scene_rect)
             return
+        if target.kind in ("link_move", "link_corner"):
+            anchor = self._corner_anchor(target.bbox, px, py)
+            if target.kind == "link_corner" and anchor is not None:
+                self._resize_link = (n, target.payload, anchor)
+                ascene = page_coords.page_to_scene(
+                    anchor[0], anchor[1], render_zoom=zoom, rotation=rot, page_size_pts=size
+                )
+                self._canvas.begin_resize_feedback(ascene)
+            else:
+                self._move_link = (n, target.payload)
+                scene_rect = page_coords.page_rect_to_scene(
+                    target.bbox, render_zoom=zoom, rotation=rot, page_size_pts=size
+                )
+                self._canvas.begin_move_feedback(scene_rect)
+            return
         anchor = self._corner_anchor(target.bbox, px, py)
         if target.kind == "image_corner" and anchor is not None:
             self._resize_image = (n, target.payload, anchor)
-            self._move_image_target = None
-            self._move_paragraph = None
             ascene = page_coords.page_to_scene(
                 anchor[0], anchor[1], render_zoom=zoom, rotation=rot, page_size_pts=size
             )
             self._canvas.begin_resize_feedback(ascene)
         else:  # body -> move
             self._move_image_target = (n, target.payload)
-            self._move_paragraph = None
-            self._resize_image = None
             scene_rect = page_coords.page_rect_to_scene(
                 target.bbox, render_zoom=zoom, rotation=rot, page_size_pts=size
             )
@@ -1785,7 +1941,11 @@ class DocumentView(QWidget):
             # edit-mode click-away below) before starting a marquee — otherwise
             # the comment stays selected and a later Delete would remove it.
             self._clear_selection()
-            self._begin_text_selection(sx, sy)  # Markup: marquee text selection (X4)
+            # A plain click on a link follows it (resolved on release as a
+            # click vs a drag); force the selection drag so the release fires
+            # even on a page with no selectable words.
+            self._pending_link_follow = self._link_at(n, px, py)
+            self._begin_text_selection(sx, sy, force=self._pending_link_follow is not None)
             return
         if target is None:
             # Edit mode, empty page: start a BOX marquee (task 1). Selection is
@@ -1803,7 +1963,12 @@ class DocumentView(QWidget):
         ):
             self.toggle_multi_select(n, target.payload)  # Shift+click adds (E10.7)
             return
-        kind = "image" if target.kind.startswith("image") else "text"
+        if target.kind.startswith("image"):
+            kind = "image"
+        elif target.kind.startswith("link"):
+            kind = "link"
+        else:
+            kind = "text"
         if self._selection == (kind, n, target.payload):
             self._accept_target_drag(n, px, py, target)
             return
@@ -1964,13 +2129,14 @@ class DocumentView(QWidget):
             self._text_lines_page = self._current_page
         return self._text_lines
 
-    def _begin_text_selection(self, sx: float, sy: float) -> None:
+    def _begin_text_selection(self, sx: float, sy: float, force: bool = False) -> None:
         """A plain read-only press starts a window/marquee selection: the drag
         draws a rectangle and everything inside it is selected. Accepts the
         drag only when the page has selectable native words — scanned/outline
-        pages have nothing to select, so the drag stays inert there."""
+        pages have nothing to select, so the drag stays inert there. ``force``
+        accepts it anyway (a pending link-follow needs the release event)."""
         self._clear_text_selection()  # a new drag replaces any prior selection
-        if not self._page_text_lines():
+        if not self._page_text_lines() and not force:
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
@@ -1985,15 +2151,22 @@ class DocumentView(QWidget):
 
     def _on_text_select_finished(self, sx: float, sy: float) -> None:
         """Finalize the window selection. A press with no real drag is a click,
-        which deselects (matches Acrobat: click to place, drag to select)."""
+        which follows a link under the release point (markup follow) or else
+        deselects (matches Acrobat: click to place, drag to select)."""
         anchor_pt = self._text_sel_anchor_pt
         self._text_sel_anchor_pt = None
+        follow = self._pending_link_follow
+        self._pending_link_follow = None
         if anchor_pt is None:
             return
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
         if abs(px - anchor_pt[0]) < 2.0 and abs(py - anchor_pt[1]) < 2.0:
-            self._clear_text_selection()  # a click, not a drag — deselect
+            self._clear_text_selection()  # a click, not a drag
+            if follow is not None:
+                x0, y0, x1, y1 = follow.bbox
+                if x0 <= px <= x1 and y0 <= py <= y1:  # release still over the link
+                    self._follow_link(follow)
             return
         self._set_region(anchor_pt[0], anchor_pt[1], sx, sy)
 
@@ -2067,6 +2240,7 @@ class DocumentView(QWidget):
         geometry = self.page_geometry(n)
         span = page_coords.span_at(geometry.spans, px, py)
         comment = self._doc.comment_at(n, px, py)
+        link = self._link_at(n, px, py)
         from PySide6.QtGui import QCursor
         from PySide6.QtWidgets import QMenu
 
@@ -2091,6 +2265,10 @@ class DocumentView(QWidget):
             )
         elif span is not None:
             actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
+        if link is not None:  # markup follows links — offer it explicitly
+            if not menu.isEmpty():
+                menu.addSeparator()
+            actions["open_link"] = menu.addAction(icons.icon("open_link"), "Open link")
         if comment is None:  # adding a comment ON a comment would stack them
             if not menu.isEmpty():
                 menu.addSeparator()
@@ -2114,6 +2292,8 @@ class DocumentView(QWidget):
             self.highlight_selection()
         elif chosen is actions.get("highlight"):
             self._highlight_rect(n, span.bbox)
+        elif chosen is actions.get("open_link"):
+            self._follow_link(link)
         elif chosen is actions.get("add_comment"):
             self._open_comment_editor(n, px, py, None)
 
@@ -2302,6 +2482,8 @@ class DocumentView(QWidget):
             self._delete_comment_at(n, payload.xref)
         elif kind == "image" and self._edit_mode:
             self._delete_image_at(n, payload)
+        elif kind == "link" and self._edit_mode:
+            self._delete_link_at(n, payload.xref)
 
     def _delete_comment_at(self, page_index: int, xref: int) -> None:
         def op(doc: PdfDocument) -> None:
@@ -2329,13 +2511,26 @@ class DocumentView(QWidget):
             self._canvas.set_text_hover(False)  # not an I-beam target
             if target is None:
                 self._canvas.clear_hover()
+                self._canvas.viewport().setToolTip("")
             else:
                 self._show_hover_target(n, target)
+                self._canvas.viewport().setToolTip(
+                    self._link_label(target.payload) if target.kind.startswith("link") else ""
+                )
             return
-        # Markup mode, not over a comment: an I-beam over selectable words (X4),
-        # else clean. Clear a lingering comment outline first.
+        # Markup mode, not over a comment: a pointing hand over a link (click to
+        # follow), an I-beam over selectable words (X4), else clean. Clear a
+        # lingering comment outline first.
         if self._canvas.hover_kind is not None:
             self._canvas.clear_hover()
+        link = self._link_at(n, px, py)
+        if link is not None:
+            self._canvas.set_text_hover(False)
+            self._canvas.set_link_hover(True)
+            self._canvas.viewport().setToolTip(self._link_label(link))
+            return
+        self._canvas.set_link_hover(False)
+        self._canvas.viewport().setToolTip("")
         self._canvas.set_text_hover(textselect.word_at(self._page_text_lines(), px, py) is not None)
 
     def _show_hover_target(self, n: int, target) -> None:
@@ -2372,6 +2567,23 @@ class DocumentView(QWidget):
             page_index, image, anchor = self._resize_image
             self._resize_image = None
             self._finish_image_resize(page_index, image, anchor, sx1, sy1)
+            return
+        if self._resize_link is not None:
+            page_index, info, anchor = self._resize_link
+            self._resize_link = None
+            self._finish_link_resize(page_index, info, anchor, sx1, sy1)
+            return
+        if self._move_link is not None:
+            page_index, info = self._move_link
+            self._move_link = None
+            offset = self._drag_offset(sx0, sy0, sx1, sy1, page_index)
+            if offset is None:
+                return
+
+            def link_move_op(doc: PdfDocument) -> None:
+                doc.move_link(page_index, info.xref, offset)
+
+            self._push_command("Move link", link_move_op, ("page", page_index))
             return
         if self._move_comment is not None:
             page_index, comment = self._move_comment
@@ -2459,6 +2671,21 @@ class DocumentView(QWidget):
         if not self._push_command("Resize image", op, ("page", page_index)):
             return
 
+    def _finish_link_resize(self, page_index, info, anchor, sx1, sy1) -> None:
+        """Resize a link's rectangle so the dragged corner reaches the release
+        point, anchored at the opposite corner (no aspect lock — links resize
+        freely)."""
+        rx, ry = self._scene_point_to_page(sx1, sy1, page_index)
+        ax, ay = anchor
+        if abs(rx - ax) < 3.0 and abs(ry - ay) < 3.0:
+            return  # negligible drag — leave the link as it was
+        new_rect = (min(ax, rx), min(ay, ry), max(ax, rx), max(ay, ry))
+
+        def op(doc: PdfDocument) -> None:
+            doc.resize_link(page_index, info.xref, new_rect)
+
+        self._push_command("Resize link", op, ("page", page_index))
+
     # --- context menu: the visible twin of every gesture (U3) --------------
     def _on_context_menu(self, sx: float, sy: float) -> None:
         """Right-click menu for text, images and the page background.
@@ -2477,6 +2704,7 @@ class DocumentView(QWidget):
         para = target.payload if target is not None and target.kind == "text" else None
         span = page_coords.span_at(geometry.spans, px, py)
         image = self._doc.image_at(n, px, py)
+        link = self._link_at(n, px, py)
         if not self.isVisible():
             return  # offscreen tests call the dispatch methods directly
         from PySide6.QtGui import QCursor
@@ -2560,6 +2788,13 @@ class DocumentView(QWidget):
                 icons.icon("rotate_image_ccw"), "Rotate 90° counter-clockwise"
             )
             actions["delete"] = menu.addAction(icons.icon("delete_image"), "Delete image\tDel")
+        if link is not None:
+            if not menu.isEmpty():
+                menu.addSeparator()
+            if link.editable:
+                actions["edit_link"] = menu.addAction(icons.icon("edit_link"), "Edit link…")
+            actions["open_link"] = menu.addAction(icons.icon("open_link"), "Open link")
+            actions["remove_link"] = menu.addAction(icons.icon("remove_link"), "Remove link")
         if menu.isEmpty():  # page background
             actions["insert_text"] = menu.addAction(icons.icon("insert_text"), "Insert text here")
             actions["insert_image"] = menu.addAction(
@@ -2609,6 +2844,12 @@ class DocumentView(QWidget):
             self._rotate_image_at(n, image, 90)
         elif chosen is actions.get("delete"):
             self._delete_image_at(n, image)
+        elif chosen is actions.get("edit_link"):
+            self._edit_link_at(n, link)
+        elif chosen is actions.get("open_link"):
+            self._follow_link(link)
+        elif chosen is actions.get("remove_link"):
+            self._delete_link_at(n, link.xref)
         elif chosen is actions.get("insert_text"):
             self._insert_text_at_point(sx, sy)
         elif chosen is actions.get("insert_image"):
@@ -2938,6 +3179,7 @@ class DocumentView(QWidget):
             self._cache.evict_page(page)
             self._geometry.evict_page(page)
             self._ocr_words.evict_page(page)
+            self._links.evict_page(page)
             self._thumbnails.update_thumbnail(page, self._thumb_pixmap(page))
             if page == self._current_page:
                 self._show_page(page)
@@ -2956,6 +3198,7 @@ class DocumentView(QWidget):
         self._cache.clear()
         self._geometry.clear()
         self._ocr_words.clear()
+        self._links.clear()
         self._text_lines = None  # content may have changed — rebuild on next use (X4)
 
     def _page_pixmap(self, index: int, render_zoom: float):
@@ -3004,6 +3247,7 @@ class DocumentView(QWidget):
         self._canvas.set_page(self._page_pixmap(index, render_zoom), render_zoom, size_pts)
         self._push_selection_chrome()
         self._push_reveal_chrome()
+        self._push_link_chrome()
         self._push_search_chrome()
         self._push_text_selection_chrome()
         self._thumbnails.set_current(self._current_page)

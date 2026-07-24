@@ -129,7 +129,8 @@ def _dropped_pdf_paths(mime: QMimeData) -> list[Path]:
 
 # Bumped whenever the toolbar/dock layout changes so a stale saved window
 # state (restoreState) is cleanly ignored rather than hiding a new toolbar.
-_STATE_VERSION = 2
+# 3: added the "Insert link" toolbar button (hyperlink feature).
+_STATE_VERSION = 3
 
 
 class MainWindow(QMainWindow):
@@ -361,6 +362,10 @@ class MainWindow(QMainWindow):
         self._insert_image_action.setCheckable(True)
         self._insert_image_action.triggered.connect(self.insert_image)
 
+        self._insert_link_action = QAction("Insert lin&k…", self)
+        self._insert_link_action.setCheckable(True)
+        self._insert_link_action.triggered.connect(self.insert_link)
+
         self._highlight_action = QAction("High&light text", self)
         self._highlight_action.setCheckable(True)
         self._highlight_action.setShortcut("Ctrl+Shift+H")
@@ -386,6 +391,7 @@ class MainWindow(QMainWindow):
             self._insert_action,
             self._insert_text_action,
             self._insert_image_action,
+            self._insert_link_action,
         )
         # ANNOTATIONS — markup, available whenever a document is open (Markup
         # mode AND edit mode), like the read features. Enabled on `has` alone.
@@ -432,6 +438,7 @@ class MainWindow(QMainWindow):
             self._insert_action: "insert_pages",
             self._insert_text_action: "insert_text",
             self._insert_image_action: "insert_image",
+            self._insert_link_action: "insert_link",
             self._highlight_action: "highlight",
             self._insert_comment_action: "insert_comment",
             self._insert_callout_action: "insert_callout",
@@ -472,6 +479,9 @@ class MainWindow(QMainWindow):
             self._find_action: "Find in document (Ctrl+F)",
             self._insert_text_action: "Insert text — then click the page to place it",
             self._insert_image_action: "Insert an image — then click the page to place it",
+            self._insert_link_action: (
+                "Insert a hyperlink — drag a rectangle, then set the address or destination page"
+            ),
             self._highlight_action: (
                 "Highlight text (Ctrl+Shift+H) — the current selection, or drag a window over text"
             ),
@@ -625,6 +635,7 @@ class MainWindow(QMainWindow):
         # double-click sub-mode TOGGLES moved to menu-only (less used).
         toolbar.addAction(self._insert_text_action)
         toolbar.addAction(self._insert_image_action)
+        toolbar.addAction(self._insert_link_action)
         toolbar.addSeparator()
         toolbar.addAction(self._rotate_ccw_action)
         toolbar.addAction(self._rotate_cw_action)
@@ -1491,6 +1502,14 @@ class MainWindow(QMainWindow):
                 v.begin_insert_image()
             self._sync_chrome()
 
+    def insert_link(self) -> None:
+        if (v := self.active_view) is not None:
+            if v.armed_action == "link":
+                v.cancel_armed_mode()  # clicking the checked action cancels
+            else:
+                v.begin_insert_link()
+            self._sync_chrome()
+
     def insert_comment(self) -> None:
         if (v := self.active_view) is not None:
             if v.armed_action == "comment":
@@ -1775,6 +1794,7 @@ class MainWindow(QMainWindow):
         armed = view.armed_action if view is not None else None
         self._insert_text_action.setChecked(armed == "text")
         self._insert_image_action.setChecked(armed == "image")
+        self._insert_link_action.setChecked(armed == "link")
         self._highlight_action.setChecked(armed == "highlight")
         self._insert_comment_action.setChecked(armed == "comment")
         self._insert_callout_action.setChecked(armed in ("callout_target", "callout_box"))
