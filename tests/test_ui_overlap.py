@@ -68,6 +68,41 @@ def test_two_inserted_boxes_stay_separate_when_moved_to_overlap(qapp, tmp_path):
         window.close()
 
 
+def test_box_moved_onto_substring_text_does_not_merge(qapp, tmp_path):
+    """User report (2026-07-24): a box moved onto text whose whole line is a
+    SUBSTRING of the box's text merged them into one mangled paragraph
+    ('Bank' under 'International Bank or Wire Fees'). Whole-line fingerprint
+    matching keeps them separate."""
+    path = tmp_path / "sub.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((300, 400), "Bank", fontsize=9)  # foreign, substring of the box
+    doc.save(str(path))
+    doc.close()
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        view = window.active_view
+        view.set_edit_mode(True)
+        _insert(view, 100, 200, "International Bank or Wire Fees")
+        box_para = _para_with(view, "International")
+        foreign = _para_with(view, "Bank")
+        # Move the box right on top of the foreign 'Bank' line.
+        dx = foreign.bbox[0] - box_para.bbox[0]
+        dy = foreign.bbox[1] - box_para.bbox[1]
+        view._apply_box_offsets(0, [(box_para, (dx, dy))], "move onto Bank")
+
+        paras = view.page_geometry(0).paragraphs
+        texts = {p.text for p in paras}
+        assert "International Bank or Wire Fees" in texts
+        assert "Bank" in texts  # NOT merged into the box paragraph
+        assert not any("International" in p.text and "\nBank" in p.text for p in paras)
+        assert not any(p.text == "Bank\nInternational Bank or Wire Fees" for p in paras)
+    finally:
+        window.close()
+
+
 def test_moved_box_over_existing_text_does_not_absorb_it(qapp, tmp_path):
     """An inserted box moved over PRE-EXISTING page text must not swallow it."""
     path = tmp_path / "existing.pdf"
@@ -134,24 +169,28 @@ def test_box_for_returns_none_for_foreign_text_under_a_moved_box(qapp, tmp_path)
         window.close()
 
 
-def test_box_for_matches_a_wrapped_box_by_normalized_text(qapp, tmp_path):
-    """A wrapped box re-extracts as para.text with a newline, but its stored
-    fingerprint is the logical one-line text; _box_for must match them
-    NORMALIZED (not by exact equality, which the review flagged)."""
+def test_box_stores_visual_lines_and_box_for_matches_them(qapp, tmp_path):
+    """A box's fingerprint is its VISUAL lines (task 5, whole-line matching).
+    A multi-line box stores each line, and _box_for matches the re-extracted
+    paragraph by whole-line subset — not substring."""
     window = MainWindow()
     try:
         window.open_path(_blank(tmp_path))
         view = window.active_view
         view.set_edit_mode(True)
-        _insert(view, 100, 200, "alpha beta gamma")  # stored fingerprint, one line
+        _insert(view, 100, 200, "first line here\nsecond line here")
         box = view.document.boxes(0)[0]
-        para = _para_with(view, "alpha")
-        # Query _box_for with a NEWLINE-broken version of the same text (what a
-        # wrapped re-extraction produces). Exact equality would miss it.
-        wrapped = "alpha beta\ngamma"
-        assert normalize(wrapped) == normalize(box.text)
-        found = view._box_for(view.document, 0, para.bbox, wrapped)
+        # Fingerprint stores BOTH visual lines.
+        assert {normalize(ln) for ln in box.text.split("\n")} == {
+            "first line here",
+            "second line here",
+        }
+        para = _para_with(view, "first line here")
+        assert len(para.lines) == 2
+        found = view._box_for(view.document, 0, para.bbox, para.text)
         assert found is not None and found.id == box.id
+        # A FOREIGN paragraph whose text is a substring of a box line is NOT it.
+        assert view._box_for(view.document, 0, para.bbox, "line") is None
     finally:
         window.close()
 

@@ -46,7 +46,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Drag a multi-selected box", "Moves the whole group, spacing preserved"),
             (
                 "Right-click (multi-selected)",
-                "Merge · Align text boxes (6-way) · Distribute evenly (equal gaps)",
+                "Merge · Align (6-way) · Distribute (equal gaps) · Delete all selected",
             ),
             (
                 "Right-click",

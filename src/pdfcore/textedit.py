@@ -224,6 +224,13 @@ def _layout_runs(runs: list[StyledRun], wrap_width: float | None) -> list[list[_
     return lines
 
 
+def _visual_line_texts(lines: list[list[_Fragment]]) -> tuple[str, ...]:
+    """The text of each laid-out VISUAL line (post-wrap), for the box content
+    fingerprint. These are exactly what re-extraction produces per line, so
+    whole-line fingerprint matching has no substring false-positives."""
+    return tuple("".join(frag.text for frag in line) for line in lines if line)
+
+
 def _finish_line(fragments: list[_Fragment]) -> list[_Fragment]:
     """Drop trailing spaces, then merge adjacent same-style fragments."""
     while fragments and fragments[-1].text.isspace():
@@ -406,6 +413,10 @@ class ParagraphReplaceResult:
     # was inserted (empty replacement). Lets the UI keep an inserted box's
     # registry rect in step with moves AND grow/shrink edits (E10).
     new_bbox: tuple[float, float, float, float] | None = None
+    # The VISUAL lines actually laid out (post-wrap), for the box content
+    # fingerprint — whole-line matching (task 5) needs the wrapped lines, not
+    # the logical text, so an edited/wrapped box owns its own lines exactly.
+    visual_lines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1352,13 +1363,20 @@ def _rect_area(rect: tuple[float, ...]) -> float:
 
 def normalize_box_text(s: str) -> str:
     """Collapse all whitespace (incl. the U+00A0 an embedded TTF can emit) to
-    single spaces — so a box fingerprint matches re-extracted text regardless
-    of word-wrap: a wrapped visual line is a contiguous SUBSTRING of the box's
-    logical text once whitespace is normalized, and a whole paragraph's text
-    equals its fingerprint whether or not it wrapped. THE shared normalizer for
-    box ownership — `_line_region` (engine) and `DocumentView._box_for` (UI)
-    must agree, so both go through this."""
+    single spaces. THE shared normalizer for box ownership — `_line_region`
+    (engine) and `DocumentView._box_for` (UI) must agree, so both go through
+    this and `fingerprint_lineset`."""
     return " ".join(s.split())
+
+
+def fingerprint_lineset(text: str) -> frozenset[str]:
+    """A box fingerprint as a set of its NORMALIZED VISUAL lines. Ownership
+    matches a line by WHOLE-LINE membership in this set (not substring), so a
+    foreign line whose text merely appears inside the box's text is NOT
+    absorbed — the 'Bank' under 'International Bank or Wire Fees' bug (task 5,
+    2026-07-24). Callers store the box's actual laid-out visual lines
+    ("\\n"-joined) so a wrapped box's own lines match exactly."""
+    return frozenset(normalize_box_text(ln) for ln in text.split("\n") if ln.strip())
 
 
 # Internal alias (the engine's ownership helpers read it under the short name).
@@ -1375,14 +1393,16 @@ def _line_text(line: dict) -> str:
 def _line_region(line: dict, bounds: Sequence[tuple[tuple[float, ...], str]]) -> int:
     """Index of the isolation region (insert box) a line belongs to, or -1.
 
-    ``bounds`` is the NORMALIZED ``[(rect, fingerprint)]`` list. A line is a
+    ``bounds`` is the NORMALIZED ``[(rect, lineset)]`` list. A line is a
     candidate for every box whose rect contains its centre. Ownership then
-    resolves by CONTENT (task 5 Level 1): among the containing boxes, one
-    whose fingerprint includes this line's text wins — so a box moved OVER
-    other text never absorbs it, and two overlapping boxes keep their own
-    lines. Ties (and fingerprint-less legacy boxes) fall back to the TIGHTEST
-    containing rect. A fingerprinted box does NOT claim a foreign line under
-    it (returns -1 -> the line stays in its normal dict-block paragraph).
+    resolves by CONTENT (task 5): among the containing boxes, one whose visual
+    lineset CONTAINS this line's whole text wins — so a box moved OVER other
+    text never absorbs it, two overlapping boxes keep their own lines, and a
+    foreign line whose text merely appears INSIDE the box's text (e.g. 'Bank'
+    within 'International Bank or Wire Fees') is NOT grabbed. Ties (and
+    fingerprint-less legacy boxes) fall back to the TIGHTEST containing rect. A
+    fingerprinted box does NOT claim a foreign line under it (returns -1 -> the
+    line stays in its normal dict-block paragraph).
     """
     bx0, by0, bx1, by1 = line["bbox"]
     cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
@@ -1394,7 +1414,7 @@ def _line_region(line: dict, bounds: Sequence[tuple[tuple[float, ...], str]]) ->
     if not containing:
         return -1
     text = _line_text(line)
-    matches = [i for i in containing if text and bounds[i][1] and text in bounds[i][1]]
+    matches = [i for i in containing if text and text in bounds[i][1]]
     if matches:
         pool = matches
     else:
@@ -1409,21 +1429,22 @@ def _line_region(line: dict, bounds: Sequence[tuple[tuple[float, ...], str]]) ->
 
 def _normalize_boundaries(
     boundaries: Sequence,
-) -> list[tuple[tuple[float, ...], str]]:
-    """Normalize the public ``boundaries`` arg to ``[(rect, fingerprint)]``.
+) -> list[tuple[tuple[float, ...], frozenset[str]]]:
+    """Normalize the public ``boundaries`` arg to ``[(rect, lineset)]``.
 
-    Accepts a bare rect (legacy — geometry-only isolation, fingerprint "") OR
+    Accepts a bare rect (legacy — geometry-only isolation, empty lineset) OR
     a ``(rect, text)`` pair (task 5 — content-aware). A ``(rect, text)`` pair
     is a 2-tuple whose first element is itself a sequence; anything else is a
-    bare 4-number rect.
+    bare 4-number rect. The fingerprint text becomes a SET of its normalized
+    visual lines (whole-line matching — see ``fingerprint_lineset``).
     """
-    norm: list[tuple[tuple[float, ...], str]] = []
+    norm: list[tuple[tuple[float, ...], frozenset[str]]] = []
     for entry in boundaries:
         if len(entry) == 2 and isinstance(entry[0], (tuple, list)):
             rect, text = entry
-            norm.append((tuple(float(v) for v in rect), _normalize_text(text)))
+            norm.append((tuple(float(v) for v in rect), fingerprint_lineset(text)))
         else:
-            norm.append((tuple(float(v) for v in entry), ""))
+            norm.append((tuple(float(v) for v in entry), frozenset()))
     return norm
 
 
@@ -1829,6 +1850,7 @@ def replace_paragraph_runs(
         uniform_style=para.uniform_style,
         resized=resized,
         new_bbox=new_bbox,
+        visual_lines=_visual_line_texts(lines),
     )
 
 
@@ -1840,8 +1862,9 @@ def insert_new_text(
     *,
     style: TextStyle | None = None,
     align: str = "left",
-) -> None:
-    """Insert NEW text at a baseline point (unrotated page space).
+) -> tuple[str, ...]:
+    """Insert NEW text at a baseline point (unrotated page space). Returns the
+    VISUAL line texts (box fingerprint).
 
     Additive — nothing is redacted. ``\\n`` starts extra lines below.
     ``style`` defaults to non-embedded 11pt black helv; an explicit fontfile
@@ -1849,7 +1872,7 @@ def insert_new_text(
     lines against each other (see ``insert_new_runs``).
     """
     style = style or TextStyle()
-    insert_new_runs(doc, page_index, point, [StyledRun(text, style)], align=align)
+    return insert_new_runs(doc, page_index, point, [StyledRun(text, style)], align=align)
 
 
 def insert_new_runs(
@@ -1860,8 +1883,9 @@ def insert_new_runs(
     *,
     align: str = "left",
     pitch: float | None = None,
-) -> None:
-    """Insert NEW rich text at a baseline point (E9). Additive.
+) -> tuple[str, ...]:
+    """Insert NEW rich text at a baseline point (E9). Additive. Returns the
+    VISUAL line texts laid out (for the box content fingerprint).
 
     Hard ``\\n`` breaks only (no wrap width for free-standing text); line
     pitch defaults to 1.2 × the first run's base size. The point (and every
@@ -1907,6 +1931,7 @@ def insert_new_runs(
     block = max(widths, default=0.0)
     for i, line in enumerate(lines):
         _insert_line(page, x + _align_shift(align, block, widths[i]), y + i * pitch, line)
+    return _visual_line_texts(lines)
 
 
 def add_highlight(

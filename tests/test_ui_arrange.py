@@ -200,6 +200,43 @@ def test_align_left_is_on_screen_left_on_a_rotated_page(qapp, tmp_path):
         window.close()
 
 
+def test_delete_selected_boxes_removes_them_all_in_one_step(qapp, tmp_path):
+    """User request (2026-07-24): delete ALL selected text boxes at once."""
+    window, view = _open(
+        tmp_path,
+        [(80, 100, 9, "alpha box"), (80, 150, 9, "beta box"), (80, 210, 9, "gamma box")],
+    )
+    try:
+        _select_all(view)
+        assert len(view._multi_paragraphs) == 3
+        view._delete_selected_paragraphs()
+
+        remaining = {p.text for p in view.page_geometry(0).paragraphs}
+        assert "alpha box" not in remaining
+        assert "beta box" not in remaining
+        assert "gamma box" not in remaining
+        assert view.undo_stack.count() == 1  # ONE undoable step
+
+        view.undo_stack.undo()
+        restored = {p.text for p in view.page_geometry(0).paragraphs}
+        assert {"alpha box", "beta box", "gamma box"} <= restored
+    finally:
+        window.close()
+
+
+def test_delete_key_deletes_a_multi_selection(qapp, tmp_path):
+    """The Delete key removes a selected box group too, not just via the menu."""
+    window, view = _open(tmp_path, [(80, 100, 9, "one box"), (80, 160, 9, "two box")])
+    try:
+        _select_all(view)
+        view._on_delete_selection()  # what Delete/Backspace triggers
+        remaining = {p.text for p in view.page_geometry(0).paragraphs}
+        assert "one box" not in remaining and "two box" not in remaining
+        assert view.undo_stack.count() == 1
+    finally:
+        window.close()
+
+
 def test_align_survives_undo(qapp, tmp_path):
     window, view = _open(
         tmp_path, [(120, 100, 9, "alpha"), (160, 150, 9, "beta"), (80, 210, 9, "gamma")]

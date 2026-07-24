@@ -134,12 +134,13 @@ class PdfDocument:
         *,
         style: TextStyle | None = None,
         align: str = "left",
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Insert NEW text at a baseline point on page ``n`` (additive).
+        Returns the box's VISUAL line texts (content fingerprint).
 
         ``align`` justifies multi-line text against its widest line.
         """
-        textedit.insert_new_text(self._doc, n, point, text, style=style, align=align)
+        return textedit.insert_new_text(self._doc, n, point, text, style=style, align=align)
 
     def paragraph_at(
         self,
@@ -304,13 +305,14 @@ class PdfDocument:
         *,
         align: str = "left",
         pitch: float | None = None,
-    ) -> None:
-        """Insert NEW rich text at a baseline point on page ``n`` (E9).
+    ) -> tuple[str, ...]:
+        """Insert NEW rich text at a baseline point on page ``n`` (E9). Returns
+        the box's VISUAL line texts (content fingerprint).
 
         ``pitch`` overrides the default 1.2-em baseline spacing (a copy of an
         existing paragraph reproduces that paragraph's own pitch).
         """
-        textedit.insert_new_runs(self._doc, n, point, runs, align=align, pitch=pitch)
+        return textedit.insert_new_runs(self._doc, n, point, runs, align=align, pitch=pitch)
 
     def highlight(
         self, n: int, span: TextSpan, color: tuple[float, float, float] | None = None

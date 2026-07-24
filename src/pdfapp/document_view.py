@@ -56,8 +56,8 @@ from pdfcore.textedit import (
     StyledRun,
     TextSpan,
     TextStyle,
+    fingerprint_lineset,
     merge_paragraphs,
-    normalize_box_text,
 )
 
 # Thumbnails render at a fixed low dpi for speed; the main page renders at
@@ -366,14 +366,16 @@ class DocumentView(QWidget):
     def _box_for(doc: PdfDocument, n: int, bbox: tuple[float, float, float, float], text: str = ""):
         """The registered box a paragraph belongs to, or None for pre-existing
         text. MUST agree with the engine's ``_line_region`` (they are the two
-        halves of the SAME ownership question). Among boxes whose rect contains
-        the paragraph's centre: one whose fingerprint matches ``text`` wins
-        (WHITESPACE-NORMALIZED — a wrapped box's re-extracted `para.text` joins
-        visual lines with "\\n" but normalizes equal to its logical stored
-        text); ties break to the TIGHTEST rect. When ``text`` is supplied and
-        NO fingerprint matches, a fingerprinted box must NOT be returned for
-        foreign text under it (mirrors `_line_region` returning -1) — fall back
-        to fingerprint-less legacy boxes only, else None."""
+        halves of the SAME ownership question), so both go through
+        ``fingerprint_lineset``. Among boxes whose rect contains the
+        paragraph's centre: one whose visual lineset CONTAINS the paragraph's
+        lines wins (whole-line match — a foreign paragraph whose text merely
+        appears inside a box is excluded, and a wrapped box's own lines match
+        because the fingerprint stores the VISUAL lines); ties break to the
+        TIGHTEST rect. When ``text`` is supplied and NO box matches, a
+        fingerprinted box must NOT be returned for foreign text under it
+        (mirrors `_line_region` returning -1) — fall back to fingerprint-less
+        legacy boxes only, else None."""
         cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         containing = [
             box
@@ -387,9 +389,9 @@ class DocumentView(QWidget):
             return max(0.0, box.rect[2] - box.rect[0]) * max(0.0, box.rect[3] - box.rect[1])
 
         if text:
-            needle = normalize_box_text(text)
+            needle = fingerprint_lineset(text)
             matches = [
-                box for box in containing if box.text and normalize_box_text(box.text) == needle
+                box for box in containing if needle and needle <= fingerprint_lineset(box.text)
             ]
             if matches:
                 return min(matches, key=area)
@@ -1556,20 +1558,20 @@ class DocumentView(QWidget):
             if pieces is not None:  # rich path: styles typed/applied in the editor
                 runs, _resolved = self._runs_from_pieces(pieces)
 
-                def do_insert(doc: PdfDocument) -> None:
-                    doc.insert_runs(page_index, point, runs, align=align)
+                def do_insert(doc: PdfDocument) -> tuple[str, ...]:
+                    return doc.insert_runs(page_index, point, runs, align=align)
             else:  # direct-call fallback: uniform toolbar style
                 style = self._current_style()
 
-                def do_insert(doc: PdfDocument) -> None:
-                    doc.insert_text(page_index, point, text, style=style, align=align)
+                def do_insert(doc: PdfDocument) -> tuple[str, ...]:
+                    return doc.insert_text(page_index, point, text, style=style, align=align)
 
             def insert_op(doc: PdfDocument) -> None:
                 # Register the new box INSIDE the op: the command's snapshot
                 # then carries content + registry together, so undo/redo can
                 # never split them (E10).
                 before = {(s.text, s.bbox) for s in doc.text_spans(page_index)}
-                do_insert(doc)
+                lines = do_insert(doc)  # the laid-out VISUAL lines (fingerprint)
                 new = [s for s in doc.text_spans(page_index) if (s.text, s.bbox) not in before]
                 if new:
                     doc.add_box(
@@ -1580,7 +1582,7 @@ class DocumentView(QWidget):
                             max(s.bbox[2] for s in new),
                             max(s.bbox[3] for s in new),
                         ),
-                        text=text,  # content fingerprint (task 5 overlap disambiguation)
+                        text="\n".join(lines),  # VISUAL-line fingerprint (task 5)
                     )
 
             self._push_command("Insert text", insert_op, ("page", page_index))
@@ -1637,7 +1639,8 @@ class DocumentView(QWidget):
             results.append(result)
             if box is not None:  # keep the registry rect + fingerprint in step
                 if result.new_bbox is not None:
-                    doc.update_box(box.id, result.new_bbox, text)  # content changed
+                    # Store the VISUAL lines (post-wrap), not the logical text.
+                    doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
                 else:  # emptied — the box's text is gone, drop its identity
                     doc.remove_box(box.id)
 
@@ -2148,7 +2151,7 @@ class DocumentView(QWidget):
                     doc.remove_box(box.id)
             if boxes and len(seen) == len(paras) and result.new_bbox is not None:
                 # EVERY member was an inserted box: the union stays one.
-                doc.add_box(n, result.new_bbox, text=union.text)
+                doc.add_box(n, result.new_bbox, text="\n".join(result.visual_lines))
 
         self._push_command("Merge text boxes", op, ("page", n))
         # after_command cleared the (now stale) selection; nothing else to do.
@@ -2284,8 +2287,12 @@ class DocumentView(QWidget):
 
     def _on_delete_selection(self) -> None:
         """Delete/Backspace removes a selected COMMENT (either mode — markup) or
-        IMAGE (edit mode only — content). Paragraph text is deleted through its
-        editor instead. In Markup mode a selection can only ever be a comment."""
+        IMAGE (edit mode only — content), or a multi-selection of TEXT boxes
+        (edit mode — the group in one step). A single paragraph is deleted
+        through its editor / context menu instead."""
+        if self._edit_mode and self._selected_members():
+            self._delete_selected_paragraphs()  # the whole box group
+            return
         if self._selection is None:
             return
         kind, n, payload = self._selection
@@ -2517,6 +2524,9 @@ class DocumentView(QWidget):
             )
             for key in ("dist_v", "dist_h"):
                 actions[key].setEnabled(multi_count >= 3)  # need something between the ends
+            actions["delete_selected"] = menu.addAction(
+                icons.icon("delete_image"), f"Delete {multi_count} text boxes"
+            )
             menu.addSeparator()
         if para is not None or span is not None:
             actions["edit_text"] = menu.addAction(
@@ -2579,6 +2589,8 @@ class DocumentView(QWidget):
             self._distribute_selected_boxes("v")
         elif chosen is actions.get("dist_h"):
             self._distribute_selected_boxes("h")
+        elif chosen is actions.get("delete_selected"):
+            self._delete_selected_paragraphs()
         elif chosen is actions.get("edit_text"):
             self._begin_text_edit(n, span)
         elif chosen is actions.get("edit_para"):
@@ -2669,7 +2681,7 @@ class DocumentView(QWidget):
             # Register INSIDE the op so the snapshot carries content +
             # registry together and undo can never split them (E10).
             before = {(s.text, s.bbox) for s in doc.text_spans(page_index)}
-            doc.insert_runs(page_index, point, runs, align=para.align, pitch=para.pitch)
+            lines = doc.insert_runs(page_index, point, runs, align=para.align, pitch=para.pitch)
             new = [s for s in doc.text_spans(page_index) if (s.text, s.bbox) not in before]
             if new:
                 rect = (
@@ -2678,7 +2690,7 @@ class DocumentView(QWidget):
                     max(s.bbox[2] for s in new),
                     max(s.bbox[3] for s in new),
                 )
-                doc.add_box(page_index, rect, text=para.text)  # copy shares the source text
+                doc.add_box(page_index, rect, text="\n".join(lines))  # VISUAL-line fingerprint
                 created.append(rect)
 
         if not self._push_command("Duplicate text box", op, ("page", page_index)):
@@ -2701,6 +2713,24 @@ class DocumentView(QWidget):
             if x0 <= cx <= x1 and y0 <= cy <= y1:
                 return candidate
         return None
+
+    def _delete_selected_paragraphs(self) -> None:
+        """Delete ALL multi-selected text boxes in ONE undoable command (user
+        request 2026-07-24) — no more one-by-one. Each is redacted with nothing
+        reinserted and its registry box dissolved, like the single-box delete."""
+        members = self._selected_members()
+        if not members:
+            return
+        n = self._current_page
+
+        def op(doc: PdfDocument) -> None:
+            for para in members:
+                box = self._box_for(doc, n, para.bbox, para.text)
+                doc.replace_paragraph(n, para, "")
+                if box is not None:
+                    doc.remove_box(box.id)
+
+        self._push_command("Delete text boxes", op, ("page", n))
 
     def _delete_paragraph_at(self, page_index: int, para) -> None:
         """Context menu: delete a whole text block in one step — the same

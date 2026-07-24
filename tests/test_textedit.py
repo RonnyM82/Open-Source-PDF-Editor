@@ -1614,24 +1614,31 @@ def test_two_overlapping_fingerprint_boxes_keep_their_own_lines(tmp_path):
         assert texts == {"alpha content", "beta content"}
 
 
-def test_fingerprint_matches_a_wrapped_visual_line(tmp_path):
-    """A wrapped box's stored fingerprint is its LOGICAL text; a visual line is
-    a substring after whitespace-normalisation, so ownership still holds."""
+def test_fingerprint_stores_visual_lines_and_matches_them(tmp_path):
+    """A box's fingerprint is its VISUAL lines (task 5, whole-line matching):
+    each laid-out line is stored and owned exactly, and a foreign line whose
+    text merely appears INSIDE a box line is NOT absorbed."""
     path = tmp_path / "wrap.pdf"
     doc = pymupdf.open()
     page = doc.new_page()
-    # Two visual lines that together are one logical sentence.
     page.insert_text((100, 200), "the quick brown", fontname="helv", fontsize=9)
     page.insert_text((100, 212), "fox jumps over", fontname="helv", fontsize=9)
+    page.insert_text((100, 260), "quick", fontname="helv", fontsize=9)  # foreign, substring
     doc.save(str(path))
     doc.close()
 
     with PdfDocument.open(path) as pdoc:
-        rect = (95.0, 195.0, 220.0, 220.0)
-        geo = (rect, "the quick brown fox jumps over")  # logical text (as stored)
+        # Fingerprint = the box's two VISUAL lines (as stored on insert).
+        geo = ((95.0, 195.0, 220.0, 220.0), "the quick brown\nfox jumps over")
         para = pdoc.paragraph_at(0, 150.0, 205.0, boundaries=[geo])
         assert para is not None
-        assert len(para.lines) == 2  # both wrapped lines owned by the one box
+        assert len(para.lines) == 2  # both visual lines owned by the one box
+
+        # A foreign "quick" line under a box covering it is NOT absorbed
+        # (substring of "the quick brown", but not a whole box line).
+        wide = ((95.0, 195.0, 220.0, 265.0), "the quick brown\nfox jumps over")
+        texts = {p.text for p in pdoc.paragraphs(0, boundaries=[wide])}
+        assert "quick" in texts  # stays its own paragraph
 
 
 def test_boundaries_keep_a_genuine_multiline_paragraph_together(tmp_path):
