@@ -461,8 +461,8 @@ def test_link_dialog_validates_and_normalizes_address(qapp):
 
     dlg._uri_edit.setText("livetools.com.au")
     assert ok.isEnabled()
-    assert "http://livetools.com.au" in dlg._uri_hint.text()
-    assert dlg.spec() == {"uri": "http://livetools.com.au"}
+    assert "https://livetools.com.au" in dlg._uri_hint.text()
+    assert dlg.spec() == {"uri": "https://livetools.com.au"}
 
     dlg._uri_edit.setText("https://example.com")
     assert ok.isEnabled() and dlg._uri_hint.text() == ""

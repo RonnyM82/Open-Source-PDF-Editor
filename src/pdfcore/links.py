@@ -198,7 +198,7 @@ def normalize_uri(text: str | None) -> str | None:
         local, _, host = t.rpartition("@")
         return f"mailto:{t}" if local and "." in host else None
     if "." in t.strip("."):
-        return "http://" + t  # bare host / host+path
+        return "https://" + t  # bare host / host+path — https, http is deprecated
     return None
 
 

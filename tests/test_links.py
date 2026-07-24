@@ -396,7 +396,7 @@ def test_detect_urls_finds_and_normalizes(tmp_path):
     assert found == {
         "https://example.com/quote",
         "mailto:rep@example.com",
-        "http://www.foo.org",
+        "https://www.foo.org",
     }
 
 
@@ -432,6 +432,51 @@ def test_link_detected_urls_two_in_one_paragraph(tmp_path):
         assert "one.example" in blue and "two.example" in blue
 
 
+def test_detected_url_styles_only_its_own_line(tmp_path):
+    """A URL in a tightly-set block must not colour the lines above and below it.
+
+    User report: auto-detect got the clickable area right but styled the phone
+    number and ABN line around the URL. Lines set tighter than their font
+    metrics overlap, so assigning a selection rect to a line by y-OVERLAP
+    matched the neighbours too; each rect must own exactly ONE line.
+    """
+    p = tmp_path / "block.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=320, height=220)
+    for i, line in enumerate(["+61 2 5550 0100", "www.example.com", "ABN: 53 000 000 770"]):
+        pg.insert_text((30, 60 + i * 13), line, fontname="helv", fontsize=11)  # tight leading
+    d.save(str(p))
+    d.close()
+    out = tmp_path / "block_linked.pdf"
+    with PdfDocument.open(p) as doc:
+        assert doc.link_detected_urls(0, style=True) == 1
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        blue = "".join(s.text for s in doc.text_spans(0) if s.color == links.WORD_LINK_BLUE)
+        assert "example.com" in blue
+        assert "5550" not in blue and "ABN" not in blue  # neighbours untouched
+
+
+def test_style_selection_does_not_bleed_to_adjacent_lines(tmp_path):
+    """The same guarantee at the engine level, on a tight three-line paragraph."""
+    p = tmp_path / "tight.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=320, height=220)
+    for i, line in enumerate(["alpha one", "bravo two", "charlie three"]):
+        pg.insert_text((30, 60 + i * 13), line, fontname="helv", fontsize=11)
+    d.save(str(p))
+    d.close()
+    with PdfDocument.open(p) as doc:
+        words = doc._doc[0].get_text("words")  # noqa: SLF001 - test rig
+        bravo = [w for w in words if w[4] == "bravo"][0]
+        rect = (bravo[0], bravo[1], bravo[2], bravo[3])
+        para = doc.paragraphs(0)[0]
+        doc.style_paragraph_selection(0, para, [rect], color=links.WORD_LINK_BLUE)
+        blue = "".join(s.text for s in doc.text_spans(0) if s.color == links.WORD_LINK_BLUE)
+        assert "bravo" in blue
+        assert "alpha" not in blue and "charlie" not in blue
+
+
 def test_link_detected_urls_none(tmp_path):
     src = _urls_pdf(tmp_path, ["nothing to see here"])
     with PdfDocument.open(src) as doc:
@@ -449,8 +494,8 @@ def test_link_detected_urls_none(tmp_path):
         ("http://www.x.com", "http://www.x.com"),
         ("mailto:a@b.com", "mailto:a@b.com"),
         ("tel:+123", "tel:+123"),
-        ("www.example.com", "http://www.example.com"),
-        ("livetools.com.au", "http://livetools.com.au"),
+        ("www.example.com", "https://www.example.com"),
+        ("livetools.com.au", "https://livetools.com.au"),
         ("a@b.com", "mailto:a@b.com"),
         ("asdf", None),
         ("h5 candidates", None),
@@ -472,7 +517,7 @@ def test_add_link_normalizes_scheme_less_address(text_pdf, tmp_path):
         doc.save(out)
     got = _links(out)[0]
     assert got.kind == links.URI and got.editable
-    assert got.uri == "http://livetools.com.au"
+    assert got.uri == "https://livetools.com.au"
 
 
 def test_add_link_refuses_unusable_address(text_pdf):
@@ -511,7 +556,7 @@ def test_broken_launch_link_can_be_moved_and_repaired(text_pdf, tmp_path):
         current = doc.links(0)[0]
         doc.update_link(0, current.xref, uri="www.broken.com")  # re-target repairs it
         fixed = doc.links(0)[0]
-        assert fixed.kind == links.URI and fixed.uri == "http://www.broken.com"
+        assert fixed.kind == links.URI and fixed.uri == "https://www.broken.com"
 
 
 _SAMPLE_QUOTE = Path("samples/sample_quote.pdf")
@@ -521,5 +566,7 @@ _SAMPLE_QUOTE = Path("samples/sample_quote.pdf")
 def test_detect_urls_on_real_sample():
     with PdfDocument.open(_SAMPLE_QUOTE) as doc:
         found = {d.uri for d in doc.detect_urls(0)}
+    # The sample's text already carries a scheme, so it passes through as-is
+    # (only a scheme-LESS address gets the https default).
     assert "http://www.example.com" in found
     assert "mailto:rep@example.com" in found

@@ -1897,13 +1897,30 @@ def _selection_runs(
 ) -> list[StyledRun]:
     """Rebuild ``para`` as runs, with the words covered by ``line_rects`` given
     ``color`` + ``underline`` and everything else keeping its original style."""
+    # Assign each selection rect to exactly ONE line — the one whose y-range its
+    # centre is nearest. A plain y-overlap test leaks: real documents set lines
+    # tighter than their font metrics (the sample quote's lines overlap by
+    # 2.39 pt), so a rect would match its neighbours too and style the words
+    # above and below it at the same x (user report: auto-detect coloured the
+    # phone number and ABN line around a URL).
+    owner: dict[int, list[tuple[float, float]]] = {}
+    for rect in line_rects:
+        centre_y = (rect[1] + rect[3]) / 2
+        best, best_dist = None, float("inf")
+        for i, line in enumerate(para.lines):
+            ly0 = min(s.bbox[1] for s in line)
+            ly1 = max(s.bbox[3] for s in line)
+            dist = 0.0 if ly0 <= centre_y <= ly1 else min(abs(centre_y - ly0), abs(centre_y - ly1))
+            if dist < best_dist:
+                best, best_dist = i, dist
+        if best is not None:
+            owner.setdefault(best, []).append((rect[0], rect[2]))
+
     runs: list[StyledRun] = []
     for i, line in enumerate(para.lines):
         if i:
             runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
-        ly0 = min(s.bbox[1] for s in line)
-        ly1 = max(s.bbox[3] for s in line)
-        x_ranges = [(r[0], r[2]) for r in line_rects if r[1] < ly1 and r[3] > ly0]
+        x_ranges = owner.get(i, [])
         for span in line:
             base = TextStyle(
                 code=span.base14 or "helv",

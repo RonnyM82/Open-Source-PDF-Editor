@@ -224,6 +224,11 @@ class DocumentView(QWidget):
         for overlay in (self._editor, self._para_editor):
             overlay.committed.connect(lambda _text: self.editorClosed.emit())
             overlay.cancelled.connect(self.editorClosed)
+            # Chrome re-syncs when an editor closes: the Hyperlink command is
+            # disabled while one is open (signal-to-signal — a lambda calling
+            # .emit() here raises a PySide6 "Unknown return type").
+            overlay.committed.connect(self.stateChanged)
+            overlay.cancelled.connect(self.stateChanged)
         self._pending_paragraph: tuple[int, Paragraph] | None = None
         self._pending_insert: tuple[int, tuple[float, float]] | None = None
         # Review comments (E11): pending create (page, rect, callout target),
@@ -955,6 +960,7 @@ class DocumentView(QWidget):
         base_font = self._editor_font_for(span)
         self._editor.open_pieces(rect, self._pieces_from_span(span), base_font, select_all=True)
         self._edit_open_sig = self._pieces_signature(self._editor)
+        self.stateChanged.emit()  # the Hyperlink command greys out while editing
 
     def _char_format_for(self, span: TextSpan | Paragraph) -> QTextCharFormat:
         """A char format visually AND semantically matching an extracted span.
@@ -1274,6 +1280,7 @@ class DocumentView(QWidget):
         )
         self._edit_open_sig = self._pieces_signature(self._para_editor)
         self.editWarning.emit("Editing paragraph — Ctrl+Enter applies, Esc cancels.")
+        self.stateChanged.emit()  # the Hyperlink command greys out while editing
 
     # --- armed click actions: insert text/image, highlight (E5/E6/E7) ------
     def begin_insert_text(self) -> None:
@@ -1570,12 +1577,20 @@ class DocumentView(QWidget):
 
     def _paragraph_style_editable(self, n: int, para, line_rects) -> bool:
         """Can the selected text be recoloured in place? Only when it resolves to
-        ONE non-embedded, unrotated paragraph fully containing the selection."""
+        ONE non-embedded, unrotated paragraph that owns the selection.
+
+        Ownership is tested on each rect's CENTRE, not its whole box: word boxes
+        routinely overhang a paragraph's span-derived bbox by a point or two, and
+        the old strict-containment test failed on that — dropping every manual
+        link into the fallback, which underlines without recolouring (user
+        report: "creating the hyperlink underlines the text, but doesn't colour
+        it", while auto-detect — which never had this check — coloured fine).
+        """
         if para is None or any(s.rotation != 0 or s.embedded for s in para.spans):
             return False
         px0, py0, px1, py1 = para.bbox
         return all(
-            px0 - 2 <= x0 and x1 <= px1 + 2 and py0 - 2 <= y0 and y1 <= py1 + 2
+            px0 - 2 <= (x0 + x1) / 2 <= px1 + 2 and py0 - 2 <= (y0 + y1) / 2 <= py1 + 2
             for x0, y0, x1, y1 in line_rects
         )
 
@@ -3315,6 +3330,17 @@ class DocumentView(QWidget):
         if self._para_editor.is_editing:
             return self._para_editor
         return None
+
+    @property
+    def editor_open(self) -> bool:
+        """True while an in-place text editor is open.
+
+        The Hyperlink tool works on PAGE text (it needs page-space rects to
+        place the annotation), so it cannot act on a selection inside the rich
+        editor. Rather than look enabled and do nothing, the command is disabled
+        while an editor is open (user report).
+        """
+        return self.open_rich_editor() is not None
 
     def apply_format_to_editor(self, fmt: QTextCharFormat) -> bool:
         """Merge a char format into the open editor's selection. False = no

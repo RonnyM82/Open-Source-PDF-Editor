@@ -1818,6 +1818,10 @@ class MainWindow(QMainWindow):
         self._insert_text_action.setChecked(armed == "text")
         self._insert_image_action.setChecked(armed == "image")
         self._hyperlink_action.setChecked(armed in ("hyperlink", "link"))
+        # Works on PAGE text, so it can't act on a selection inside an open
+        # in-place editor — disabled rather than inert (user report).
+        if has and view.editor_open:
+            self._hyperlink_action.setEnabled(False)
         self._highlight_action.setChecked(armed == "highlight")
         self._insert_comment_action.setChecked(armed == "comment")
         self._insert_callout_action.setChecked(armed in ("callout_target", "callout_box"))
