@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from pdfcore.links import GOTO, LinkInfo
+from pdfcore.links import GOTO, LinkInfo, normalize_uri
 
 
 class LinkDialog(QDialog):
@@ -58,10 +58,17 @@ class LinkDialog(QDialog):
 
         form = QFormLayout()
         self._uri_edit = QLineEdit()
-        self._uri_edit.setPlaceholderText("https://example.com  or  mailto:name@example.com")
+        self._uri_edit.setPlaceholderText("https://example.com  or  name@example.com")
         self._uri_edit.setMinimumWidth(340)
         form.addRow(QLabel("Address:"), self._uri_edit)
         layout.addLayout(form)
+        # Live feedback: shows what will actually be stored (a scheme is added
+        # for you), or why the address can't be used. Without this the dialog
+        # happily wrote scheme-less text, which PDF stores as a broken
+        # file-LAUNCH action whose target is lost.
+        self._uri_hint = QLabel("")
+        self._uri_hint.setWordWrap(True)
+        layout.addWidget(self._uri_hint)
 
         layout.addWidget(self._page_radio)
         page_form = QFormLayout()
@@ -111,23 +118,37 @@ class LinkDialog(QDialog):
         uri_mode = self._uri_mode()
         self._uri_edit.setEnabled(uri_mode)
         self._page_spin.setEnabled(not uri_mode)
+        typed = self._uri_edit.text().strip()
+        normalized = normalize_uri(typed) if uri_mode else None
+        if not uri_mode or not typed:
+            self._uri_hint.setText("")
+        elif normalized is None:
+            self._uri_hint.setText("That isn't a usable web or email address.")
+        elif normalized != typed:
+            self._uri_hint.setText(f"Will be saved as: {normalized}")
+        else:
+            self._uri_hint.setText("")
         ok = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok is not None:
-            ok.setEnabled(not uri_mode or bool(self._uri_edit.text().strip()))
+            ok.setEnabled(not uri_mode or normalized is not None)
 
     def _on_remove(self) -> None:
         self.removed = True
         self.accept()
 
     def _on_accept(self) -> None:
-        if self._uri_mode() and not self._uri_edit.text().strip():
-            return  # OK is disabled in this state, but guard the Enter key too
+        # OK is disabled for an unusable address, but guard the Enter key too.
+        if self._uri_mode() and normalize_uri(self._uri_edit.text()) is None:
+            return
         self.accept()
 
     def spec(self) -> dict:
-        """Engine kwargs for the chosen target (call only on a non-removed OK)."""
+        """Engine kwargs for the chosen target (call only on a non-removed OK).
+
+        The address is normalized (a missing scheme is added) so the engine
+        never receives text that PDF would store as a broken launch action."""
         if self._uri_mode():
-            return {"uri": self._uri_edit.text().strip()}
+            return {"uri": normalize_uri(self._uri_edit.text()) or ""}
         return {"dest_page": self._page_spin.value() - 1}
 
     def style_as_hyperlink(self) -> bool:

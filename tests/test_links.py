@@ -439,6 +439,81 @@ def test_link_detected_urls_none(tmp_path):
         assert doc.links(0) == []
 
 
+# --- address normalization + repairing broken links ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("https://x.com", "https://x.com"),
+        ("http://www.x.com", "http://www.x.com"),
+        ("mailto:a@b.com", "mailto:a@b.com"),
+        ("tel:+123", "tel:+123"),
+        ("www.example.com", "http://www.example.com"),
+        ("livetools.com.au", "http://livetools.com.au"),
+        ("a@b.com", "mailto:a@b.com"),
+        ("asdf", None),
+        ("h5 candidates", None),
+        ("", None),
+        ("   ", None),
+        ("@nohost", None),
+    ],
+)
+def test_normalize_uri(typed, expected):
+    assert links.normalize_uri(typed) == expected
+
+
+def test_add_link_normalizes_scheme_less_address(text_pdf, tmp_path):
+    """A scheme-less address must NOT become a broken file-LAUNCH action
+    (MuPDF classifies by the URI string; the target is lost on read-back)."""
+    out = tmp_path / "normalized.pdf"
+    with PdfDocument.open(text_pdf) as doc:
+        doc.add_link(0, (20, 40, 200, 60), uri="livetools.com.au")
+        doc.save(out)
+    got = _links(out)[0]
+    assert got.kind == links.URI and got.editable
+    assert got.uri == "http://livetools.com.au"
+
+
+def test_add_link_refuses_unusable_address(text_pdf):
+    with PdfDocument.open(text_pdf) as doc:
+        with pytest.raises(ValueError):
+            doc.add_link(0, (20, 40, 200, 60), uri="h5 candidates")
+
+
+def test_resize_preserves_a_valid_uri_link(links_pdf, tmp_path):
+    """A geometry-only edit must keep the target verbatim."""
+    out = tmp_path / "resized_keeps.pdf"
+    with PdfDocument.open(links_pdf.path) as doc:
+        uri = next(i for i in doc.links(0) if i.kind == links.URI)
+        doc.resize_link(0, uri.xref, (60, 90, 300, 130))
+        doc.save(out)
+    got = next(i for i in _links(out) if i.kind == links.URI)
+    assert got.uri == links_pdf.uri  # unchanged target
+    assert got.bbox == pytest.approx((60, 90, 300, 130), abs=0.5)
+
+
+def test_broken_launch_link_can_be_moved_and_repaired(text_pdf, tmp_path):
+    """The links a scheme-less address already produced must be fixable: their
+    area can be redefined, and re-targeting them restores a real URI link."""
+    broken = tmp_path / "broken.pdf"
+    d = pymupdf.open(str(text_pdf))
+    d[0].insert_link(
+        {"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(20, 120, 200, 140), "uri": "www.broken.com"}
+    )
+    d.save(str(broken))
+    d.close()
+
+    with PdfDocument.open(broken) as doc:
+        bad = doc.links(0)[0]
+        assert not bad.editable and bad.uri is None  # the damage this caused
+        doc.resize_link(0, bad.xref, (30, 130, 260, 155))  # redefine area works
+        current = doc.links(0)[0]
+        doc.update_link(0, current.xref, uri="www.broken.com")  # re-target repairs it
+        fixed = doc.links(0)[0]
+        assert fixed.kind == links.URI and fixed.uri == "http://www.broken.com"
+
+
 _SAMPLE_QUOTE = Path("samples/sample_quote.pdf")
 
 

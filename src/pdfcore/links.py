@@ -176,6 +176,43 @@ def _clamp_rect(
     return (x0, y0, x1, y1)
 
 
+def normalize_uri(text: str | None) -> str | None:
+    """User input → a real URI target, or None when it can't be one.
+
+    LOAD-BEARING: MuPDF decides a link's KIND by parsing the URI string, and a
+    string with no scheme is stored as a file-LAUNCH action whose target is
+    then lost (probe: "www.example.com" reads back kind=launch, uri=None). So
+    every address is given a scheme before it is written — ``www.x.com`` and
+    ``x.com`` become ``http://…``, a bare address becomes ``mailto:…`` — and
+    anything that still isn't a plausible target is REFUSED rather than
+    silently written as a broken launch action.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if "://" in t or t.lower().startswith(("mailto:", "tel:")):
+        return t  # already carries a scheme
+    if " " in t:
+        return None  # nonsense — never a valid address
+    if "@" in t:
+        local, _, host = t.rpartition("@")
+        return f"mailto:{t}" if local and "." in host else None
+    if "." in t.strip("."):
+        return "http://" + t  # bare host / host+path
+    return None
+
+
+def _prepare_uri(uri: str | None) -> str:
+    """Normalize a URI for writing, raising when it can't be made valid."""
+    normalized = normalize_uri(uri)
+    if normalized is None:
+        raise ValueError(
+            f"{uri!r} is not a usable web or email address — try https://example.com "
+            "or name@example.com"
+        )
+    return normalized
+
+
 def _infer_kind(uri: str | None, dest_page: int | None) -> str:
     if uri is not None and dest_page is not None:
         raise ValueError("a link is either a URI or a go-to-page, not both")
@@ -203,7 +240,9 @@ def _write_dict(
     if xref is not None:
         d["xref"] = xref
     if kind == URI:
-        d["uri"] = uri or ""
+        # The ONE place a URI reaches the page — normalized here so no write
+        # path can create a scheme-less (broken launch-action) link.
+        d["uri"] = _prepare_uri(uri)
     else:  # GOTO
         if dest_page is None or not (0 <= dest_page < doc.page_count):
             raise ValueError("the destination page is out of range")
@@ -262,11 +301,17 @@ def _rewrite(
     The caller MUST NOT hold its own reference to the page while calling this:
     ``reload_page`` refuses to evict a page with more than one live Python
     reference, so all geometry (``offset``) is resolved here, not by the caller.
+
+    Works on ANY link kind. A geometry-only change keeps the link's existing
+    target verbatim (its RAW dict, whatever the kind) — moving or resizing a
+    hotspot never needs to understand where it points; a target change REPLACES
+    the destination with a URI/go-to-page, which is equally valid for a link
+    whose old target we could not represent (that is how a broken scheme-less
+    link gets repaired).
     """
     page = doc[page_index]
-    info = _link_info(page_index, page, _find_raw(page, xref))
-    if not info.editable:
-        raise ValueError("this link type can't be edited")
+    raw = _find_raw(page, xref)
+    info = _link_info(page_index, page, raw)
     if offset is not None:
         x0, y0, x1, y1 = info.bbox
         rect = _clamp_rect(page, (x0 + offset[0], y0 + offset[1], x1 + offset[0], y1 + offset[1]))
@@ -274,11 +319,13 @@ def _rewrite(
         rect = _clamp_rect(page, new_rect if new_rect is not None else info.bbox)
     if change_target:
         kind = _infer_kind(uri, dest_page)
-    else:
-        kind, uri, dest_page, dest_point = info.kind, info.uri, info.dest_page, info.dest_point
-    d = _write_dict(
-        doc, rect, kind=kind, uri=uri, dest_page=dest_page, dest_point=dest_point, xref=xref
-    )
+        d = _write_dict(
+            doc, rect, kind=kind, uri=uri, dest_page=dest_page, dest_point=dest_point, xref=xref
+        )
+    else:  # geometry only — preserve the raw target, whatever kind it is
+        d = {k: v for k, v in raw.items() if k != "id"}
+        d["from"] = pymupdf.Rect(rect)
+        d["xref"] = xref
     page.update_link(d)
     _refresh(doc, page_index, page)
 
@@ -473,17 +520,6 @@ class DetectedUrl:
     text: str
 
 
-def _normalize_url(token: str) -> str:
-    low = token.lower()
-    if low.startswith(("http://", "https://", "mailto:")):
-        return token
-    if low.startswith("www."):
-        return "http://" + token
-    if "@" in token:
-        return "mailto:" + token
-    return token
-
-
 def detect_urls(doc: pymupdf.Document, page_index: int) -> list[DetectedUrl]:
     """Every URL/email in page ``n``'s text, as normalized targets + word rects
     (unrotated page points). One hit per word; trailing prose punctuation is
@@ -496,12 +532,15 @@ def detect_urls(doc: pymupdf.Document, page_index: int) -> list[DetectedUrl]:
         core = word.strip().rstrip(_TRAILING)
         if not core or not _URL_RE.fullmatch(core):
             continue
+        uri = normalize_uri(core)  # the same scheme rule every write path uses
+        if uri is None:
+            continue
         rect = (float(x0), float(y0), float(x1), float(y1))
         key = (round(x0, 1), round(y0, 1), core.lower())
         if key in seen:
             continue
         seen.add(key)
-        out.append(DetectedUrl(_normalize_url(core), rect, word))
+        out.append(DetectedUrl(uri, rect, word))
     return out
 
 

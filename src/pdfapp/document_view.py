@@ -1497,11 +1497,12 @@ class DocumentView(QWidget):
         self._push_command("Add link", op, ("page", n))
 
     def _edit_link_at(self, n: int, info: LinkInfo) -> None:
-        """Open the link dialog for an existing link (change target or remove)."""
+        """Open the link dialog for an existing link (change target or remove).
+
+        Works on ANY link kind — editing REPLACES the target, so a link whose
+        old destination we can't represent (e.g. a scheme-less launch action) is
+        repaired rather than refused."""
         if not self._edit_mode:
-            return
-        if not info.editable:
-            self.editWarning.emit("This kind of link can't be edited here.")
             return
         if not self.isVisible():
             return  # offscreen tests drive _commit_update_link / _delete_link_at directly
@@ -2944,8 +2945,9 @@ class DocumentView(QWidget):
         if link is not None:
             if not menu.isEmpty():
                 menu.addSeparator()
-            if link.editable:
-                actions["edit_link"] = menu.addAction(icons.icon("edit_link"), "Edit link…")
+            # Offered for EVERY link kind: editing replaces the target, which is
+            # how a broken (scheme-less, launch-action) link gets repaired.
+            actions["edit_link"] = menu.addAction(icons.icon("edit_link"), "Edit link…")
             actions["open_link"] = menu.addAction(icons.icon("open_link"), "Open link")
             actions["redefine_link"] = menu.addAction(
                 icons.icon("insert_link"), "Redefine clickable area…"

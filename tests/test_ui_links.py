@@ -471,6 +471,28 @@ def test_double_click_linked_text_opens_editor(qapp, tmp_path):
         window.close()
 
 
+def test_link_dialog_validates_and_normalizes_address(qapp):
+    """Nonsense can't be accepted (it would become a broken launch action), and
+    a scheme-less address is normalized rather than written raw."""
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    dlg = LinkDialog(None, page_count=3)
+    ok = dlg._buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+    dlg._uri_edit.setText("h5 candidates")
+    assert not ok.isEnabled()
+    assert "isn't a usable" in dlg._uri_hint.text()
+
+    dlg._uri_edit.setText("livetools.com.au")
+    assert ok.isEnabled()
+    assert "http://livetools.com.au" in dlg._uri_hint.text()
+    assert dlg.spec() == {"uri": "http://livetools.com.au"}
+
+    dlg._uri_edit.setText("https://example.com")
+    assert ok.isEnabled() and dlg._uri_hint.text() == ""
+    assert dlg.spec() == {"uri": "https://example.com"}
+
+
 def test_link_dialog_style_checkbox(qapp):
     create = LinkDialog(None, page_count=3, text_link=True)
     assert create.style_as_hyperlink() is True  # default on
