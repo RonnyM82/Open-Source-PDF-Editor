@@ -138,6 +138,60 @@ def page_marker():
     return _page_marker
 
 
+# A 3-page PDF carrying pre-existing hyperlinks (a URI link and an internal
+# go-to-page link), for the "recognise existing links" read path and edit
+# round-trips. Constants ride the namedtuple (importlib keeps conftest
+# un-importable from test modules). Links must be inserted into a REAL PDF page
+# (insert_link raises on a fresh new_page doc), so the fixture saves a base,
+# reopens it, inserts the links, then saves the final file.
+LinksPDF = namedtuple(
+    "LinksPDF",
+    ["path", "uri", "uri_rect", "goto_page", "goto_rect", "page_count", "text_under_uri"],
+)
+
+
+@pytest.fixture
+def links_pdf(tmp_path) -> LinksPDF:
+    uri = "https://example.com/quote"
+    uri_rect = (72.0, 100.0, 240.0, 118.0)
+    goto_rect = (72.0, 140.0, 240.0, 158.0)
+    goto_page = 2
+    text_under_uri = "Visit our website"
+
+    base = tmp_path / "links_base.pdf"
+    doc = pymupdf.open()
+    for i in range(3):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Links page {i}", fontsize=14)
+        page.insert_text((72, 113), text_under_uri, fontsize=11)  # sits under uri_rect
+        page.insert_text((72, 153), "Jump to the last page", fontsize=11)
+    doc.save(str(base))
+    doc.close()
+
+    doc = pymupdf.open(str(base))
+    doc[0].insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(uri_rect), "uri": uri})
+    doc[0].insert_link(
+        {
+            "kind": pymupdf.LINK_GOTO,
+            "from": pymupdf.Rect(goto_rect),
+            "page": goto_page,
+            "to": pymupdf.Point(0, 0),
+        }
+    )
+    path = tmp_path / "links.pdf"
+    doc.save(str(path))
+    doc.close()
+    return LinksPDF(
+        path=path,
+        uri=uri,
+        uri_rect=uri_rect,
+        goto_page=goto_page,
+        goto_rect=goto_rect,
+        page_count=3,
+        text_under_uri=text_under_uri,
+    )
+
+
 # The generated quote fixture: strings tests locate spans by, plus the table
 # geometry (PDF points) for pixel probes. Threaded through a namedtuple because
 # importlib import mode keeps conftest un-importable from test modules.

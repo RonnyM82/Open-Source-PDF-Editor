@@ -17,6 +17,7 @@ from pdfcore import (
     comments,
     imageedit,
     invoice,
+    links,
     ocr,
     pages,
     textedit,
@@ -27,6 +28,7 @@ from pdfcore.boxregistry import BoxRecord
 from pdfcore.comments import CommentInfo
 from pdfcore.imageedit import ImageInfo
 from pdfcore.invoice import InvoiceExtract
+from pdfcore.links import LinkInfo
 from pdfcore.ocr import OcrWord
 from pdfcore.render import RenderedPage, render_page, render_page_at_dpi
 from pdfcore.textedit import Paragraph, StyledRun, TextSpan, TextStyle
@@ -506,6 +508,54 @@ class PdfDocument:
     def set_comments_hidden(self, hidden: bool) -> int:
         """Hide/show all comments (the print path's no-print mechanism)."""
         return comments.set_comments_hidden(self._doc, hidden)
+
+    # --- hyperlinks (link annotations) -------------------------------------
+    def links(self, n: int) -> list[LinkInfo]:
+        """Every link on page ``n`` (unrotated page coordinates)."""
+        return links.links_on_page(self._doc, n)
+
+    def link_at(self, n: int, px: float, py: float) -> LinkInfo | None:
+        """The link under an unrotated page point on page ``n``, or None."""
+        return links.link_at(self._doc, n, px, py)
+
+    def add_link(
+        self,
+        n: int,
+        rect: tuple[float, float, float, float],
+        *,
+        uri: str | None = None,
+        dest_page: int | None = None,
+        dest_point: tuple[float, float] | None = None,
+    ) -> int:
+        """Create a link over ``rect``. Exactly one of ``uri`` (web/email) or
+        ``dest_page`` (go-to-page) must be given. Returns the new link's xref."""
+        return links.add_link(
+            self._doc, n, rect, uri=uri, dest_page=dest_page, dest_point=dest_point
+        )
+
+    def update_link(
+        self,
+        n: int,
+        xref: int,
+        *,
+        uri: str | None = None,
+        dest_page: int | None = None,
+        dest_point: tuple[float, float] | None = None,
+    ) -> None:
+        """Change where a link points (rect unchanged). URI ↔ go-to-page allowed."""
+        links.update_link(self._doc, n, xref, uri=uri, dest_page=dest_page, dest_point=dest_point)
+
+    def move_link(self, n: int, xref: int, offset: tuple[float, float]) -> None:
+        """Translate a link's rectangle by ``offset`` (unrotated page points)."""
+        links.move_link(self._doc, n, xref, offset)
+
+    def resize_link(self, n: int, xref: int, new_rect: tuple[float, float, float, float]) -> None:
+        """Resize a link's rectangle to ``new_rect`` (unrotated page points)."""
+        links.resize_link(self._doc, n, xref, new_rect)
+
+    def delete_link(self, n: int, xref: int) -> None:
+        """Remove the link with ``xref`` on page ``n`` (any kind)."""
+        links.delete_link(self._doc, n, xref)
 
     # --- snapshots (Phase 2 undo) ----------------------------------------
     def snapshot(self) -> bytes:

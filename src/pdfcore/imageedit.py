@@ -81,6 +81,7 @@ def _remove_image(
     MOVE, callout targets on the image follow it) via the comment guard.
     """
     from pdfcore import comments as comments_module
+    from pdfcore import links as links_module
 
     page = doc[page_index]
     x0, y0, x1, y1 = target.bbox
@@ -92,6 +93,7 @@ def _remove_image(
         if redact_rect.intersects(pymupdf.Rect(other.bbox)):
             raise ValueError(f"Another image overlaps this one — {verb} it would destroy both.")
     comment_guard = comments_module.guard(doc, page_index, moved=moved)
+    link_guard = links_module.guard(doc, page_index, moved=moved)
     page.add_redact_annot(redact_rect)
     page.apply_redactions(
         images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
@@ -99,6 +101,7 @@ def _remove_image(
         text=pymupdf.PDF_REDACT_TEXT_NONE,
     )
     comment_guard.restore()
+    link_guard.restore()
 
 
 def replace_image(

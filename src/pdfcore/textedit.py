@@ -638,16 +638,19 @@ def replace_span_runs(
     if rotation is None:  # BEFORE any mutation — the band would be wrong
         raise ValueError("this text is rotated at an unsupported angle")
     from pdfcore import comments as comments_module
+    from pdfcore import links as links_module
 
     page = doc[page_index]
     band = _redact_band(span)
     foreign = _capture_foreign_spans(doc, page_index, [band], [span.bbox])
     comment_guard = comments_module.guard(doc, page_index)
+    link_guard = links_module.guard(doc, page_index)
     page.add_redact_annot(band, fill=fill)
     _apply_text_only_redactions(page)
     _repair_foreign_spans(doc, page_index, foreign, [span.bbox])
     _remove_member_rules(page, [span])
     comment_guard.restore()
+    link_guard.restore()
 
     lines = _layout_runs(runs, None)
     fragments = lines[0] if lines else []
@@ -1818,21 +1821,21 @@ def replace_paragraph_runs(
                             )
 
     from pdfcore import comments as comments_module
+    from pdfcore import links as links_module
 
     bands = [_redact_band(span) for span in para.spans]
     member_bboxes = [span.bbox for span in para.spans]
     foreign = _capture_foreign_spans(doc, page_index, bands, member_bboxes)
-    comment_guard = comments_module.guard(
-        doc,
-        page_index,
-        moved=(para.bbox, offset[0], offset[1]) if offset != (0.0, 0.0) else None,
-    )
+    moved = (para.bbox, offset[0], offset[1]) if offset != (0.0, 0.0) else None
+    comment_guard = comments_module.guard(doc, page_index, moved=moved)
+    link_guard = links_module.guard(doc, page_index, moved=moved)
     for band in bands:
         page.add_redact_annot(band, fill=fill)
     _apply_text_only_redactions(page)
     _repair_foreign_spans(doc, page_index, foreign, member_bboxes)
     _remove_member_rules(page, para.spans)
     comment_guard.restore()
+    link_guard.restore()
     new_bbox = None
     if has_text:
         for i, line in enumerate(lines):
