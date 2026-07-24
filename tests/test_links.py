@@ -7,6 +7,8 @@ assertion especially misleading.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pymupdf
 import pytest
 
@@ -362,3 +364,87 @@ def test_style_selection_no_underline(tmp_path):
     with PdfDocument.open(out) as doc:
         green = [s for s in doc.text_spans(0) if s.color == 0x008000]
         assert green and not any(s.underline for s in green)
+
+
+# --- URL auto-detection (H3) --------------------------------------------------
+
+
+def _urls_pdf(tmp_path, lines):
+    p = tmp_path / "urls.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=520, height=320)
+    y = 80
+    for line in lines:
+        pg.insert_text((50, y), line, fontname="helv", fontsize=11)
+        y += 30
+    d.save(str(p))
+    d.close()
+    return p
+
+
+def test_detect_urls_finds_and_normalizes(tmp_path):
+    src = _urls_pdf(
+        tmp_path,
+        [
+            "Visit https://example.com/quote today.",
+            "Email rep@example.com or see www.foo.org",
+            "Plain text with no links at all here",
+        ],
+    )
+    with PdfDocument.open(src) as doc:
+        found = {d.uri for d in doc.detect_urls(0)}
+    assert found == {
+        "https://example.com/quote",
+        "mailto:rep@example.com",
+        "http://www.foo.org",
+    }
+
+
+def test_detect_urls_trims_trailing_punctuation(tmp_path):
+    src = _urls_pdf(tmp_path, ["See https://example.com/page, thanks."])
+    with PdfDocument.open(src) as doc:
+        found = [d.uri for d in doc.detect_urls(0)]
+    assert found == ["https://example.com/page"]  # the comma is trimmed
+
+
+def test_link_detected_urls_styles_and_links(tmp_path):
+    src = _urls_pdf(tmp_path, ["Visit https://example.com/quote today."])
+    out = tmp_path / "detected.pdf"
+    with PdfDocument.open(src) as doc:
+        assert doc.link_detected_urls(0, style=True) == 1
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        assert doc.links(0)[0].uri == "https://example.com/quote"
+        assert any(s.color == links.WORD_LINK_BLUE and s.underline for s in doc.text_spans(0))
+
+
+def test_link_detected_urls_two_in_one_paragraph(tmp_path):
+    # Two URLs on one line share a paragraph — both must be styled (grouped) and
+    # both linked, despite the same paragraph being restyled only once.
+    src = _urls_pdf(tmp_path, ["a https://one.example and b https://two.example end"])
+    out = tmp_path / "two.pdf"
+    with PdfDocument.open(src) as doc:
+        assert doc.link_detected_urls(0, style=True) == 2
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        assert {i.uri for i in doc.links(0)} == {"https://one.example", "https://two.example"}
+        blue = "".join(s.text for s in doc.text_spans(0) if s.color == links.WORD_LINK_BLUE)
+        assert "one.example" in blue and "two.example" in blue
+
+
+def test_link_detected_urls_none(tmp_path):
+    src = _urls_pdf(tmp_path, ["nothing to see here"])
+    with PdfDocument.open(src) as doc:
+        assert doc.link_detected_urls(0) == 0
+        assert doc.links(0) == []
+
+
+_SAMPLE_QUOTE = Path("samples/sample_quote.pdf")
+
+
+@pytest.mark.skipif(not _SAMPLE_QUOTE.exists(), reason="samples/sample_quote.pdf is local-only")
+def test_detect_urls_on_real_sample():
+    with PdfDocument.open(_SAMPLE_QUOTE) as doc:
+        found = {d.uri for d in doc.detect_urls(0)}
+    assert "http://www.example.com" in found
+    assert "mailto:rep@example.com" in found

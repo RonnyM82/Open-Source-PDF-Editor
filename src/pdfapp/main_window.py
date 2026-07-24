@@ -347,6 +347,11 @@ class MainWindow(QMainWindow):
         self._extract_text_action = QAction("Extract &text…", self)
         self._extract_text_action.triggered.connect(self.extract_text)
 
+        # Tools → Detect & link URLs: a CONTENT op (styles + links text), so
+        # edit-mode gated.
+        self._detect_links_action = QAction("&Detect && link URLs…", self)
+        self._detect_links_action.triggered.connect(self.detect_links)
+
         # Edit → Find (SR2): the other READ feature — never edit-gated.
         # Search is ALWAYS case-insensitive (by design; no toggle exists).
         self._find_action = QAction("&Find…", self)
@@ -434,6 +439,7 @@ class MainWindow(QMainWindow):
             self._dblclick_para_action: "dblclick_paragraph",
             self._gestures_action: "help",
             self._extract_text_action: "extract_text",
+            self._detect_links_action: "detect_links",
             self._find_action: "search",
             self._undo_action: "undo",
             self._redo_action: "redo",
@@ -484,6 +490,9 @@ class MainWindow(QMainWindow):
             self._insert_action: "Insert pages from another PDF",
             self._gestures_action: "Every editing gesture on one page",
             self._extract_text_action: "Extract the document's text (OCR for scanned pages)",
+            self._detect_links_action: (
+                "Find web/email addresses in the text and turn them into styled hyperlinks"
+            ),
             self._find_action: "Find in document (Ctrl+F)",
             self._insert_text_action: "Insert text — then click the page to place it",
             self._insert_image_action: "Insert an image — then click the page to place it",
@@ -570,6 +579,7 @@ class MainWindow(QMainWindow):
         # future additions use this handle instead.
         self._tools_menu = self.menuBar().addMenu("&Tools")
         self._tools_menu.addAction(self._extract_text_action)
+        self._tools_menu.addAction(self._detect_links_action)
 
         # Lists the open document TABS of THIS window (populated by
         # _rebuild_window_menu). Named "Documents", not "Window": with File →
@@ -1615,6 +1625,12 @@ class MainWindow(QMainWindow):
         if view is not None:
             view.open_search()
 
+    def detect_links(self):
+        """Tools → Detect & link URLs: find web/email addresses and style+link
+        them across the document (edit mode). Delegated to the active view."""
+        if (v := self.active_view) is not None:
+            v.detect_and_link_urls()
+
     def extract_text(self):
         """Tools → Extract text (X2: whole document by default, per-page
         native/OCR routing, cancellable progress). Returns the dialog;
@@ -1838,6 +1854,7 @@ class MainWindow(QMainWindow):
         # read-only — deliberately NOT in _page_edit_actions.
         self._extract_text_action.setEnabled(has)
         self._find_action.setEnabled(has)
+        self._detect_links_action.setEnabled(has and edit_on)  # a content op
 
         self._thumbs_action.setEnabled(has)
         self._thumbs_action.blockSignals(True)

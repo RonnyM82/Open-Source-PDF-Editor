@@ -100,6 +100,7 @@ _NAMES = {
     "align_right": "mdi6.format-align-right",
     # Tools
     "extract_text": "mdi6.text-box-search-outline",
+    "detect_links": "mdi6.web",
     # Search (SR2)
     "search": "mdi6.magnify",
     "search_prev": "mdi6.chevron-up",

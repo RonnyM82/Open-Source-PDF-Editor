@@ -600,6 +600,15 @@ class PdfDocument:
         text that can't be recoloured in place)."""
         links.underline_rects(self._doc, n, rects, color=color)
 
+    def detect_urls(self, n: int) -> list[links.DetectedUrl]:
+        """Every URL/email in page ``n``'s text (normalized target + word rect)."""
+        return links.detect_urls(self._doc, n)
+
+    def link_detected_urls(self, n: int, *, style: bool = True) -> int:
+        """Turn every URL/email on page ``n`` into a styled hyperlink; returns
+        how many were linked."""
+        return links.link_detected_urls(self._doc, n, style=style)
+
     # --- snapshots (Phase 2 undo) ----------------------------------------
     def snapshot(self) -> bytes:
         """Serialized current state — transient, for undo; not archival.

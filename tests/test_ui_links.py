@@ -479,3 +479,62 @@ def test_link_dialog_style_checkbox(qapp):
     info = links.LinkInfo(0, 7, links.URI, (10, 10, 100, 40), uri="https://x")
     editing = LinkDialog(None, page_count=3, initial=info, text_link=True)
     assert editing.style_as_hyperlink() is False  # not offered when editing
+
+
+# --- auto-detect URLs (H3) ----------------------------------------------------
+
+
+def _urls_doc(tmp_path, line="Visit https://example.com/quote and rep@example.com"):
+    base = tmp_path / "urls.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=520, height=300)
+    pg.insert_text((50, 90), line, fontname="helv", fontsize=11)
+    d.save(str(base))
+    d.close()
+    return base
+
+
+def test_detect_links_action_enabled_only_in_edit_mode(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_urls_doc(tmp_path))
+        view = window.active_view
+        window._sync_chrome()
+        assert not window._detect_links_action.isEnabled()  # markup
+        view.set_edit_mode(True)
+        window._sync_chrome()
+        assert window._detect_links_action.isEnabled()
+    finally:
+        window.close()
+
+
+def test_detect_and_link_urls_creates_styled_links_and_undo(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_urls_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.detect_links()  # offscreen: skips the confirm, links directly
+        got = {i.uri for i in view.document.links(0)}
+        assert got == {"https://example.com/quote", "mailto:rep@example.com"}
+        assert any(s.color == links.WORD_LINK_BLUE for s in view.document.text_spans(0))
+        assert view.dirty
+        view.undo_stack.undo()
+        assert view.document.links(0) == []
+    finally:
+        window.close()
+
+
+def test_detect_and_link_urls_none_reports(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path, "no addresses in this text at all"))
+        view = window.active_view
+        view.set_edit_mode(True)
+        warnings = []
+        view.editWarning.connect(warnings.append)
+        view.detect_and_link_urls()
+        assert view.document.links(0) == []
+        assert warnings and "no web" in warnings[-1].lower()
+    finally:
+        window.close()

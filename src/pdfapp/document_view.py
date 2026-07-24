@@ -1632,6 +1632,33 @@ class DocumentView(QWidget):
         self._pending_redefine = (n, info.xref)
         self._canvas.arm_link_rect("Draw the link's new clickable area · Esc cancels")
 
+    def detect_and_link_urls(self) -> None:
+        """Find every web/email address in the document's text and turn it into
+        a styled hyperlink (one undo step). Edit mode only; confirms first."""
+        if not self._edit_mode:
+            self.editWarning.emit("Switch to Edit mode to detect and link URLs.")
+            return
+        total = sum(len(self._doc.detect_urls(n)) for n in range(self._doc.page_count))
+        if total == 0:
+            self.editWarning.emit("No web or email addresses found in the text.")
+            return
+        if self.isVisible():
+            resp = QMessageBox.question(
+                self,
+                "Detect links",
+                f"Found {total} web/email address(es).\n\n"
+                "Turn them into hyperlinks, styled blue with an underline?",
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        counts: list[int] = []
+
+        def op(doc: PdfDocument) -> None:
+            counts.append(sum(doc.link_detected_urls(n, style=True) for n in range(doc.page_count)))
+
+        if self._push_command("Detect links", op, ("all", -1)):
+            self.editWarning.emit(f"Linked {counts[0]} web/email address(es).")
+
     def set_highlight_color(self, rgb: tuple[float, float, float] | None) -> None:
         """Set the highlighter colour for subsequent highlights ((r,g,b) 0-1 or
         None for the engine's default yellow). Driven by the Annotate toolbar."""

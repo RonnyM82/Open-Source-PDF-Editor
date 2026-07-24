@@ -30,6 +30,7 @@ Two probe-verified 1.28.0 facts drive this module:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pymupdf
@@ -447,3 +448,105 @@ def guard(
 ) -> _LinkGuard:
     """Snapshot links before a redaction-based op; call ``.restore()`` after."""
     return _LinkGuard(doc, page_index, moved)
+
+
+# --- URL auto-detection -------------------------------------------------------
+
+# A token IS a web/email address (matched whole, after trailing punctuation is
+# trimmed). Kept deliberately simple — the detector links only confident hits.
+_URL_RE = re.compile(
+    r"(?:https?://|www\.)\S+"  # http(s):// or www.
+    r"|mailto:\S+"  # explicit mailto:
+    r"|[\w.+-]+@[\w-]+\.[\w.-]+",  # bare email
+    re.IGNORECASE,
+)
+# Punctuation commonly trailing a URL in prose, trimmed before matching/linking.
+_TRAILING = ".,;:!?)]}>\"'"
+
+
+@dataclass(frozen=True)
+class DetectedUrl:
+    """A URL/email found in page text: its normalized target and word rect."""
+
+    uri: str
+    rect: tuple[float, float, float, float]
+    text: str
+
+
+def _normalize_url(token: str) -> str:
+    low = token.lower()
+    if low.startswith(("http://", "https://", "mailto:")):
+        return token
+    if low.startswith("www."):
+        return "http://" + token
+    if "@" in token:
+        return "mailto:" + token
+    return token
+
+
+def detect_urls(doc: pymupdf.Document, page_index: int) -> list[DetectedUrl]:
+    """Every URL/email in page ``n``'s text, as normalized targets + word rects
+    (unrotated page points). One hit per word; trailing prose punctuation is
+    trimmed from the target (the rect keeps the whole word — harmless)."""
+    page = doc[page_index]
+    out: list[DetectedUrl] = []
+    seen: set[tuple] = set()
+    for w in page.get_text("words"):
+        x0, y0, x1, y1, word = w[0], w[1], w[2], w[3], w[4]
+        core = word.strip().rstrip(_TRAILING)
+        if not core or not _URL_RE.fullmatch(core):
+            continue
+        rect = (float(x0), float(y0), float(x1), float(y1))
+        key = (round(x0, 1), round(y0, 1), core.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(DetectedUrl(_normalize_url(core), rect, word))
+    return out
+
+
+def _para_style_editable(para) -> bool:
+    return bool(para.spans) and all(s.rotation == 0 and not s.embedded for s in para.spans)
+
+
+def _rect_in_para(rect: tuple[float, float, float, float], para) -> bool:
+    px0, py0, px1, py1 = para.bbox
+    return px0 - 2 <= rect[0] and rect[2] <= px1 + 2 and py0 - 2 <= rect[1] and rect[3] <= py1 + 2
+
+
+def link_detected_urls(
+    doc: pymupdf.Document,
+    page_index: int,
+    *,
+    style: bool = True,
+    color: int = WORD_LINK_BLUE,
+) -> int:
+    """Find URLs/emails on page ``n`` and turn them into hyperlinks — recoloured
+    + underlined where the text is editable, an additive underline otherwise.
+    Returns how many were linked.
+
+    Paragraphs are styled ONCE with all their URL rects (a second restyle would
+    use a stale Paragraph); links are added AFTER all styling (which redacts).
+    """
+    from pdfcore import textedit
+
+    detected = detect_urls(doc, page_index)
+    if not detected:
+        return 0
+    if style:
+        groups: dict[tuple, tuple] = {}  # paragraph identity -> (para, [rects])
+        for du in detected:
+            cx, cy = (du.rect[0] + du.rect[2]) / 2, (du.rect[1] + du.rect[3]) / 2
+            para = textedit.paragraph_at(doc, page_index, cx, cy)
+            if para is not None and _para_style_editable(para) and _rect_in_para(du.rect, para):
+                entry = groups.setdefault((para.bbox, para.text), (para, []))
+                entry[1].append(du.rect)
+            else:  # not recolourable — draw the fallback underline now
+                underline_rects(doc, page_index, [du.rect], color=WORD_LINK_BLUE_RGB)
+        for para, rects in groups.values():
+            textedit.style_paragraph_selection(
+                doc, page_index, para, rects, color=color, underline=True
+            )
+    for du in detected:
+        add_link_rects(doc, page_index, [du.rect], uri=du.uri)
+    return len(detected)
