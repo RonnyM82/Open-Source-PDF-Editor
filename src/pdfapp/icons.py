@@ -67,6 +67,7 @@ _NAMES = {
     "insert_comment": "mdi6.comment-plus-outline",
     "insert_callout": "mdi6.comment-arrow-left-outline",
     "insert_link": "mdi6.link-plus",
+    "link_text": "mdi6.link-variant-plus",
     "edit_link": "mdi6.link-edit",
     "open_link": "mdi6.open-in-new",
     "remove_link": "mdi6.link-off",

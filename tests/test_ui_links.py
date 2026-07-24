@@ -338,3 +338,144 @@ def test_insert_link_action_enabled_only_in_edit_mode(qapp, links_pdf):
         assert window._insert_link_action.isEnabled()
     finally:
         window.close()
+
+
+# --- Word-style text links (H2) -----------------------------------------------
+
+
+def _paragraph_doc(tmp_path, text="Please click here now"):
+    base = tmp_path / "ptext.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=400, height=300)
+    pg.insert_text((60, 100), text, fontname="helv", fontsize=12)
+    d.save(str(base))
+    d.close()
+    return base
+
+
+def _sel_rect(view, wanted):
+    ws = view.document._doc[0].get_text("words")  # noqa: SLF001 - test rig
+    sel = [w for w in ws if w[4] in wanted]
+    return (
+        min(w[0] for w in sel),
+        min(w[1] for w in sel),
+        max(w[2] for w in sel),
+        max(w[3] for w in sel),
+    )
+
+
+def test_link_text_tool_arms_and_toggles(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.link_text()
+        assert view.armed_action == "link_text"
+        assert window._link_text_action.isChecked()
+        window.link_text()
+        assert view.armed_action is None
+    finally:
+        window.close()
+
+
+def test_link_text_gated_to_edit_mode(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view  # markup
+        view.begin_link_text()
+        assert view.armed_action is None
+    finally:
+        window.close()
+
+
+def test_commit_text_link_styles_and_links(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        rect = _sel_rect(view, {"click", "here"})
+        para = view.document.paragraph_at(0, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+        assert view._paragraph_style_editable(0, para, [rect])
+        view._commit_text_link(0, [rect], para, {"uri": "https://ex.example"}, True)
+        spans = view.document.text_spans(0)
+        assert any(s.color == links.WORD_LINK_BLUE and s.underline for s in spans)
+        assert view.document.links(0)[0].uri == "https://ex.example"
+        # One undo step reverts BOTH the styling and the link.
+        view.undo_stack.undo()
+        assert not any(s.color == links.WORD_LINK_BLUE for s in view.document.text_spans(0))
+        assert view.document.links(0) == []
+    finally:
+        window.close()
+
+
+def test_commit_text_link_fallback_underline(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        warnings = []
+        view.editWarning.connect(warnings.append)
+        rect = _sel_rect(view, {"click", "here"})
+        # para=None forces the fallback (drawn underline, no recolour).
+        view._commit_text_link(0, [rect], None, {"uri": "https://fb.example"}, True)
+        assert view.document.links(0)[0].uri == "https://fb.example"
+        drawings = view.document._doc[0].get_drawings()  # noqa: SLF001
+        assert any(
+            d.get("color") and abs(d["color"][2] - links.WORD_LINK_BLUE_RGB[2]) < 0.05
+            for d in drawings
+        )
+        assert warnings and "underlined" in warnings[-1].lower()
+    finally:
+        window.close()
+
+
+def test_redefine_link_area(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view._commit_add_link(0, (50, 200, 150, 220), {"uri": "https://re.example"})
+        info = view.document.links(0)[0]
+        view._redefine_link_area(0, info)
+        assert view._canvas.link_rect_armed and view._pending_redefine == (0, info.xref)
+        s0 = _scene(view, 0, 200, 240)
+        s1 = _scene(view, 0, 320, 270)
+        view._on_link_rect_selected(s0[0], s0[1], s1[0], s1[1])
+        r = view.document.links(0)[0].bbox
+        assert r[0] == pytest.approx(200, abs=3) and r[2] == pytest.approx(320, abs=3)
+    finally:
+        window.close()
+
+
+def test_double_click_linked_text_opens_editor(qapp, tmp_path):
+    """Linked text stays editable — double-click opens the text/paragraph
+    editor (links are lowest priority), so its style can be changed."""
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        rect = _sel_rect(view, {"click", "here"})
+        para = view.document.paragraph_at(0, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+        view._commit_text_link(0, [rect], para, {"uri": "https://ex.example"}, True)
+        cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+        sx, sy = _scene(view, 0, cx, cy)
+        view._on_point_activated(sx, sy, False)
+        assert view._editor.is_editing or view._para_editor.is_editing
+    finally:
+        window.close()
+
+
+def test_link_dialog_style_checkbox(qapp):
+    create = LinkDialog(None, page_count=3, text_link=True)
+    assert create.style_as_hyperlink() is True  # default on
+    box = LinkDialog(None, page_count=3, text_link=False)
+    assert box.style_as_hyperlink() is False  # no checkbox for a drawn box
+    info = links.LinkInfo(0, 7, links.URI, (10, 10, 100, 40), uri="https://x")
+    editing = LinkDialog(None, page_count=3, initial=info, text_link=True)
+    assert editing.style_as_hyperlink() is False  # not offered when editing

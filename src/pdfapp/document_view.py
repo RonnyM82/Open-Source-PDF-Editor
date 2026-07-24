@@ -241,6 +241,12 @@ class DocumentView(QWidget):
         # A markup-mode plain click on a link opens it — the candidate is set on
         # press and resolved (click vs drag) on release.
         self._pending_link_follow: LinkInfo | None = None
+        # What an armed region selection does: "highlight" (the highlighter) or
+        # "link" (the Word-style Link-text tool). Both reuse arm_region_select.
+        self._region_action = "highlight"
+        # An armed link-rectangle draw that REDEFINES an existing link's area
+        # instead of creating a new one: (page_index, xref) or None.
+        self._pending_redefine: tuple[int, int] | None = None
         # Click-to-select state (U6): ("text"|"image", page, Paragraph|ImageInfo).
         # The canvas only displays the chrome; this is the source of truth.
         self._selection: tuple[str, int, object] | None = None
@@ -1282,11 +1288,25 @@ class DocumentView(QWidget):
         self._canvas.arm_insert_point("Click where the comment should go · Esc cancels")
 
     def begin_insert_link(self) -> None:
-        """Arm the draw-a-rectangle gesture for a NEW hyperlink (edit mode).
-        On release the link dialog opens for the address / destination."""
+        """Arm the draw-a-rectangle gesture for a NEW hyperlink (edit mode) —
+        the tool for images/buttons/blank regions. On release the link dialog
+        opens for the address / destination."""
         if not self._edit_mode or not self._canvas.has_page:
             return
+        self._pending_redefine = None
         self._canvas.arm_link_rect("Drag a rectangle over the area to link · Esc cancels")
+
+    def begin_link_text(self) -> None:
+        """Arm the Word-style Link-text tool (edit mode): select a word (click),
+        a line (triple-click) or a run (drag), then the dialog opens and the
+        text is linked + styled blue/underline. Reuses the region-select
+        machinery, routed to the link flow by ``_region_action``."""
+        if not self._edit_mode or not self._canvas.has_page:
+            return
+        self._region_action = "link"
+        self._canvas.arm_region_select(
+            "Select the text to link: click a word · triple-click a line · drag a run · Esc cancels"
+        )
 
     def begin_insert_callout(self) -> None:
         """Arm a TWO-click callout: first the arrow target, then the box.
@@ -1312,6 +1332,7 @@ class DocumentView(QWidget):
             return
         self._click_action = None
         self._word_click_index = None
+        self._region_action = "highlight"
         self._canvas.arm_region_select(
             "Highlighter on: drag · double-click a word · triple-click a line · Esc to stop",
             sticky=True,
@@ -1319,9 +1340,9 @@ class DocumentView(QWidget):
 
     @property
     def armed_action(self) -> str | None:
-        """The armed one-shot mode: "text" | "image" | "highlight" | "link" | None."""
+        """The armed mode: "text"|"image"|"highlight"|"link_text"|"link"|None."""
         if self._canvas.region_armed:
-            return "highlight"
+            return "link_text" if self._region_action == "link" else "highlight"
         if self._canvas.link_rect_armed:
             return "link"
         if self._canvas.insert_armed and self._click_action is not None:
@@ -1331,6 +1352,8 @@ class DocumentView(QWidget):
     def cancel_armed_mode(self) -> None:
         """Drop any armed one-shot mode (Esc, mode exit, toolbar re-click)."""
         self._click_action = None
+        self._region_action = "highlight"
+        self._pending_redefine = None
         self._canvas.disarm_insert_point()
         self._canvas.disarm_region_select()
         self._canvas.disarm_link_rect()
@@ -1343,6 +1366,9 @@ class DocumentView(QWidget):
         double-click) highlights just the WORD under the point — Qt suppresses
         the trailing double-click, so double-clicking a word lands on the word.
         """
+        if self._region_action == "link":  # the Word-style Link-text tool
+            self._on_link_region_selected(sx0, sy0, sx1, sy1)
+            return
         n = self._current_page
         ax, ay = self._scene_point_to_page(sx0, sy0, n)
         bx, by = self._scene_point_to_page(sx1, sy1, n)
@@ -1441,6 +1467,19 @@ class DocumentView(QWidget):
         if (x1 - x0) < 4.0 and (y1 - y0) < 4.0:
             self.editWarning.emit("Draw a rectangle over the area you want to link.")
             return
+        if self._pending_redefine is not None:  # replacing an existing link's area
+            rn, xref = self._pending_redefine
+            self._pending_redefine = None
+            if rn != n:
+                self.editWarning.emit("Redraw the area on the link's own page.")
+                return
+            rect = (x0, y0, x1, y1)
+
+            def op(doc: PdfDocument) -> None:
+                doc.resize_link(n, xref, rect)
+
+            self._push_command("Redefine link area", op, ("page", n))
+            return
         self._create_link_dialog(n, (x0, y0, x1, y1))
 
     def _create_link_dialog(self, n: int, rect: tuple[float, float, float, float]) -> None:
@@ -1505,6 +1544,93 @@ class DocumentView(QWidget):
         if info.kind == links.GOTO and info.dest_page is not None:
             return f"page {info.dest_page + 1}"
         return "link"
+
+    # --- Word-style link-text tool ----------------------------------------
+    def _on_link_region_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
+        """Resolve the Link-text tool's selection (word/line/run) to per-line
+        rects, then link + style them."""
+        n = self._current_page
+        ax, ay = self._scene_point_to_page(sx0, sy0, n)
+        bx, by = self._scene_point_to_page(sx1, sy1, n)
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        lines = self._page_text_lines()
+        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click / triple-click
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            region = None
+            if self._canvas.region_click_count >= 3:
+                region = textselect.line_region_at(lines, cx, cy)
+            if not region:
+                region = textselect.word_region_at(lines, cx, cy)
+        else:  # a drag window
+            region = textselect.words_in_rect(lines, (x0, y0, x1, y1))
+        if not region:
+            self.editWarning.emit("No text there to link.")
+            return
+        self._create_text_link(n, textselect.region_rects(region))
+
+    def _paragraph_style_editable(self, n: int, para, line_rects) -> bool:
+        """Can the selected text be recoloured in place? Only when it resolves to
+        ONE non-embedded, unrotated paragraph fully containing the selection."""
+        if para is None or any(s.rotation != 0 or s.embedded for s in para.spans):
+            return False
+        px0, py0, px1, py1 = para.bbox
+        return all(
+            px0 - 2 <= x0 and x1 <= px1 + 2 and py0 - 2 <= y0 and y1 <= py1 + 2
+            for x0, y0, x1, y1 in line_rects
+        )
+
+    def _create_text_link(
+        self, n: int, line_rects: list[tuple[float, float, float, float]]
+    ) -> None:
+        cx = (line_rects[0][0] + line_rects[0][2]) / 2
+        cy = (line_rects[0][1] + line_rects[0][3]) / 2
+        para = self._doc.paragraph_at(n, cx, cy)
+        editable = self._paragraph_style_editable(n, para, line_rects)
+        if not self.isVisible():
+            return  # offscreen tests drive _commit_text_link directly
+        dlg = LinkDialog(self, self._doc.page_count, current_page=n, text_link=True)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._commit_text_link(
+            n, line_rects, para if editable else None, dlg.spec(), dlg.style_as_hyperlink()
+        )
+
+    def _commit_text_link(
+        self,
+        n: int,
+        line_rects: list[tuple[float, float, float, float]],
+        para,
+        spec: dict,
+        style: bool,
+    ) -> None:
+        """One undo step: (recolour the selected text OR draw a fallback
+        underline) + create the link(s) over the same rects. ``para`` is None
+        when the text can't be recoloured in place (embedded/rotated/multi-
+        paragraph) — then the fallback underline is drawn."""
+        fell_back: list[bool] = []
+
+        def op(doc: PdfDocument) -> None:
+            if style and para is not None:
+                doc.style_paragraph_selection(
+                    n, para, line_rects, color=links.WORD_LINK_BLUE, underline=True
+                )
+            elif style:
+                doc.underline_rects(n, line_rects)
+                fell_back.append(True)
+            doc.add_link_rects(n, line_rects, **spec)
+
+        if self._push_command("Link text", op, ("page", n)) and fell_back:
+            self.editWarning.emit(
+                "Linked — this text can't be recoloured, so it was underlined instead."
+            )
+
+    def _redefine_link_area(self, n: int, info: LinkInfo) -> None:
+        """Arm a rectangle draw that REPLACES ``info``'s clickable area."""
+        if not self._edit_mode:
+            return
+        self._pending_redefine = (n, info.xref)
+        self._canvas.arm_link_rect("Draw the link's new clickable area · Esc cancels")
 
     def set_highlight_color(self, rgb: tuple[float, float, float] | None) -> None:
         """Set the highlighter colour for subsequent highlights ((r,g,b) 0-1 or
@@ -2794,6 +2920,9 @@ class DocumentView(QWidget):
             if link.editable:
                 actions["edit_link"] = menu.addAction(icons.icon("edit_link"), "Edit link…")
             actions["open_link"] = menu.addAction(icons.icon("open_link"), "Open link")
+            actions["redefine_link"] = menu.addAction(
+                icons.icon("insert_link"), "Redefine clickable area…"
+            )
             actions["remove_link"] = menu.addAction(icons.icon("remove_link"), "Remove link")
         if menu.isEmpty():  # page background
             actions["insert_text"] = menu.addAction(icons.icon("insert_text"), "Insert text here")
@@ -2848,6 +2977,8 @@ class DocumentView(QWidget):
             self._edit_link_at(n, link)
         elif chosen is actions.get("open_link"):
             self._follow_link(link)
+        elif chosen is actions.get("redefine_link"):
+            self._redefine_link_area(n, link)
         elif chosen is actions.get("remove_link"):
             self._delete_link_at(n, link.xref)
         elif chosen is actions.get("insert_text"):

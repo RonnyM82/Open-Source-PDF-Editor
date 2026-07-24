@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -38,6 +39,7 @@ class LinkDialog(QDialog):
         *,
         initial: LinkInfo | None = None,
         current_page: int = 0,
+        text_link: bool = False,
     ) -> None:
         super().__init__(parent)
         editing = initial is not None
@@ -68,6 +70,13 @@ class LinkDialog(QDialog):
         self._page_spin.setValue(min(self._page_count, current_page + 1))
         page_form.addRow(QLabel("Page:"), self._page_spin)
         layout.addLayout(page_form)
+
+        # For a link OVER TEXT (not a drawn box), offer the Word-style look.
+        self._style_check: QCheckBox | None = None
+        if text_link and not editing:
+            self._style_check = QCheckBox("Style text as a hyperlink (blue + underline)")
+            self._style_check.setChecked(True)
+            layout.addWidget(self._style_check)
 
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -120,3 +129,7 @@ class LinkDialog(QDialog):
         if self._uri_mode():
             return {"uri": self._uri_edit.text().strip()}
         return {"dest_page": self._page_spin.value() - 1}
+
+    def style_as_hyperlink(self) -> bool:
+        """Whether to give the linked TEXT the blue-underline look (text links)."""
+        return self._style_check is not None and self._style_check.isChecked()
