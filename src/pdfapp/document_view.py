@@ -1575,24 +1575,34 @@ class DocumentView(QWidget):
             return f"page {info.dest_page + 1}"
         return "link"
 
-    def _paragraph_style_editable(self, n: int, para, line_rects) -> bool:
-        """Can the selected text be recoloured in place? Only when it resolves to
-        ONE non-embedded, unrotated paragraph that owns the selection.
+    def _style_block_reason(self, n: int, para, line_rects) -> str | None:
+        """Why the selected text can't be recoloured in place, or None if it can.
 
-        Ownership is tested on each rect's CENTRE, not its whole box: word boxes
-        routinely overhang a paragraph's span-derived bbox by a point or two, and
-        the old strict-containment test failed on that — dropping every manual
-        link into the fallback, which underlines without recolouring (user
-        report: "creating the hyperlink underlines the text, but doesn't colour
-        it", while auto-detect — which never had this check — coloured fine).
+        The caller turns this into a plain-words message instead of silently
+        underlining and leaving the user to wonder (user report). Embedded fonts
+        are the common case: a Word/browser export embeds its own subset, which
+        the editor deliberately never re-renders in a substitute font.
         """
-        if para is None or any(s.rotation != 0 or s.embedded for s in para.spans):
-            return False
+        if para is None:
+            return "it isn't a single editable block of text"
+        if any(s.embedded for s in para.spans):
+            return "it uses an embedded font (typical of Word or browser exports)"
+        if any(s.rotation != 0 for s in para.spans):
+            return "it is rotated"
         px0, py0, px1, py1 = para.bbox
-        return all(
+        # Ownership is tested on each rect's CENTRE, not its whole box: word
+        # boxes routinely overhang a paragraph's span-derived bbox by a point or
+        # two, and a strict-containment test failed on that.
+        if not all(
             px0 - 2 <= (x0 + x1) / 2 <= px1 + 2 and py0 - 2 <= (y0 + y1) / 2 <= py1 + 2
             for x0, y0, x1, y1 in line_rects
-        )
+        ):
+            return "the selection covers more than one block of text"
+        return None
+
+    def _paragraph_style_editable(self, n: int, para, line_rects) -> bool:
+        """True when the selection can be recoloured in place."""
+        return self._style_block_reason(n, para, line_rects) is None
 
     def _create_text_link(
         self, n: int, line_rects: list[tuple[float, float, float, float]]
@@ -1600,14 +1610,19 @@ class DocumentView(QWidget):
         cx = (line_rects[0][0] + line_rects[0][2]) / 2
         cy = (line_rects[0][1] + line_rects[0][3]) / 2
         para = self._doc.paragraph_at(n, cx, cy)
-        editable = self._paragraph_style_editable(n, para, line_rects)
+        reason = self._style_block_reason(n, para, line_rects)
         if not self.isVisible():
             return  # offscreen tests drive _commit_text_link directly
         dlg = LinkDialog(self, self._doc.page_count, current_page=n, text_link=True)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._commit_text_link(
-            n, line_rects, para if editable else None, dlg.spec(), dlg.style_as_hyperlink()
+            n,
+            line_rects,
+            para if reason is None else None,
+            dlg.spec(),
+            dlg.style_as_hyperlink(),
+            reason=reason,
         )
 
     def _commit_text_link(
@@ -1617,11 +1632,13 @@ class DocumentView(QWidget):
         para,
         spec: dict,
         style: bool,
+        reason: str | None = None,
     ) -> None:
         """One undo step: (recolour the selected text OR draw a fallback
         underline) + create the link(s) over the same rects. ``para`` is None
         when the text can't be recoloured in place (embedded/rotated/multi-
-        paragraph) — then the fallback underline is drawn."""
+        paragraph) — then the fallback underline is drawn and ``reason`` says
+        WHY, so the fallback is never silent."""
         fell_back: list[bool] = []
 
         def op(doc: PdfDocument) -> None:
@@ -1635,8 +1652,9 @@ class DocumentView(QWidget):
             doc.add_link_rects(n, line_rects, **spec)
 
         if self._push_command("Link text", op, ("page", n)) and fell_back:
+            because = f" because {reason}" if reason else ""
             self.editWarning.emit(
-                "Linked — this text can't be recoloured, so it was underlined instead."
+                f"Linked, and underlined — but the text couldn't be coloured blue{because}."
             )
 
     # --- Hyperlink tool gestures (flow run / rectangle) --------------------
