@@ -253,3 +253,112 @@ def test_links_follow_page_reorder(links_pdf, tmp_path):
         assert len(links.links_on_page(doc, 2)) == 2  # links rode along to index 2
     finally:
         doc.close()
+
+
+# --- styled text links (H1) ---------------------------------------------------
+
+
+def _paragraph_pdf(tmp_path, text="Please click here now"):
+    p = tmp_path / "para.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=400, height=300)
+    pg.insert_text((60, 100), text, fontname="helv", fontsize=12)
+    d.save(str(p))
+    d.close()
+    return p
+
+
+def _word_rect(doc, wanted):
+    ws = doc._doc[0].get_text("words")  # noqa: SLF001 - test rig
+    sel = [w for w in ws if w[4] in wanted]
+    return (
+        min(w[0] for w in sel),
+        min(w[1] for w in sel),
+        max(w[2] for w in sel),
+        max(w[3] for w in sel),
+    )
+
+
+def test_word_link_blue_is_office_hyperlink():
+    assert links.WORD_LINK_BLUE == 0x0563C1
+
+
+def test_add_link_rects_multi_line_one_target(text_pdf, tmp_path):
+    out = tmp_path / "multi.pdf"
+    rects = [(60, 100, 300, 116), (60, 120, 300, 136), (60, 140, 300, 156)]
+    with PdfDocument.open(text_pdf) as doc:
+        xrefs = doc.add_link_rects(0, rects, uri="https://multi.example")
+        assert len(xrefs) == 3
+        doc.save(out)
+    got = _links(out)
+    assert len(got) == 3
+    assert {i.uri for i in got} == {"https://multi.example"}
+
+
+def test_underline_rects_draws_blue_and_keeps_links(tmp_path):
+    src = _paragraph_pdf(tmp_path)
+    out = tmp_path / "ul.pdf"
+    with PdfDocument.open(src) as doc:
+        rect = _word_rect(doc, {"click", "here"})
+        doc.underline_rects(0, [rect])
+        doc.add_link_rects(0, [rect], uri="https://ul.example")
+        doc.save(out)
+    doc = pymupdf.open(str(out))
+    try:
+        blues = [
+            d
+            for d in doc[0].get_drawings()
+            if d.get("color") and abs(d["color"][2] - links.WORD_LINK_BLUE_RGB[2]) < 0.05
+        ]
+        assert blues, "no blue underline drawn"
+        assert doc[0].get_links(), "fallback link missing"
+    finally:
+        doc.close()
+
+
+def test_style_selection_recolors_only_selected(tmp_path):
+    src = _paragraph_pdf(tmp_path)
+    out = tmp_path / "styled.pdf"
+    with PdfDocument.open(src) as doc:
+        rect = _word_rect(doc, {"click", "here"})
+        para = doc.paragraphs(0)[0]
+        doc.style_paragraph_selection(0, para, [rect], color=links.WORD_LINK_BLUE)
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        spans = doc.text_spans(0)
+        blue = [s for s in spans if s.color == links.WORD_LINK_BLUE]
+        assert blue and all(s.underline for s in blue)
+        joined = "".join(s.text for s in blue)
+        assert "click" in joined and "here" in joined
+        # The rest of the paragraph keeps its original black, un-underlined style.
+        black = [s for s in spans if s.color == 0]
+        assert black and not any(s.underline for s in black)
+        assert "Please" in "".join(s.text for s in black)
+
+
+def test_style_selection_then_link_round_trip(tmp_path):
+    src = _paragraph_pdf(tmp_path)
+    out = tmp_path / "styled_link.pdf"
+    with PdfDocument.open(src) as doc:
+        rect = _word_rect(doc, {"click", "here"})
+        para = doc.paragraphs(0)[0]
+        doc.style_paragraph_selection(0, para, [rect], color=links.WORD_LINK_BLUE)
+        doc.add_link_rects(0, [rect], uri="https://styled.example")
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        assert any(s.color == links.WORD_LINK_BLUE for s in doc.text_spans(0))
+        got = doc.links(0)
+        assert got and got[0].uri == "https://styled.example"
+
+
+def test_style_selection_no_underline(tmp_path):
+    src = _paragraph_pdf(tmp_path)
+    out = tmp_path / "nounderline.pdf"
+    with PdfDocument.open(src) as doc:
+        rect = _word_rect(doc, {"click", "here"})
+        para = doc.paragraphs(0)[0]
+        doc.style_paragraph_selection(0, para, [rect], color=0x008000, underline=False)
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        green = [s for s in doc.text_spans(0) if s.color == 0x008000]
+        assert green and not any(s.underline for s in green)

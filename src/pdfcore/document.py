@@ -28,7 +28,7 @@ from pdfcore.boxregistry import BoxRecord
 from pdfcore.comments import CommentInfo
 from pdfcore.imageedit import ImageInfo
 from pdfcore.invoice import InvoiceExtract
-from pdfcore.links import LinkInfo
+from pdfcore.links import WORD_LINK_BLUE, WORD_LINK_BLUE_RGB, LinkInfo
 from pdfcore.ocr import OcrWord
 from pdfcore.render import RenderedPage, render_page, render_page_at_dpi
 from pdfcore.textedit import Paragraph, StyledRun, TextSpan, TextStyle
@@ -299,6 +299,23 @@ class PdfDocument:
             self._doc, n, para, runs, fill=fill, offset=offset, width=width, align=align
         )
 
+    def style_paragraph_selection(
+        self,
+        n: int,
+        para: Paragraph,
+        line_rects: list[tuple[float, float, float, float]],
+        *,
+        color: int = WORD_LINK_BLUE,
+        underline: bool = True,
+    ) -> textedit.ParagraphReplaceResult:
+        """Recolour + optionally underline the words of ``para`` covered by
+        ``line_rects`` (per-line selection rects), leaving the rest untouched.
+        Used to give linked text the classic blue-underline look; the caller
+        restricts it to editable (non-embedded, unrotated) paragraphs."""
+        return textedit.style_paragraph_selection(
+            self._doc, n, para, line_rects, color=color, underline=underline
+        )
+
     def insert_runs(
         self,
         n: int,
@@ -556,6 +573,32 @@ class PdfDocument:
     def delete_link(self, n: int, xref: int) -> None:
         """Remove the link with ``xref`` on page ``n`` (any kind)."""
         links.delete_link(self._doc, n, xref)
+
+    def add_link_rects(
+        self,
+        n: int,
+        rects: list[tuple[float, float, float, float]],
+        *,
+        uri: str | None = None,
+        dest_page: int | None = None,
+        dest_point: tuple[float, float] | None = None,
+    ) -> list[int]:
+        """Create one link per rect (a multi-line text link), all sharing the
+        same target. Returns the new links' xrefs."""
+        return links.add_link_rects(
+            self._doc, n, rects, uri=uri, dest_page=dest_page, dest_point=dest_point
+        )
+
+    def underline_rects(
+        self,
+        n: int,
+        rects: list[tuple[float, float, float, float]],
+        *,
+        color: tuple[float, float, float] = WORD_LINK_BLUE_RGB,
+    ) -> None:
+        """Draw additive underlines under each rect (the fallback link style for
+        text that can't be recoloured in place)."""
+        links.underline_rects(self._doc, n, rects, color=color)
 
     # --- snapshots (Phase 2 undo) ----------------------------------------
     def snapshot(self) -> bytes:

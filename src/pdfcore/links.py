@@ -57,6 +57,11 @@ EDITABLE_KINDS = (URI, GOTO)
 # Smallest side a link rectangle may have (points).
 _MIN_LINK_SIDE = 4.0
 
+# The default "classic hyperlink" colour — Word's hyperlink blue (#0563C1),
+# as an sRGB int for TextStyle.color and an (r, g, b) 0-1 tuple for drawn rules.
+WORD_LINK_BLUE = 0x0563C1
+WORD_LINK_BLUE_RGB = (0x05 / 255, 0x63 / 255, 0xC1 / 255)
+
 
 @dataclass(frozen=True)
 class LinkInfo:
@@ -321,6 +326,56 @@ def delete_link(doc: pymupdf.Document, page_index: int, xref: int) -> None:
     page = doc[page_index]
     page.delete_link(_find_raw(page, xref))
     _refresh(doc, page_index, page)
+
+
+def add_link_rects(
+    doc: pymupdf.Document,
+    page_index: int,
+    rects: list[tuple[float, float, float, float]],
+    *,
+    uri: str | None = None,
+    dest_page: int | None = None,
+    dest_point: tuple[float, float] | None = None,
+) -> list[int]:
+    """Create one link per rect, all sharing the same target — a multi-line
+    text link is one annotation per line (how real PDFs do it). Rects too small
+    to form a valid area are skipped. Returns the new links' xrefs."""
+    kind = _infer_kind(uri, dest_page)
+    page = doc[page_index]
+    before = {int(lk.get("xref", 0)) for lk in page.get_links()}
+    for rect in rects:
+        try:
+            r = _clamp_rect(page, rect)
+        except ValueError:
+            continue
+        page.insert_link(
+            _write_dict(doc, r, kind=kind, uri=uri, dest_page=dest_page, dest_point=dest_point)
+        )
+    page = _refresh(doc, page_index, page)
+    return [
+        int(lk.get("xref", 0)) for lk in page.get_links() if int(lk.get("xref", 0)) not in before
+    ]
+
+
+def underline_rects(
+    doc: pymupdf.Document,
+    page_index: int,
+    rects: list[tuple[float, float, float, float]],
+    *,
+    color: tuple[float, float, float] = WORD_LINK_BLUE_RGB,
+    thickness: float | None = None,
+) -> None:
+    """Draw an ADDITIVE underline near the bottom of each rect (page content,
+    non-destructive). The fallback "link style" for text that can't be
+    recoloured in place (embedded/outline/scanned). Unrotated page points —
+    the stroke rotates with the page like any content."""
+    page = doc[page_index]
+    for x0, y0, x1, y1 in rects:
+        if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+            continue
+        t = thickness if thickness is not None else max(0.6, (y1 - y0) * 0.06)
+        yb = y1 - max(1.0, (y1 - y0) * 0.12)  # just below the text baseline
+        page.draw_line(pymupdf.Point(x0, yb), pymupdf.Point(x1, yb), color=color, width=t)
 
 
 # --- redaction survival guard -------------------------------------------------

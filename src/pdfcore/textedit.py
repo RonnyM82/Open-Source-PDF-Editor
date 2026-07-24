@@ -1857,6 +1857,107 @@ def replace_paragraph_runs(
     )
 
 
+def _split_span_selection(
+    span: TextSpan, x_ranges: list[tuple[float, float]]
+) -> list[tuple[str, bool]]:
+    """Split a span's text into ``(text, selected)`` pieces by whether each
+    word's centre x falls inside one of the selection ranges on its line.
+
+    Word-granular (selections come from whole words); whitespace goes with the
+    word before it, so the underline runs continuously through a selected
+    phrase. Measured with the span's own base-14 metrics (the same the layout
+    uses), so the x-walk matches the on-page glyph positions."""
+    if not x_ranges:
+        return [(span.text, False)]
+    fontname = span.base14 or "helv"
+    x = span.bbox[0]
+    out: list[tuple[str, bool]] = []
+    for token in re.split(r"(\s+)", span.text):
+        if not token:
+            continue
+        width = pymupdf.get_text_length(token, fontname=fontname, fontsize=span.size)
+        centre = x + width / 2
+        # Center-in-range for EVERY token (whitespace included) so the space
+        # inside a selected phrase stays selected — the underline runs
+        # continuously through "click here" rather than breaking at the space.
+        selected = any(a <= centre <= b for a, b in x_ranges)
+        if out and out[-1][1] == selected:
+            out[-1] = (out[-1][0] + token, selected)
+        else:
+            out.append((token, selected))
+        x += width
+    return out
+
+
+def _selection_runs(
+    para: Paragraph,
+    line_rects: list[tuple[float, float, float, float]],
+    color: int,
+    underline: bool,
+) -> list[StyledRun]:
+    """Rebuild ``para`` as runs, with the words covered by ``line_rects`` given
+    ``color`` + ``underline`` and everything else keeping its original style."""
+    runs: list[StyledRun] = []
+    for i, line in enumerate(para.lines):
+        if i:
+            runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
+        ly0 = min(s.bbox[1] for s in line)
+        ly1 = max(s.bbox[3] for s in line)
+        x_ranges = [(r[0], r[2]) for r in line_rects if r[1] < ly1 and r[3] > ly0]
+        for span in line:
+            base = TextStyle(
+                code=span.base14 or "helv",
+                size=span.size,
+                color=span.color,
+                underline=span.underline,
+                strike=span.strike,
+            )
+            for text, selected in _split_span_selection(span, x_ranges):
+                if selected:
+                    runs.append(
+                        StyledRun(
+                            text,
+                            TextStyle(
+                                code=span.base14 or "helv",
+                                size=span.size,
+                                color=color,
+                                underline=underline,
+                                strike=span.strike,
+                            ),
+                        )
+                    )
+                else:
+                    runs.append(StyledRun(text, base))
+    if not runs:
+        runs = [
+            StyledRun(
+                para.text, TextStyle(code=para.base14 or "helv", size=para.size, color=para.color)
+            )
+        ]
+    return runs
+
+
+def style_paragraph_selection(
+    doc: pymupdf.Document,
+    page_index: int,
+    para: Paragraph,
+    line_rects: list[tuple[float, float, float, float]],
+    *,
+    color: int,
+    underline: bool = True,
+) -> ParagraphReplaceResult:
+    """Recolour (and optionally underline) the words of ``para`` covered by
+    ``line_rects`` (per-visual-line selection rects, unrotated page points),
+    leaving the rest of the paragraph's style untouched.
+
+    Reproduces the paragraph in place through the runs engine, so it inherits
+    the runs layout (widths unchanged by colour/underline, so the text does not
+    move). Used to give linked text the classic blue-underline look; the caller
+    restricts it to editable (non-embedded, unrotated) paragraphs."""
+    runs = _selection_runs(para, line_rects, color, underline)
+    return replace_paragraph_runs(doc, page_index, para, runs)
+
+
 def insert_new_text(
     doc: pymupdf.Document,
     page_index: int,
