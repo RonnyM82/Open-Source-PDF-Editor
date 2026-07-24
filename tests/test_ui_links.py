@@ -14,7 +14,7 @@ from pdfapp import page_coords  # noqa: E402
 from pdfapp.link_dialog import LinkDialog  # noqa: E402
 from pdfapp.main_window import MainWindow  # noqa: E402
 from pdfapp.page_geometry import HoverTarget, hover_target  # noqa: E402
-from pdfcore import links  # noqa: E402
+from pdfcore import links, textselect  # noqa: E402
 
 
 def _standalone_link_pdf(tmp_path, rect=(100, 300, 300, 340), uri="https://standalone.example"):
@@ -113,28 +113,30 @@ def test_hover_target_link_is_lowest_priority(qapp, links_pdf, tmp_path):
 # --- create -------------------------------------------------------------------
 
 
-def test_insert_link_arms_and_toggles(qapp, links_pdf):
+def test_hyperlink_tool_arms_and_toggles(qapp, links_pdf):
+    """ONE command now (user report: two near-identical buttons)."""
     window = MainWindow()
     try:
         window.open_path(links_pdf.path)
         view = window.active_view
         view.set_edit_mode(True)
-        window.insert_link()
-        assert view._canvas.link_rect_armed is True
-        assert view.armed_action == "link"
-        window.insert_link()  # clicking the checked action cancels
-        assert view._canvas.link_rect_armed is False
+        window.hyperlink()
+        assert view._canvas.link_armed is True
+        assert view.armed_action == "hyperlink"
+        assert window._hyperlink_action.isChecked()
+        window.hyperlink()  # clicking the checked action cancels
+        assert view._canvas.link_armed is False
     finally:
         window.close()
 
 
-def test_insert_link_gated_to_edit_mode(qapp, links_pdf):
+def test_hyperlink_gated_to_edit_mode(qapp, links_pdf):
     window = MainWindow()
     try:
         window.open_path(links_pdf.path)
         view = window.active_view  # markup mode by default
-        view.begin_insert_link()
-        assert view._canvas.link_rect_armed is False
+        view.begin_hyperlink()
+        assert view._canvas.link_armed is False
     finally:
         window.close()
 
@@ -328,14 +330,14 @@ def test_link_dialog_seeds_from_existing(qapp):
 # --- action enablement --------------------------------------------------------
 
 
-def test_insert_link_action_enabled_only_in_edit_mode(qapp, links_pdf):
+def test_hyperlink_action_enabled_only_in_edit_mode(qapp, links_pdf):
     window = MainWindow()
     try:
         window.open_path(links_pdf.path)
         view = window.active_view
-        assert not window._insert_link_action.isEnabled()  # markup
+        assert not window._hyperlink_action.isEnabled()  # markup
         view.set_edit_mode(True)
-        assert window._insert_link_action.isEnabled()
+        assert window._hyperlink_action.isEnabled()
     finally:
         window.close()
 
@@ -362,32 +364,6 @@ def _sel_rect(view, wanted):
         max(w[2] for w in sel),
         max(w[3] for w in sel),
     )
-
-
-def test_link_text_tool_arms_and_toggles(qapp, tmp_path):
-    window = MainWindow()
-    try:
-        window.open_path(_paragraph_doc(tmp_path))
-        view = window.active_view
-        view.set_edit_mode(True)
-        window.link_text()
-        assert view.armed_action == "link_text"
-        assert window._link_text_action.isChecked()
-        window.link_text()
-        assert view.armed_action is None
-    finally:
-        window.close()
-
-
-def test_link_text_gated_to_edit_mode(qapp, tmp_path):
-    window = MainWindow()
-    try:
-        window.open_path(_paragraph_doc(tmp_path))
-        view = window.active_view  # markup
-        view.begin_link_text()
-        assert view.armed_action is None
-    finally:
-        window.close()
 
 
 def test_commit_text_link_styles_and_links(qapp, tmp_path):
@@ -501,6 +477,133 @@ def test_link_dialog_style_checkbox(qapp):
     info = links.LinkInfo(0, 7, links.URI, (10, 10, 100, 40), uri="https://x")
     editing = LinkDialog(None, page_count=3, initial=info, text_link=True)
     assert editing.style_as_hyperlink() is False  # not offered when editing
+
+
+# --- the merged Hyperlink tool's gestures -------------------------------------
+
+
+def _prose_doc(tmp_path):
+    base = tmp_path / "prose.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=300, height=250)
+    pg.insert_textbox(
+        pymupdf.Rect(30, 40, 270, 200),
+        "First sentence here. Second one runs a bit longer and wraps onto the "
+        "next line properly. Third short one.",
+        fontname="helv",
+        fontsize=11,
+    )
+    d.save(str(base))
+    d.close()
+    return base
+
+
+def _word(view, prefix):
+    for line in view._page_text_lines():
+        for w in line:
+            if w.text.startswith(prefix):
+                return w
+    raise AssertionError(f"{prefix!r} not found")
+
+
+def _word_centre(view, prefix):
+    w = _word(view, prefix)
+    return ((w.bbox[0] + w.bbox[2]) / 2, (w.bbox[1] + w.bbox[3]) / 2)
+
+
+def test_hyperlink_tool_cursor_shows_the_gesture(qapp, tmp_path):
+    """I-beam over text (a drag selects a run), crosshair elsewhere (draws a
+    box) — the user reported no text cursor ever appeared."""
+    from PySide6.QtCore import Qt
+
+    window = MainWindow()
+    try:
+        window.open_path(_prose_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.hyperlink()
+        view._on_hover_moved(*_scene(view, 0, *_word_centre(view, "Second")))
+        assert view._canvas.viewport().cursor().shape() == Qt.CursorShape.IBeamCursor
+        view._on_hover_moved(*_scene(view, 0, 10, 230))  # blank area
+        assert view._canvas.viewport().cursor().shape() == Qt.CursorShape.CrossCursor
+    finally:
+        window.close()
+
+
+def test_hyperlink_drag_selects_a_run_across_a_wrap(qapp, tmp_path):
+    """Dragging a run must select exactly that run — the marquee it replaced
+    dropped edge words (the 'incomplete styling' report)."""
+    window = MainWindow()
+    try:
+        window.open_path(_prose_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.hyperlink()
+        view._on_link_drag_started(*_scene(view, 0, *_word_centre(view, "Second")))
+        assert view._link_mode == "flow"
+        view._on_link_drag_moved(*_scene(view, 0, *_word_centre(view, "properly")))
+        text = textselect.selection_text(view._page_text_lines(), view._link_span)
+        assert text.startswith("Second one runs") and text.endswith("properly.")
+        assert len(view._canvas._text_selection_rects) == 2  # live highlight, per line
+    finally:
+        window.close()
+
+
+def test_hyperlink_triple_click_selects_the_sentence(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(_prose_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.hyperlink()
+        view._link_click_point = _word_centre(view, "wraps")
+        view._apply_link_click(3)
+        assert textselect.selection_text(view._page_text_lines(), view._link_span) == (
+            "Second one runs a bit\nlonger and wraps onto the next line properly."
+        )
+        view._apply_link_click(1)  # a single click takes just the word
+        assert textselect.selection_text(view._page_text_lines(), view._link_span) == "wraps"
+    finally:
+        window.close()
+
+
+def test_hyperlink_over_blank_space_draws_a_rectangle(qapp, tmp_path):
+    """The one command still covers images/buttons: a press off text starts a
+    rectangle instead of a run selection."""
+    window = MainWindow()
+    try:
+        window.open_path(_prose_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.hyperlink()
+        view._on_link_drag_started(*_scene(view, 0, 40, 215))
+        assert view._link_mode == "rect"
+    finally:
+        window.close()
+
+
+def test_hyperlink_run_becomes_a_styled_link(qapp, tmp_path):
+    """End to end: drag a run -> styled blue+underlined link over exactly it."""
+    window = MainWindow()
+    try:
+        window.open_path(_prose_doc(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.hyperlink()
+        view._on_link_drag_started(*_scene(view, 0, *_word_centre(view, "Second")))
+        view._on_link_drag_moved(*_scene(view, 0, *_word_centre(view, "properly")))
+        rects = textselect.selection_rects(view._page_text_lines(), view._link_span)
+        para = view.document.paragraph_at(
+            0, (rects[0][0] + rects[0][2]) / 2, (rects[0][1] + rects[0][3]) / 2
+        )
+        editable = view._paragraph_style_editable(0, para, rects)
+        view._commit_text_link(0, rects, para if editable else None, {"uri": "https://run.x"}, True)
+        assert len(view.document.links(0)) == len(rects)
+        blue = [s for s in view.document.text_spans(0) if s.color == links.WORD_LINK_BLUE]
+        assert blue and all(s.underline for s in blue)
+        assert "Second" in "".join(s.text for s in blue)
+    finally:
+        window.close()
 
 
 # --- auto-detect URLs (H3) ----------------------------------------------------

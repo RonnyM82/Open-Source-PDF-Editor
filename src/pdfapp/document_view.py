@@ -187,6 +187,9 @@ class DocumentView(QWidget):
         self._canvas.backgroundPressed.connect(self._commit_open_editor)
         self._canvas.regionSelected.connect(self._on_region_selected)
         self._canvas.linkRectSelected.connect(self._on_link_rect_selected)
+        self._canvas.linkDragStarted.connect(self._on_link_drag_started)
+        self._canvas.linkDragMoved.connect(self._on_link_drag_moved)
+        self._canvas.linkDragFinished.connect(self._on_link_drag_finished)
         self._canvas.contextMenuRequested.connect(self._on_context_menu)
         self._canvas.hoverMoved.connect(self._on_hover_moved)
         self._canvas.hoverKindChanged.connect(
@@ -241,9 +244,20 @@ class DocumentView(QWidget):
         # A markup-mode plain click on a link opens it — the candidate is set on
         # press and resolved (click vs drag) on release.
         self._pending_link_follow: LinkInfo | None = None
-        # What an armed region selection does: "highlight" (the highlighter) or
-        # "link" (the Word-style Link-text tool). Both reuse arm_region_select.
+        # What an armed region selection does — only "highlight" now (the
+        # Hyperlink tool has its own gesture mode); kept so the highlighter's
+        # dispatch stays explicit.
         self._region_action = "highlight"
+        # Live Hyperlink-tool state: the flow-selection anchor (a textselect
+        # Position) and the current span, plus the deferred-click timer that
+        # lets a 2nd/3rd click arrive before the gesture is treated as final.
+        self._link_anchor = None
+        self._link_span = None
+        self._link_mode = "flow"  # what the live Hyperlink drag is doing
+        self._link_click_timer = QTimer(self)
+        self._link_click_timer.setSingleShot(True)
+        self._link_click_timer.timeout.connect(self._finish_link_click)
+        self._link_click_point: tuple[float, float] | None = None
         # An armed link-rectangle draw that REDEFINES an existing link's area
         # instead of creating a new one: (page_index, xref) or None.
         self._pending_redefine: tuple[int, int] | None = None
@@ -1296,16 +1310,19 @@ class DocumentView(QWidget):
         self._pending_redefine = None
         self._canvas.arm_link_rect("Drag a rectangle over the area to link · Esc cancels")
 
-    def begin_link_text(self) -> None:
-        """Arm the Word-style Link-text tool (edit mode): select a word (click),
-        a line (triple-click) or a run (drag), then the dialog opens and the
-        text is linked + styled blue/underline. Reuses the region-select
-        machinery, routed to the link flow by ``_region_action``."""
+    def begin_hyperlink(self) -> None:
+        """Arm the ONE Hyperlink tool (edit mode, Ctrl+K).
+
+        Over TEXT it selects a run — click a word, triple-click the sentence,
+        or drag; over blank space / an image it draws a rectangle. Either way
+        the link dialog follows, so a single command covers both cases.
+        """
         if not self._edit_mode or not self._canvas.has_page:
             return
-        self._region_action = "link"
-        self._canvas.arm_region_select(
-            "Select the text to link: click a word · triple-click a line · drag a run · Esc cancels"
+        self._clear_link_selection()
+        self._canvas.arm_link(
+            "Hyperlink: drag over text (or click a word · triple-click a sentence), "
+            "or drag a box over an image · Esc cancels"
         )
 
     def begin_insert_callout(self) -> None:
@@ -1340,9 +1357,15 @@ class DocumentView(QWidget):
 
     @property
     def armed_action(self) -> str | None:
-        """The armed mode: "text"|"image"|"highlight"|"link_text"|"link"|None."""
+        """The armed mode: "text"|"image"|"highlight"|"hyperlink"|"link"|None.
+
+        "hyperlink" is the merged tool; "link" is the bare rectangle draw that
+        only "Redefine clickable area" still arms.
+        """
+        if self._canvas.link_armed:
+            return "hyperlink"
         if self._canvas.region_armed:
-            return "link_text" if self._region_action == "link" else "highlight"
+            return "highlight"
         if self._canvas.link_rect_armed:
             return "link"
         if self._canvas.insert_armed and self._click_action is not None:
@@ -1354,9 +1377,11 @@ class DocumentView(QWidget):
         self._click_action = None
         self._region_action = "highlight"
         self._pending_redefine = None
+        self._clear_link_selection()
         self._canvas.disarm_insert_point()
         self._canvas.disarm_region_select()
         self._canvas.disarm_link_rect()
+        self._canvas.disarm_link()
 
     def _on_region_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
         """Highlight everything inside the dragged window (one undo step).
@@ -1366,9 +1391,6 @@ class DocumentView(QWidget):
         double-click) highlights just the WORD under the point — Qt suppresses
         the trailing double-click, so double-clicking a word lands on the word.
         """
-        if self._region_action == "link":  # the Word-style Link-text tool
-            self._on_link_region_selected(sx0, sy0, sx1, sy1)
-            return
         n = self._current_page
         ax, ay = self._scene_point_to_page(sx0, sy0, n)
         bx, by = self._scene_point_to_page(sx1, sy1, n)
@@ -1546,30 +1568,6 @@ class DocumentView(QWidget):
             return f"page {info.dest_page + 1}"
         return "link"
 
-    # --- Word-style link-text tool ----------------------------------------
-    def _on_link_region_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
-        """Resolve the Link-text tool's selection (word/line/run) to per-line
-        rects, then link + style them."""
-        n = self._current_page
-        ax, ay = self._scene_point_to_page(sx0, sy0, n)
-        bx, by = self._scene_point_to_page(sx1, sy1, n)
-        x0, x1 = sorted((ax, bx))
-        y0, y1 = sorted((ay, by))
-        lines = self._page_text_lines()
-        if (x1 - x0) < 2.0 and (y1 - y0) < 2.0:  # a click / triple-click
-            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            region = None
-            if self._canvas.region_click_count >= 3:
-                region = textselect.line_region_at(lines, cx, cy)
-            if not region:
-                region = textselect.word_region_at(lines, cx, cy)
-        else:  # a drag window
-            region = textselect.words_in_rect(lines, (x0, y0, x1, y1))
-        if not region:
-            self.editWarning.emit("No text there to link.")
-            return
-        self._create_text_link(n, textselect.region_rects(region))
-
     def _paragraph_style_editable(self, n: int, para, line_rects) -> bool:
         """Can the selected text be recoloured in place? Only when it resolves to
         ONE non-embedded, unrotated paragraph fully containing the selection."""
@@ -1625,6 +1623,108 @@ class DocumentView(QWidget):
             self.editWarning.emit(
                 "Linked — this text can't be recoloured, so it was underlined instead."
             )
+
+    # --- Hyperlink tool gestures (flow run / rectangle) --------------------
+    def _clear_link_selection(self) -> None:
+        self._link_anchor = None
+        self._link_span = None
+        self._link_click_timer.stop()
+        self._link_click_point = None
+        self._canvas.clear_text_selection()
+
+    def _push_link_selection_chrome(self) -> None:
+        """Live highlight of the run being selected (reuses the X4 chrome)."""
+        n = self._current_page
+        rects = textselect.selection_rects(self._page_text_lines(), self._link_span)
+        zoom = self._canvas.render_zoom
+        rot = self._doc.page_rotation(n)
+        size = self._doc.page_size(n)
+        self._canvas.set_text_selection_rects(
+            [
+                page_coords.page_rect_to_scene(
+                    r, render_zoom=zoom, rotation=rot, page_size_pts=size
+                )
+                for r in rects
+            ]
+        )
+
+    def _on_link_drag_started(self, sx: float, sy: float) -> None:
+        """Hyperlink press: a run selection over TEXT, a rectangle elsewhere."""
+        if not self._edit_mode:
+            return
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        lines = self._page_text_lines()
+        if lines and textselect.word_at(lines, px, py) is not None:
+            self._link_mode = "flow"
+            self._link_anchor = textselect.position_at(lines, px, py)
+            self._link_span = textselect.selection_span(lines, self._link_anchor, self._link_anchor)
+            self._push_link_selection_chrome()
+            self._canvas.begin_link_flow()
+        else:  # blank space or an image — draw the hotspot instead
+            self._link_mode = "rect"
+            self._canvas.begin_link_rect()
+
+    def _on_link_drag_moved(self, sx: float, sy: float) -> None:
+        """Extend the run selection to the cursor and repaint it live."""
+        if self._link_anchor is None:
+            return
+        n = self._current_page
+        px, py = self._scene_point_to_page(sx, sy, n)
+        lines = self._page_text_lines()
+        self._link_span = textselect.selection_span(
+            lines, self._link_anchor, textselect.position_at(lines, px, py)
+        )
+        self._push_link_selection_chrome()
+
+    def _on_link_drag_finished(
+        self, sx0: float, sy0: float, sx1: float, sy1: float, clicks: int
+    ) -> None:
+        n = self._current_page
+        if self._link_mode == "rect":
+            self._canvas.disarm_link()
+            self._on_link_rect_selected(sx0, sy0, sx1, sy1)
+            return
+        ax, ay = self._scene_point_to_page(sx0, sy0, n)
+        bx, by = self._scene_point_to_page(sx1, sy1, n)
+        if abs(bx - ax) >= 2.0 or abs(by - ay) >= 2.0:  # a real drag is final
+            self._link_click_timer.stop()
+            self._commit_link_from_span()
+            return
+        # A CLICK: show the word now, but wait out the double-click interval so
+        # a 2nd/3rd click can still arrive (acting immediately is exactly what
+        # made triple-click impossible before).
+        self._link_click_point = (ax, ay)
+        self._apply_link_click(clicks)
+        self._link_click_timer.start(QApplication.doubleClickInterval() + 20)
+
+    def _apply_link_click(self, clicks: int) -> None:
+        """1-2 clicks select the word, 3+ the whole sentence."""
+        if self._link_click_point is None:
+            return
+        px, py = self._link_click_point
+        lines = self._page_text_lines()
+        span = textselect.sentence_span(lines, px, py) if clicks >= 3 else None
+        if span is None:
+            pos = textselect.word_at(lines, px, py)
+            span = textselect.selection_span(lines, pos, pos) if pos is not None else None
+        self._link_span = span
+        self._push_link_selection_chrome()
+
+    def _finish_link_click(self) -> None:
+        """The click sequence settled — act on the final selection."""
+        self._apply_link_click(self._canvas.link_clicks)
+        self._commit_link_from_span()
+
+    def _commit_link_from_span(self) -> None:
+        n = self._current_page
+        rects = textselect.selection_rects(self._page_text_lines(), self._link_span)
+        self._canvas.disarm_link()
+        self._clear_link_selection()
+        if not rects:
+            self.editWarning.emit("No text there to link.")
+            return
+        self._create_text_link(n, rects)
 
     def _redefine_link_area(self, n: int, info: LinkInfo) -> None:
         """Arm a rectangle draw that REPLACES ``info``'s clickable area."""
@@ -2657,6 +2757,14 @@ class DocumentView(QWidget):
         """Synchronous hover hit-test against the cached page geometry."""
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
+        if self._canvas.link_armed:
+            # The Hyperlink tool shows what a press would start: I-beam over
+            # text (selects a run), crosshair elsewhere (draws a hotspot).
+            lines = self._page_text_lines()
+            self._canvas.set_link_tool_cursor(
+                bool(lines) and textselect.word_at(lines, px, py) is not None
+            )
+            return
         target = hover_target(self.page_geometry(n), px, py)
         over_comment = target is not None and target.kind == "comment"
         # Element hover outline: comments in EITHER mode (markup floats on top),
