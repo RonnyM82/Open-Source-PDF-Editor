@@ -28,10 +28,15 @@ almost always what is wanted.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import pymupdf
 
 from pdfcore.textsource import Word, WordLike, group_lines, page_words
+
+# (line_index, word_index) into a grouped ``lines`` structure — points AT a
+# word. Word-snapped throughout: character precision is out of scope.
+Position = tuple[int, int]
 
 # (line_index, word_index) into a grouped `lines` structure — points AT a word.
 Position = tuple[int, int]
@@ -135,3 +140,172 @@ def page_lines(doc: pymupdf.Document, page_index: int) -> list[list[Word]]:
     is never selectable or copyable.
     """
     return group_lines(page_words(doc, page_index))
+
+
+# --- flow (run) selection ------------------------------------------------------
+#
+# Restored from the pre-marquee engine (X3/X3.1) for the Hyperlink tool ONLY:
+# linking wants "drag a run of prose", which a geometric marquee cannot express
+# (it picks words by their centre, so edge words drop out of the selection).
+# The read-only copy selection deliberately stays a MARQUEE — the model chosen
+# at X3.2 because flow over-reached across a quote's table columns. The two
+# selection models coexist on purpose; do not merge them.
+
+
+@dataclass(frozen=True)
+class Selection:
+    """A normalized flow range: ``start`` <= ``end`` in reading order.
+
+    Both positions are inclusive and point at a word. ``start`` never comes
+    after ``end`` (:func:`selection_span` swaps a backward drag), so callers
+    can iterate ``start[0]`` → ``end[0]`` directly.
+    """
+
+    start: Position
+    end: Position
+
+
+def _line_vdist(line: Sequence[WordLike], py: float) -> float:
+    """Vertical distance from ``py`` to a line's y-extent (0 when inside)."""
+    top = min(w.bbox[1] for w in line)
+    bottom = max(w.bbox[3] for w in line)
+    if py < top:
+        return top - py
+    return py - bottom if py > bottom else 0.0
+
+
+def _word_hdist(word: WordLike, px: float) -> float:
+    """Horizontal distance from ``px`` to a word's x-extent (0 when inside)."""
+    x0, x1 = word.bbox[0], word.bbox[2]
+    if px < x0:
+        return x0 - px
+    return px - x1 if px > x1 else 0.0
+
+
+def position_at(lines: Lines, px: float, py: float) -> Position | None:
+    """Nearest text position to a page point, caret style; None if no words.
+
+    Picks the line by vertical distance, then clamps horizontally to the line's
+    ends — a point left of a line resolves to its first word, right of it to
+    its last. Unlike :func:`word_at` this never returns None for a point that
+    misses every word, which is what lets a drag past the end of a line keep
+    extending the selection.
+    """
+    if not lines:
+        return None
+    line_index = min(range(len(lines)), key=lambda i: _line_vdist(lines[i], py))
+    line = lines[line_index]
+    return (line_index, min(range(len(line)), key=lambda j: _word_hdist(line[j], px)))
+
+
+def _clamp_position(lines: Lines, pos: Position) -> Position:
+    line_index = max(0, min(pos[0], len(lines) - 1))
+    return (line_index, max(0, min(pos[1], len(lines[line_index]) - 1)))
+
+
+def selection_span(
+    lines: Lines, anchor_pos: Position | None, cursor_pos: Position | None
+) -> Selection | None:
+    """The flow range between two positions (None if either is None).
+
+    A backward drag (anchor after cursor) is swapped, so it yields exactly the
+    same selection as the equivalent forward drag.
+    """
+    if anchor_pos is None or cursor_pos is None or not lines:
+        return None
+    start, end = sorted((_clamp_position(lines, anchor_pos), _clamp_position(lines, cursor_pos)))
+    return Selection(start=start, end=end)
+
+
+def _word_range(lines: Lines, span: Selection, line_index: int) -> tuple[int, int]:
+    """Inclusive ``(first, last)`` word indices selected on one line."""
+    last_word = len(lines[line_index]) - 1
+    if span.start[0] == span.end[0]:
+        return (span.start[1], span.end[1])
+    if line_index == span.start[0]:
+        return (span.start[1], last_word)
+    if line_index == span.end[0]:
+        return (0, span.end[1])
+    return (0, last_word)
+
+
+def selection_words(lines: Lines, span: Selection | None) -> Region:
+    """The selected words as a Region (per visual line), so a flow selection
+    feeds the same helpers a marquee Region does."""
+    if span is None:
+        return []
+    out: Region = []
+    for line_index in range(span.start[0], span.end[0] + 1):
+        first, last = _word_range(lines, span, line_index)
+        words = list(lines[line_index][first : last + 1])
+        if words:
+            out.append(words)
+    return out
+
+
+def selection_rects(lines: Lines, span: Selection | None) -> list[Rect]:
+    """Per-line union rects for the selected words (unrotated page points)."""
+    return [_words_bbox(words) for words in selection_words(lines, span)]
+
+
+def selection_text(lines: Lines, span: Selection | None) -> str:
+    """The selected text: words space-joined, lines newline-joined."""
+    return region_text(selection_words(lines, span))
+
+
+# A word ending a sentence (trailing quotes/brackets tolerated).
+_SENTENCE_END = (".", "!", "?")
+# A line gap this much larger than the line height reads as a new paragraph, so
+# a sentence walk never runs out of its own block.
+_PARA_GAP = 1.7
+
+
+def _ends_sentence(word: WordLike) -> bool:
+    return word.text.rstrip("\"')]}").endswith(_SENTENCE_END)
+
+
+def _step(lines: Lines, pos: Position, delta: int) -> Position | None:
+    """The next/previous position in reading-order flow, or None at the ends."""
+    line_index, word_index = pos
+    word_index += delta
+    if 0 <= word_index < len(lines[line_index]):
+        return (line_index, word_index)
+    line_index += delta
+    if not (0 <= line_index < len(lines)) or not lines[line_index]:
+        return None
+    return (line_index, 0 if delta > 0 else len(lines[line_index]) - 1)
+
+
+def _paragraph_break(lines: Lines, a: Position, b: Position) -> bool:
+    """True when two positions sit on lines separated by a paragraph-sized gap."""
+    if a[0] == b[0]:
+        return False
+    first, second = sorted((a[0], b[0]))
+    bottom = max(w.bbox[3] for w in lines[first])
+    top = min(w.bbox[1] for w in lines[second])
+    height = max(w.bbox[3] - w.bbox[1] for w in lines[first]) or 1.0
+    return (top - bottom) > height * _PARA_GAP
+
+
+def sentence_span(lines: Lines, px: float, py: float, pad: float = 1.0) -> Selection | None:
+    """The whole SENTENCE around a point (triple-click), or None if not on a word.
+
+    Walks the reading-order flow out from the hit word — back to just after the
+    previous sentence terminator, forward through the next one — following a
+    sentence across wrapped lines but never across a paragraph break.
+    """
+    pos = word_at(lines, px, py, pad)
+    if pos is None:
+        return None
+    start = pos
+    while (prev := _step(lines, start, -1)) is not None:
+        if _paragraph_break(lines, prev, start) or _ends_sentence(lines[prev[0]][prev[1]]):
+            break
+        start = prev
+    end = pos
+    while not _ends_sentence(lines[end[0]][end[1]]):
+        nxt = _step(lines, end, 1)
+        if nxt is None or _paragraph_break(lines, end, nxt):
+            break
+        end = nxt
+    return Selection(start=start, end=end)

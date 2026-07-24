@@ -14,8 +14,13 @@ from pdfcore.document import PdfDocument
 from pdfcore.textselect import (
     line_region_at,
     page_lines,
+    position_at,
     region_rects,
     region_text,
+    selection_rects,
+    selection_span,
+    selection_text,
+    sentence_span,
     word_at,
     word_region_at,
     words_in_rect,
@@ -148,6 +153,86 @@ def test_comment_text_is_never_selectable(quote_pdf):
         lines = doc.text_lines(0)
     whole_page = words_in_rect(lines, (0, 0, 100000, 100000))
     assert "SECRETNOTE" not in region_text(whole_page)
+
+
+# --- flow (run) selection — the Hyperlink tool's model ------------------------
+
+
+def _prose_lines(tmp_path):
+    """Three sentences, one of which wraps across a line."""
+    p = tmp_path / "prose.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=300, height=250)
+    pg.insert_textbox(
+        pymupdf.Rect(30, 40, 270, 200),
+        "First sentence here. Second one runs a bit longer and wraps onto the "
+        "next line properly. Third short one.",
+        fontname="helv",
+        fontsize=11,
+    )
+    d.save(str(p))
+    d.close()
+    doc = pymupdf.open(str(p))
+    try:
+        return group_lines([w for line in page_lines(doc, 0) for w in line])
+    finally:
+        doc.close()
+
+
+def _pos_of(lines, prefix):
+    for i, line in enumerate(lines):
+        for j, w in enumerate(line):
+            if w.text.startswith(prefix):
+                return (i, j)
+    raise AssertionError(f"{prefix!r} not found")
+
+
+def _centre(lines, pos):
+    w = lines[pos[0]][pos[1]]
+    return ((w.bbox[0] + w.bbox[2]) / 2, (w.bbox[1] + w.bbox[3]) / 2)
+
+
+def test_flow_drag_selects_a_run_across_a_wrap(tmp_path):
+    lines = _prose_lines(tmp_path)
+    span = selection_span(lines, _pos_of(lines, "Second"), _pos_of(lines, "properly"))
+    text = selection_text(lines, span)
+    assert text.startswith("Second one runs")
+    assert text.endswith("properly.")
+    assert len(selection_rects(lines, span)) == 2  # one rect per visual line
+
+
+def test_flow_drag_backwards_is_the_same_selection(tmp_path):
+    lines = _prose_lines(tmp_path)
+    a, b = _pos_of(lines, "Second"), _pos_of(lines, "properly")
+    assert selection_span(lines, a, b) == selection_span(lines, b, a)
+
+
+def test_triple_click_selects_the_whole_sentence(tmp_path):
+    """The user's report: triple-click must take the SENTENCE, not the line —
+    including across a wrap, and stopping at the terminator mid-line."""
+    lines = _prose_lines(tmp_path)
+    px, py = _centre(lines, _pos_of(lines, "wraps"))
+    assert selection_text(lines, sentence_span(lines, px, py)) == (
+        "Second one runs a bit\nlonger and wraps onto the next line properly."
+    )
+    px, py = _centre(lines, _pos_of(lines, "First"))
+    assert selection_text(lines, sentence_span(lines, px, py)) == "First sentence here."
+    px, py = _centre(lines, _pos_of(lines, "Third"))
+    assert selection_text(lines, sentence_span(lines, px, py)) == "Third short one."
+
+
+def test_sentence_span_off_text_is_none(tmp_path):
+    lines = _prose_lines(tmp_path)
+    assert sentence_span(lines, 5.0, 5.0) is None
+
+
+def test_position_at_clamps_past_a_line_end(tmp_path):
+    """Unlike word_at, a point past the end of a line still resolves — that is
+    what lets a drag keep extending once the cursor leaves the text."""
+    lines = _prose_lines(tmp_path)
+    assert word_at(lines, 5.0, 45.0) is None
+    pos = position_at(lines, 5.0, 45.0)
+    assert pos is not None and pos[1] == 0  # clamped to the line's first word
 
 
 def test_engine_stays_rotation_blind(text_pdf):
