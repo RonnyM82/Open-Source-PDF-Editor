@@ -1303,6 +1303,33 @@ def test_ui_edit_bullet_item_keeps_marker_and_hang(qapp, tmp_path):
         window.close()
 
 
+def test_ui_format_paragraph_as_list_and_clear(qapp, tmp_path):
+    """The context-menu 'Format as list' converts a paragraph to a bulleted
+    item and back, each as one undoable command."""
+    window = MainWindow()
+    try:
+        window.open_path(_wide_paragraph_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 200, 97)
+        assert para is not None and para.hang_indent == 0.0
+
+        view._apply_list_style("bullet", 0, [para])
+        assert view.undo_stack.count() == 1
+        items = [p for p in view.document.paragraphs(0) if p.hang_indent > 0]
+        assert items and items[0].text.lstrip()[:1] in ("•", "·")
+
+        view._apply_list_style(None, 0, [items[0]])  # unlist
+        assert view.undo_stack.count() == 2
+        assert not any(p.hang_indent > 0 for p in view.document.paragraphs(0))
+
+        view.undo_stack.undo()  # back to bulleted
+        assert any(p.hang_indent > 0 for p in view.document.paragraphs(0))
+    finally:
+        window.close()
+
+
 def test_ui_embedded_font_map_empty_for_non_embedded(qapp, tmp_path):
     """A non-embedded (base-14) paragraph populates no embedded-font map, so the
     commit path takes the normal helv/base-14 route."""

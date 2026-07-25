@@ -1941,6 +1941,7 @@ def replace_paragraph_runs(
     pitch: float | None = None,
     exact_font: bool = True,
     align: str | None = None,
+    hang: float | None = None,
 ) -> ParagraphReplaceResult:
     """Replace a paragraph with RICH runs, laid out by the engine (E9).
 
@@ -1989,19 +1990,33 @@ def replace_paragraph_runs(
     # hang. The leading marker is split off the runs so it is not laid out
     # twice. Editing the bullet AWAY (no leading marker in the runs) collapses to
     # a plain paragraph — the old bullet is then redacted with everything else.
-    # Only for an IN-PLACE edit (offset 0, box not widened): on a MOVE the kept
-    # bullet must not stay behind while the body translates, so a moved list item
-    # degrades to a plain paragraph (marker inline).
-    in_place = offset == (0.0, 0.0) and width is None
-    hang = para.hang_indent if (para.hang_indent > 0 and in_place) else 0.0
-    keep_span = (
-        para.spans[0] if (hang > 0 and para.spans and is_bullet_only(para.spans[0].text)) else None
-    )
+    # Hanging indent. ``hang`` OVERRIDES the paragraph's own indent — L2's
+    # make_list passes it to CREATE a list item from plain text; None keeps the
+    # detected indent. Disabled only on a MOVE: the kept bullet must not stay
+    # behind while the body translates, so a moved list item degrades to a plain
+    # paragraph (marker inline). A width change (box resize) keeps the hang.
+    in_place = offset == (0.0, 0.0)
+    detected_hang = para.hang_indent if in_place else 0.0
+    hang = detected_hang if hang is None else (hang if in_place else 0.0)
+    marker_runs = None
     body_runs = runs
-    if keep_span is not None:
+    if hang > 0:
         marker_runs, body_runs = _split_marker_runs(runs)
-        if marker_runs is None:  # the bullet was edited away — plain paragraph
-            keep_span, hang, body_runs = None, 0.0, runs
+        if marker_runs is None:  # no leading marker in the runs — plain paragraph
+            hang, body_runs = 0.0, runs
+    # KEEP an existing folded bullet's original span (preserve its exact symbol
+    # glyph) when editing it in place; a CREATED marker (no such span, or a
+    # numbered marker) is DRAWN instead.
+    keep_span = (
+        para.spans[0]
+        if (
+            marker_runs is not None
+            and para.hang_indent > 0
+            and para.spans
+            and is_bullet_only(para.spans[0].text)
+        )
+        else None
+    )
     body_wrap = max(20.0, wrap - hang)
     lines = _layout_runs(body_runs, body_wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
     while lines and not lines[-1]:
@@ -2104,8 +2119,13 @@ def replace_paragraph_runs(
             _insert_line(
                 page, origin_x + hang + line_shift(line), first_baseline + i * pitch_val, line
             )
-        # The bullet marker (kept_span) is NOT re-drawn — its original span
-        # survives the redaction, preserving the exact symbol glyph.
+        # A KEPT bullet marker survives the redaction (its span is excluded),
+        # preserving the exact symbol glyph. A CREATED marker (L2 make_list, or a
+        # numbered marker) has no such span and is DRAWN at the box left.
+        if marker_runs is not None and keep_span is None:
+            marker_lines = _layout_runs(marker_runs, None)
+            if marker_lines and marker_lines[0]:
+                _insert_line(page, origin_x, first_baseline, marker_lines[0])
         new_bbox = (
             origin_x,
             first_baseline - ascent,
@@ -2122,6 +2142,85 @@ def replace_paragraph_runs(
         visual_lines=_visual_line_texts(lines),
         font_fallback=font_fallback,
     )
+
+
+# The hanging indent (pt) a created BULLETED list item gets: the gap from the
+# marker to the body. Matches the samples' ~18 pt so created and imported lists
+# look the same. Numbered items stay inline (no hang — a later refinement).
+_LIST_HANG = 18.0
+LIST_KINDS = ("bullet", "number")
+
+
+def _paragraph_body_runs(para: Paragraph) -> list[StyledRun]:
+    """Rich runs for a paragraph's content with any LEADING list marker removed
+    — the body from which a new marker is (re)built. Per-span styles, embedded
+    fonts and drawn rules are preserved (the same conversion moves use)."""
+    runs: list[StyledRun] = []
+    codes = _BASE14_CODES["helv"]
+    for i, line in enumerate(para.lines):
+        if i:
+            runs.append(StyledRun("\n", TextStyle()))
+        for span in line:
+            reuse = span.embedded and map_font_to_base14(span.font, span.flags) is None
+            idx = (1 if span.flags & FLAG_BOLD else 0) + (2 if span.flags & FLAG_ITALIC else 0)
+            segments = getattr(span, "rule_segments", None) or (
+                (span.text, span.underline, span.strike),
+            )
+            for text, underline, strike in segments:
+                runs.append(
+                    StyledRun(
+                        text,
+                        TextStyle(
+                            code=span.base14 or codes[idx],
+                            size=span.size,
+                            color=span.color,
+                            underline=underline,
+                            strike=strike,
+                            embed_name=span.font if reuse else None,
+                        ),
+                    )
+                )
+    marker_runs, body_runs = _split_marker_runs(runs)
+    return body_runs if marker_runs is not None else runs
+
+
+def set_list_style(
+    doc: pymupdf.Document,
+    page_index: int,
+    para: Paragraph,
+    kind: str | None,
+    *,
+    ordinal: int = 1,
+) -> ParagraphReplaceResult:
+    """Convert a paragraph to/from a list item (L2, user request).
+
+    ``kind`` ``"bullet"`` prepends a ``•`` marker at the box left and hangs the
+    body at ``box-left + _LIST_HANG`` (the L1 structure, so it round-trips and
+    edits as a grouped item); ``"number"`` prepends ``f"{ordinal}. "`` INLINE
+    (no hanging indent yet); ``None`` strips any leading marker back to a plain
+    paragraph. An existing marker is replaced (bullet→number, renumber, …).
+
+    Per the plan's Option B the marker is ordinary editable TEXT — this is a
+    formatting convenience, not a managed list structure."""
+    body_runs = _paragraph_body_runs(para)
+    marker_style = TextStyle(code=para.base14 or "helv", size=para.size, color=para.color)
+    # The box must GROW to fit the marker so short body text is not spuriously
+    # wrapped: a bullet adds the hang gutter to the left, a number the marker's
+    # own width. None (clear) keeps the paragraph's own width.
+    para_width = para.bbox[2] - para.bbox[0]
+    if kind is None:
+        return replace_paragraph_runs(doc, page_index, para, body_runs, hang=0.0)
+    if kind == "bullet":
+        runs = [StyledRun("• ", marker_style), *body_runs]
+        width = para_width + _LIST_HANG
+        return replace_paragraph_runs(doc, page_index, para, runs, hang=_LIST_HANG, width=width)
+    if kind == "number":
+        marker = f"{ordinal}. "
+        marker_w = pymupdf.get_text_length(marker, fontname=marker_style.code, fontsize=para.size)
+        runs = [StyledRun(marker, marker_style), *body_runs]
+        width = para_width + marker_w + 2.0
+        return replace_paragraph_runs(doc, page_index, para, runs, hang=0.0, width=width)
+    raise ValueError(f"list kind must be one of {LIST_KINDS} or None, not {kind!r}")
 
 
 def _split_span_selection(

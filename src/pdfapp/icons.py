@@ -98,6 +98,9 @@ _NAMES = {
     "align_left": "mdi6.format-align-left",
     "align_center": "mdi6.format-align-center",
     "align_right": "mdi6.format-align-right",
+    "list_bulleted": "mdi6.format-list-bulleted",
+    "list_numbered": "mdi6.format-list-numbered",
+    "list_clear": "mdi6.format-list-checkbox",
     # Tools
     "extract_text": "mdi6.text-box-search-outline",
     "detect_links": "mdi6.web",

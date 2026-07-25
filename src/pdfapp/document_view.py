@@ -2916,6 +2916,28 @@ class DocumentView(QWidget):
         n = self._current_page
         return [pp for pn, pp in self._multi_paragraphs if pn == n]
 
+    def _apply_list_style(self, kind: str | None, n: int, paras: list[Paragraph]) -> None:
+        """Convert paragraph(s) to/from a bulleted/numbered list (L2). ``kind``
+        is "bullet" | "number" | None (clear). Numbered items are numbered in
+        selection order. One undoable command."""
+        if not self.can_edit_content or not paras:
+            return
+        targets = list(paras)
+        labels = {
+            "bullet": "Bulleted list",
+            "number": "Numbered list",
+            None: "Remove list formatting",
+        }
+
+        def op(doc: PdfDocument) -> None:
+            for i, para in enumerate(targets):
+                box = self._box_for(doc, n, para.bbox, para.text)
+                result = doc.set_list_style(n, para, kind, ordinal=i + 1)
+                if box is not None and result.new_bbox is not None:
+                    doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+
+        self._push_command(labels[kind], op, ("page", n))
+
     def _scene_delta_to_page(self, dsx: float, dsy: float, n: int) -> tuple[float, float]:
         """Convert a SCENE (on-screen) offset to a page offset — rotation-safe
         (deltas transform linearly; the group move does the same via
@@ -3341,6 +3363,16 @@ class DocumentView(QWidget):
                 icons.icon("delete_image"), "Delete text box"
             )
             actions["delete_text_box"].setEnabled(para is not None)
+        # Format as list (L2): the multi-selection if any, else the paragraph
+        # under the cursor. Numbered items number in selection/appearance order.
+        list_targets = self._selected_members() or ([para] if para is not None else [])
+        if list_targets and self.can_edit_content:
+            list_menu = menu.addMenu(icons.icon("list_bulleted"), "Format as list")
+            actions["list_bullet"] = list_menu.addAction(icons.icon("list_bulleted"), "Bulleted")
+            actions["list_number"] = list_menu.addAction(icons.icon("list_numbered"), "Numbered")
+            actions["list_clear"] = list_menu.addAction(
+                icons.icon("list_clear"), "Remove list formatting"
+            )
         if image is not None:
             if not menu.isEmpty():
                 menu.addSeparator()
@@ -3406,6 +3438,12 @@ class DocumentView(QWidget):
             self._duplicate_paragraph_at(n, para)
         elif chosen is actions.get("delete_text_box"):
             self._delete_paragraph_at(n, para)
+        elif chosen is actions.get("list_bullet"):
+            self._apply_list_style("bullet", n, list_targets)
+        elif chosen is actions.get("list_number"):
+            self._apply_list_style("number", n, list_targets)
+        elif chosen is actions.get("list_clear"):
+            self._apply_list_style(None, n, list_targets)
         elif chosen is actions.get("replace"):
             self._replace_image_at(n, image)
         elif chosen is actions.get("rotate_cw"):

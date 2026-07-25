@@ -563,6 +563,21 @@ class PdfDocument:
             self._doc, n, para, runs, fill=fill, offset=offset, width=width, align=align
         )
 
+    def set_list_style(
+        self,
+        n: int,
+        para: Paragraph,
+        kind: str | None,
+        *,
+        ordinal: int = 1,
+    ) -> textedit.ParagraphReplaceResult:
+        """Convert a paragraph to/from a bulleted/numbered list item (L2).
+
+        ``kind``: ``"bullet"`` | ``"number"`` | ``None`` (clear). See
+        :func:`textedit.set_list_style`.
+        """
+        return textedit.set_list_style(self._doc, n, para, kind, ordinal=ordinal)
+
     def style_paragraph_selection(
         self,
         n: int,

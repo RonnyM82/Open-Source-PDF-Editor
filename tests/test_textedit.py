@@ -653,6 +653,48 @@ def test_edit_bullet_item_preserves_marker_and_hang(tmp_path):
         assert body.bbox[0] == pytest.approx(108.0, abs=1.5)
 
 
+def test_make_bulleted_list_round_trips(tmp_path):
+    src = _para_pdf(tmp_path, ["A plain paragraph that becomes a bulleted item."])
+    with PdfDocument.open(src) as doc:
+        doc.set_list_style(0, doc.paragraphs(0)[0], "bullet")
+        out = tmp_path / "b.pdf"
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        p = doc.paragraphs(0)[0]
+        assert p.hang_indent > 0  # grouped hanging bullet, round-tripped
+        assert p.text.lstrip()[:1] in ("•", "·")
+        assert "becomes a bulleted item" in p.text
+
+
+def test_make_numbered_list_inline(tmp_path):
+    src = _para_pdf(tmp_path, ["A plain paragraph that becomes numbered."])
+    with PdfDocument.open(src) as doc:
+        doc.set_list_style(0, doc.paragraphs(0)[0], "number", ordinal=2)
+        out = tmp_path / "n.pdf"
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        p = doc.paragraphs(0)[0]
+        assert p.text.strip().startswith("2.")
+        assert "becomes numbered" in p.text
+
+
+def test_clear_list_strips_marker(tmp_path):
+    src = _para_pdf(tmp_path, ["Text to bullet and then clear."])
+    with PdfDocument.open(src) as doc:
+        doc.set_list_style(0, doc.paragraphs(0)[0], "bullet")
+        out = tmp_path / "b.pdf"
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        doc.set_list_style(0, doc.paragraphs(0)[0], None)  # unlist
+        out2 = tmp_path / "c.pdf"
+        doc.save(out2)
+    with PdfDocument.open(out2) as doc:
+        p = doc.paragraphs(0)[0]
+        assert p.hang_indent == 0.0
+        assert p.text.lstrip()[:1] not in ("•", "·")
+        assert "Text to bullet and then clear" in p.text
+
+
 def test_numbered_inline_marker_not_folded(tmp_path):
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
