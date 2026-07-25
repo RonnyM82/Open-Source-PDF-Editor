@@ -9,6 +9,7 @@ validation API against the generated test certificate.
 
 import io
 
+import pymupdf
 import pytest
 
 pytest.importorskip("PySide6")
@@ -260,6 +261,259 @@ def test_resigning_laundered_file_refused(qapp, text_pdf, signer, sample_png, tm
         result = window._execute_signing(signed_view, tmp_path / "resigned.pdf", signer)
         assert result is None
         assert "already broken" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
+def test_laundered_visible_signature_refused(qapp, text_pdf, signer, sample_png, tmp_path):
+    """The user's exact hand-test: VISIBLE image signature → edit the signed
+    copy → Ctrl+S → re-sign. The append gate now uses REAL verification, so
+    the broken file is refused however the cheap heuristic fares."""
+    window = MainWindow()
+    try:
+        window.open_path(text_pdf)
+        out = tmp_path / "visibly-signed.pdf"
+        assert (
+            window._execute_signing(
+                window.active_view,
+                out,
+                signer,
+                rect=(100.0, 500.0, 300.0, 560.0),
+                image_path=sample_png,
+            )
+            is not None
+        )
+        signed_view = window.active_view
+        signed_view.set_edit_mode(True)
+        signed_view._place_image(0, 100.0, 100.0, sample_png)
+        window.save()  # offscreen: the signed-doc save warning auto-proceeds
+        assert not signed_view.dirty
+
+        result = window._execute_signing(signed_view, tmp_path / "resigned.pdf", signer)
+        assert result is None
+        assert "already broken" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
+# --- signature status surface ------------------------------------------------
+
+
+def test_open_signed_document_announces_intact(qapp, text_pdf, signer, tmp_path):
+    signed = tmp_path / "announce.pdf"
+    signed.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+    window = MainWindow()
+    try:
+        window.open_path(signed)
+        message = window.statusBar().currentMessage().lower()
+        assert "signature intact" in message
+        assert "test signer" in message  # the signer's name is surfaced
+    finally:
+        window.close()
+
+
+def test_open_tampered_document_flags_problem(qapp, text_pdf, signer, tmp_path):
+    """The user report: Acrobat flags a tampered signed file, we showed
+    NOTHING. Opening one must now announce the problem."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    tampered = bytearray(signed)
+    tampered[signed.find(b"stream") + 16] ^= 0xFF
+    bad = tmp_path / "tampered.pdf"
+    bad.write_bytes(bytes(tampered))
+    window = MainWindow()
+    try:
+        window.open_path(bad)
+        assert "signature problem" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
+def test_open_real_tampered_sample_flags_problem(qapp, real_tampered_signed_pdf):
+    window = MainWindow()
+    try:
+        window.open_path(real_tampered_signed_pdf)
+        assert "signature problem" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
+def test_open_incrementally_tampered_document_flags_problem(qapp, text_pdf, signer, tmp_path):
+    """The appended-revision attack must flag on open like the byte-flip."""
+    from pyhanko.pdf_utils.generic import StreamObject
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    writer = IncrementalPdfFileWriter(io.BytesIO(signed))
+    page_obj = writer.root["/Pages"]["/Kids"][0].get_object()
+    page_obj["/Contents"] = writer.add_object(
+        StreamObject(stream_data=b"BT /F0 24 Tf 72 720 Td (TAMPERED) Tj ET")
+    )
+    writer.update_container(page_obj)
+    buf = io.BytesIO()
+    writer.write(buf)
+    bad = tmp_path / "inc-tampered.pdf"
+    bad.write_bytes(buf.getvalue())
+
+    window = MainWindow()
+    try:
+        window.open_path(bad)
+        message = window.statusBar().currentMessage().lower()
+        assert "signature problem" in message and "modified" in message
+    finally:
+        window.close()
+
+
+def test_broken_dialog_fires_only_for_problem_files(qapp, text_pdf, signer, tmp_path, monkeypatch):
+    """The Acrobat-style modal: fires for a tampered file, NOT for an intact
+    one (visible window; the dialog is monkeypatched, the repo pattern)."""
+    from PySide6.QtWidgets import QMessageBox
+
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[2]))
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    good = tmp_path / "good.pdf"
+    good.write_bytes(signed)
+    tampered = bytearray(signed)
+    tampered[signed.find(b"stream") + 16] ^= 0xFF
+    bad = tmp_path / "bad.pdf"
+    bad.write_bytes(bytes(tampered))
+
+    window = MainWindow()
+    try:
+        window.show()  # offscreen show(): isVisible() True, no real window
+        window.open_path(good)
+        assert warnings == []  # intact never pops the problem dialog
+        window.open_path(bad)
+        assert len(warnings) == 1 and "modified" in warnings[0].lower()
+    finally:
+        window.close()
+
+
+def test_refocus_reannounces_signature_problem(qapp, text_pdf, signer, tmp_path):
+    """Re-opening an already-open tampered file (Explorer double-click an
+    hour later) must re-flag, not silently focus the tab."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    tampered = bytearray(signed)
+    tampered[signed.find(b"stream") + 16] ^= 0xFF
+    bad = tmp_path / "refocus.pdf"
+    bad.write_bytes(bytes(tampered))
+
+    window = MainWindow()
+    try:
+        window.open_path(bad)
+        window.open_path(text_pdf)  # focus moves away, message changes
+        window.open_path(bad)  # refocus path — no new tab
+        assert window._tabs.count() == 2
+        assert "signature problem" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
+def test_unverifiable_signature_gets_honest_wording(qapp, text_pdf, signer, tmp_path, monkeypatch):
+    """A signature that merely COULD NOT be checked must not be announced as
+    'modified after signing' — the engine made no such determination."""
+    signed = tmp_path / "unverifiable.pdf"
+    signed.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+    fake = signing.SignatureVerification(
+        field_name="Signature1",
+        signer_name=None,
+        intact=False,
+        valid=False,
+        trusted=False,
+        tampered=False,
+        problem="this signature could not be checked (exotic algorithm)",
+    )
+    monkeypatch.setattr(signing, "verify_pdf_signatures", lambda *a, **k: [fake])
+
+    window = MainWindow()
+    try:
+        window.open_path(signed)
+        message = window.statusBar().currentMessage().lower()
+        assert "cannot be verified" in message
+        assert "modified" not in message
+    finally:
+        window.close()
+
+
+def test_widgets_signed_but_nothing_verifiable_flags(qapp, text_pdf, signer, tmp_path):
+    """AcroForm /Fields emptied while the widget stays on the page: pymupdf
+    says signed, pyHanko sees nothing — must announce a problem, and the
+    status text must not claim 'no digital signatures'."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    with pymupdf.open(stream=signed, filetype="pdf") as doc:
+        catalog = doc.pdf_catalog()
+        doc.xref_set_key(catalog, "AcroForm/Fields", "[]")
+        hollow = doc.tobytes()
+    path = tmp_path / "hollow.pdf"
+    path.write_bytes(hollow)
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        assert "cannot be verified" in window.statusBar().currentMessage().lower()
+        text = window.signature_status_text(window.active_view)
+        assert "cannot be verified" in text.lower()
+        assert "no digital signatures" not in text.lower()
+    finally:
+        window.close()
+
+
+def test_edit_mode_warning_on_signed_document(qapp, text_pdf, signer, tmp_path, monkeypatch):
+    """Entering Edit mode on a signed doc asks first: No un-toggles cleanly,
+    Yes proceeds (visible window + monkeypatched question, the repo pattern)."""
+    from PySide6.QtWidgets import QMessageBox
+
+    signed = tmp_path / "warn.pdf"
+    signed.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+    answers = []
+
+    def fake_question(*args, **kwargs):
+        answers.append(args[2])
+        return answers_queue.pop(0)
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+
+    window = MainWindow()
+    try:
+        window.open_path(signed)
+        window.show()
+        view = window.active_view
+
+        answers_queue = [QMessageBox.StandardButton.No]
+        window._edit_mode_action.setChecked(True)
+        assert view.edit_mode is False  # refused
+        assert window._edit_mode_action.isChecked() is False  # un-toggled
+        assert answers and "digitally signed" in answers[-1].lower()
+
+        answers_queue = [QMessageBox.StandardButton.Yes]
+        window._edit_mode_action.setChecked(True)
+        assert view.edit_mode is True  # proceeded
+    finally:
+        window.close()
+
+
+def test_signature_status_text(qapp, text_pdf, signer, signer_p12, tmp_path):
+    signed = tmp_path / "status.pdf"
+    signed_bytes = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    signed.write_bytes(signed_bytes)
+    tampered = bytearray(signed_bytes)
+    tampered[signed_bytes.find(b"stream") + 16] ^= 0xFF
+    bad = tmp_path / "status-bad.pdf"
+    bad.write_bytes(bytes(tampered))
+
+    window = MainWindow()
+    try:
+        window.open_path(text_pdf)
+        assert "no digital signatures" in window.signature_status_text(window.active_view)
+
+        window.open_path(signed)
+        text = window.signature_status_text(window.active_view)
+        assert "INTACT" in text and signer_p12.common_name in text
+        assert "identity not verified" in text
+
+        window.open_path(bad)
+        text = window.signature_status_text(window.active_view)
+        assert "BROKEN" in text and "modified" in text
     finally:
         window.close()
 

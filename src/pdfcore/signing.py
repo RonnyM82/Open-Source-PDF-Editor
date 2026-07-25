@@ -12,14 +12,16 @@ here. See CLAUDE.md "Digital signing".
 
 The signer is a swappable boundary: :func:`sign_pdf_bytes` accepts any pyHanko
 ``Signer``, so a PKCS#11/smartcard signer can slot in later without touching
-the signing path. Validation is deliberately NOT imported here — the engine
-only signs; tests (and any future status UI) use pyHanko's validation API
-directly.
+the signing path. :func:`verify_pdf_signatures` is the READ side (the app's
+signature-status surface — a tampered signed file must be flagged on open,
+like Acrobat's banner): always verify the FILE bytes as read from disk, never
+``tobytes()`` output — a rewrite breaks the very signatures being measured.
 """
 
 from __future__ import annotations
 
 import io
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,13 +36,17 @@ from cryptography.x509.oid import NameOID
 from pyhanko.pdf_utils.images import PdfImage
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.misc import PdfError
-from pyhanko.sign.fields import SigFieldSpec
 
 # Re-exported so the UI can catch a signer-level failure without importing
 # pyhanko itself (pdfapp talks to pdfcore only).
+from pyhanko.pdf_utils.reader import PdfFileReader
+from pyhanko.sign.fields import SigFieldSpec
 from pyhanko.sign.general import SigningError  # noqa: F401
 from pyhanko.sign.signers import PdfSignatureMetadata, PdfSigner, Signer, SimpleSigner
+from pyhanko.sign.validation import validate_pdf_signature
+from pyhanko.sign.validation.status import SignatureCoverageLevel
 from pyhanko.stamp import StaticStampStyle
+from pyhanko_certvalidator import ValidationContext
 
 DEFAULT_FIELD_NAME = "Signature1"
 
@@ -148,6 +154,132 @@ def generate_self_signed_p12(
     dest = Path(out_path)
     dest.write_bytes(data)
     return dest
+
+
+@dataclass(frozen=True)
+class SignatureVerification:
+    """One signature's checked state, in plain values for the UI.
+
+    ``intact`` is the tamper question — the whole FILE is what the signer
+    approved, folding in pyHanko's post-signing-revision analysis (its raw
+    ``intact`` covers only the signed revision's digest; an incremental
+    update appended after signing rewrites what the page SHOWS while that
+    stays True — the classic attack, adversarial-review finding). ``valid``
+    is the cryptographic check of the signature itself; ``trusted`` means
+    the certificate chains to a supplied trust root — with none supplied it
+    is False for everyone (self-signed included), which the UI words as
+    "identity not verified", never as tampering. ``tampered`` is True only
+    when modification was POSITIVELY determined — a signature that merely
+    could not be checked is broken but NOT tampered, and the UI must not
+    claim modification for it. ``problem`` is the plain-words reason when
+    broken, else None.
+    """
+
+    field_name: str
+    signer_name: str | None
+    intact: bool
+    valid: bool
+    trusted: bool
+    tampered: bool
+    problem: str | None
+
+
+def _cert_common_name(cert) -> str | None:
+    try:
+        return cert.subject.native.get("common_name")
+    except Exception:  # noqa: BLE001 — display-only, any cert quirk means "unknown"
+        return None
+
+
+def verify_pdf_signatures(
+    pdf_bytes: bytes, trust_roots=None, password: str | None = None
+) -> list[SignatureVerification]:
+    """Check every signature in the given FILE bytes; [] when none exist.
+
+    Pass the bytes exactly as read from disk — NEVER ``tobytes()`` output (a
+    rewrite re-serialises the file and breaks the very signatures being
+    measured, reporting false tampering). ``password`` decrypts an
+    encrypted+signed file (the UI passes the open password it already
+    collected). A signature whose validation machinery itself fails is
+    reported broken with the reason, never raised past this function; input
+    this function cannot read raises ValueError — whatever exception type
+    pyHanko's parser aired (a mangled field once escaped as a raw
+    AttributeError through a Qt slot, adversarial-review finding).
+    """
+    vc = ValidationContext(trust_roots=list(trust_roots or []), allow_fetching=False)
+    try:
+        reader = PdfFileReader(io.BytesIO(pdf_bytes))
+        if reader.encrypted:
+            reader.decrypt(password or "")
+        embedded = list(reader.embedded_signatures)
+    except PdfError as exc:
+        raise ValueError(f"pyHanko could not parse this PDF: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 — contract: unreadable input is ValueError
+        raise ValueError(f"could not read this PDF's signatures: {exc}") from exc
+    # A cert with no path to a trust root is an EXPECTED verdict here (every
+    # self-signed signature, absent a configured store) — but pyHanko logs it
+    # as a full error traceback per check, which would spam the console on
+    # every signed-document open. Quiet its loggers for the call.
+    quiet = (logging.getLogger("pyhanko"), logging.getLogger("pyhanko_certvalidator"))
+    levels = [(lg, lg.level) for lg in quiet]
+    for lg in quiet:
+        lg.setLevel(logging.CRITICAL)
+    try:
+        return _verify_embedded(embedded, vc)
+    finally:
+        for lg, level in levels:
+            lg.setLevel(level)
+
+
+def _verify_embedded(embedded, vc) -> list[SignatureVerification]:
+    results: list[SignatureVerification] = []
+    for sig in embedded:
+        field = sig.field_name or "(unnamed)"
+        signer_name = None
+        try:
+            status = validate_pdf_signature(sig, signer_validation_context=vc)
+            signer_name = _cert_common_name(status.signing_cert)
+            # status.intact digests only the SIGNED REVISION — an incremental
+            # update appended after signing rewrites what the page shows while
+            # intact stays True (the classic attack; probe-verified:
+            # docmdp_ok flips False / modification_level OTHER for it, while
+            # a legit second signature keeps docmdp_ok True, so this gate
+            # never false-positives the app's own multi-sign flow).
+            coverage_ok = status.coverage in (
+                SignatureCoverageLevel.ENTIRE_FILE,
+                SignatureCoverageLevel.ENTIRE_REVISION,
+            )
+            unmodified = bool(status.intact) and coverage_ok and status.docmdp_ok is not False
+            if not unmodified:
+                problem = "the document was modified after this signature was applied"
+            elif not status.valid:
+                problem = "the signature itself does not verify"
+            else:
+                problem = None
+            results.append(
+                SignatureVerification(
+                    field_name=field,
+                    signer_name=signer_name,
+                    intact=unmodified,
+                    valid=bool(status.valid),
+                    trusted=bool(status.trusted),
+                    tampered=not unmodified,
+                    problem=problem,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — a broken sig must REPORT, not crash open
+            results.append(
+                SignatureVerification(
+                    field_name=field,
+                    signer_name=signer_name,
+                    intact=False,
+                    valid=False,
+                    trusted=False,
+                    tampered=False,  # unverifiable, NOT a determined modification
+                    problem=f"this signature could not be checked ({exc})",
+                )
+            )
+    return results
 
 
 def signature_field_names(doc: pymupdf.Document) -> list[str]:

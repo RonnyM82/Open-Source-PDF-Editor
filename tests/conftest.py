@@ -344,6 +344,32 @@ def sample_png(tmp_path) -> Path:
 
 SignerP12 = namedtuple("SignerP12", ["path", "password", "common_name"])
 
+# Real signed samples are LOCAL-ONLY (they carry a real signature image and are
+# ignored by samples/* in .gitignore — only the three sanitised samples are
+# allow-listed). Tests using them skip cleanly when absent.
+REAL_SIGNED_PDF = (
+    Path(__file__).resolve().parents[1] / "samples" / "document with hyperlink-signed.pdf"
+)
+REAL_TAMPERED_SIGNED_PDF = (
+    Path(__file__).resolve().parents[1] / "samples" / "document with hyperlink-signed-tampered.pdf"
+)
+
+
+@pytest.fixture
+def real_signed_pdf() -> Path:
+    """A really-signed sample (produced by the app); skips when absent."""
+    if not REAL_SIGNED_PDF.exists():
+        pytest.skip("real signed sample not present (samples/ is local-only)")
+    return REAL_SIGNED_PDF
+
+
+@pytest.fixture
+def real_tampered_signed_pdf() -> Path:
+    """The signed sample after tampering — must verify as BROKEN; skips when absent."""
+    if not REAL_TAMPERED_SIGNED_PDF.exists():
+        pytest.skip("real tampered signed sample not present (samples/ is local-only)")
+    return REAL_TAMPERED_SIGNED_PDF
+
 
 @pytest.fixture(scope="session")
 def signer_p12(tmp_path_factory) -> SignerP12:

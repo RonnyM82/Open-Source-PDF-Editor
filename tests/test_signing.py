@@ -336,6 +336,116 @@ def test_pyhanko_unparseable_input_raises_valueerror(text_pdf, signer):
         signing.sign_pdf_bytes(mangled, signer)
 
 
+def test_verify_pdf_signatures_intact_tampered_and_trust(text_pdf, signer, signer_p12):
+    """The engine's READ side: what the app's status surface reports."""
+    src = text_pdf.read_bytes()
+    assert signing.verify_pdf_signatures(src) == []  # unsigned
+
+    signed = signing.sign_pdf_bytes(src, signer).pdf_bytes
+    checks = signing.verify_pdf_signatures(signed)
+    assert len(checks) == 1
+    check = checks[0]
+    assert check.intact and check.valid and check.problem is None
+    assert check.signer_name == signer_p12.common_name
+    assert check.trusted is False  # no trust roots supplied
+    with_root = signing.verify_pdf_signatures(signed, trust_roots=[signer.signing_cert])
+    assert with_root[0].trusted is True
+
+    tampered = bytearray(signed)
+    tampered[signed.find(b"stream") + 16] ^= 0xFF
+    broken = signing.verify_pdf_signatures(bytes(tampered))
+    assert len(broken) == 1
+    assert not broken[0].intact
+    assert "modified" in broken[0].problem
+
+
+def test_incremental_update_tamper_detected(text_pdf, signer):
+    """The classic attack: APPEND a revision that swaps page content — the
+    signed revision's digest stays intact, so a digest-only verdict calls the
+    file clean (review finding). docmdp/coverage analysis must flag it, and
+    must NOT flag the app's own legit second signature."""
+    from pyhanko.pdf_utils.generic import StreamObject
+
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    writer = IncrementalPdfFileWriter(io.BytesIO(signed))
+    page_obj = writer.root["/Pages"]["/Kids"][0].get_object()
+    tampered_stream = StreamObject(stream_data=b"BT /F0 24 Tf 72 720 Td (TAMPERED) Tj ET")
+    page_obj["/Contents"] = writer.add_object(tampered_stream)
+    writer.update_container(page_obj)
+    out = io.BytesIO()
+    writer.write(out)
+
+    checks = signing.verify_pdf_signatures(out.getvalue())
+    assert len(checks) == 1
+    assert not checks[0].intact
+    assert checks[0].tampered is True
+    assert "modified" in checks[0].problem
+
+    # A LEGIT second signature is also an appended revision — it must stay clean.
+    double = signing.sign_pdf_bytes(signed, signer, field_name="Signature2").pdf_bytes
+    double_checks = signing.verify_pdf_signatures(double)
+    assert len(double_checks) == 2
+    assert all(c.intact and c.valid and not c.tampered for c in double_checks)
+
+
+def test_verify_contract_never_leaks_raw_exceptions(text_pdf, signer, monkeypatch):
+    """Unreadable input raises ValueError (whatever pyHanko aired), and a
+    signature whose validation machinery crashes REPORTS as broken-but-not-
+    tampered rather than raising (review findings: an AttributeError once
+    escaped through a Qt slot)."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+
+    # A mangled field /V: pyHanko's reader constructs, iteration explodes.
+    with pymupdf.open(stream=signed, filetype="pdf") as doc:
+        widget = next(doc[0].widgets())
+        doc.xref_set_key(widget.xref, "V", "(not-a-dict)")
+        mangled = doc.tobytes()
+    with pytest.raises(ValueError):
+        signing.verify_pdf_signatures(mangled)
+
+    # Validation machinery raising mid-check: reported, never raised.
+    def boom(*args, **kwargs):
+        raise RuntimeError("exotic algorithm")
+
+    monkeypatch.setattr(signing, "validate_pdf_signature", boom)
+    checks = signing.verify_pdf_signatures(signed)
+    assert len(checks) == 1
+    assert not checks[0].intact and not checks[0].valid
+    assert checks[0].tampered is False  # unverifiable, NOT determined-modified
+    assert "could not be checked" in checks[0].problem
+
+
+def test_verify_encrypted_signed_needs_password(text_pdf, signer):
+    """Encrypted+signed (encrypt-then-sign, the standard order): without the
+    password verification fails as ValueError; with it, checks come back."""
+    from pyhanko.pdf_utils.writer import copy_into_new_writer
+
+    writer = copy_into_new_writer(PdfFileReader(io.BytesIO(text_pdf.read_bytes())))
+    writer.encrypt("open-pw")
+    buf = io.BytesIO()
+    writer.write(buf)
+    inc = IncrementalPdfFileWriter(io.BytesIO(buf.getvalue()))
+    inc.encrypt("open-pw")
+    from pyhanko.sign.signers import PdfSignatureMetadata, PdfSigner
+
+    out = PdfSigner(PdfSignatureMetadata(field_name="Signature1"), signer=signer).sign_pdf(inc)
+    enc_signed = out.getvalue()
+
+    with pytest.raises(ValueError):
+        signing.verify_pdf_signatures(enc_signed)  # no password
+    checks = signing.verify_pdf_signatures(enc_signed, password="open-pw")
+    assert len(checks) == 1
+    assert checks[0].intact and checks[0].valid
+
+
+def test_verify_real_signed_samples(real_signed_pdf, real_tampered_signed_pdf):
+    """The user's hand-made samples: signed verifies intact, tampered flags."""
+    good = signing.verify_pdf_signatures(real_signed_pdf.read_bytes())
+    assert good and all(c.intact and c.valid for c in good)
+    bad = signing.verify_pdf_signatures(real_tampered_signed_pdf.read_bytes())
+    assert bad and any(not c.intact for c in bad)
+
+
 def test_resign_same_field_name_raises_signing_error(text_pdf, signer):
     """A filled signature field can't be signed again — pyHanko's SigningError
     propagates as-is (documented contract the UI's error path will rely on)."""

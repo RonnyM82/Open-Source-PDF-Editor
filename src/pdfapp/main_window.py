@@ -413,6 +413,9 @@ class MainWindow(QMainWindow):
         self._manage_signatures_action = QAction("&Manage signatures…", self)
         self._manage_signatures_action.triggered.connect(self.manage_signatures)
 
+        self._signature_status_action = QAction("Signature stat&us…", self)
+        self._signature_status_action.triggered.connect(self.show_signature_status)
+
         # CONTENT edits — enabled only in edit mode (U0). Annotation actions
         # deliberately are NOT here: highlight/comment/callout are available in
         # Markup mode too (see _annotate_actions).
@@ -482,6 +485,7 @@ class MainWindow(QMainWindow):
             self._sign_invisible_action: "sign_invisible",
             self._place_initials_action: "place_initials",
             self._manage_signatures_action: "manage_signatures",
+            self._signature_status_action: "signature_status",
         }
         tooltips = {
             self._open_action: "Open a PDF (Ctrl+O)",
@@ -610,6 +614,7 @@ class MainWindow(QMainWindow):
         self._sign_menu.addSeparator()
         self._sign_menu.addAction(self._place_initials_action)
         self._sign_menu.addSeparator()
+        self._sign_menu.addAction(self._signature_status_action)
         self._sign_menu.addAction(self._manage_signatures_action)
 
         # Lists the open document TABS of THIS window (populated by
@@ -1308,6 +1313,10 @@ class MainWindow(QMainWindow):
         if existing is not None:
             self._tabs.setCurrentWidget(existing)
             self._recent_files.add(path)  # bump it to the front of Open Recent
+            # Re-announce a signed document's status: the original flag is
+            # transient, and re-opening a tampered file from Explorer an hour
+            # later must not read as a clean bill of health.
+            self._announce_signatures(existing)
             return
 
         try:
@@ -1317,17 +1326,25 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open failed", f"Could not open:\n{path}\n\n{exc}")
             return
 
-        if doc.needs_pass and not self._prompt_password(doc, path):
-            doc.close()
-            return
+        password: str | None = None
+        if doc.needs_pass:
+            password = self._prompt_password(doc, path)
+            if password is None:
+                doc.close()
+                return
 
-        self._add_view(DocumentView(doc))
+        view = DocumentView(doc)
+        view.open_password = password  # memory-only; signature checks need it
+        self._add_view(view)
         # Only successfully-opened files land in Open Recent (a failed open /
         # cancelled password prompt returned above).
         self._recent_files.add(path)
         # A breadcrumb so a later hang/crash log shows what was open (no-op until
         # diagnostics.install has run, i.e. never in tests).
         diagnostics.log_event(f"opened {path.name} ({doc.page_count} pages)")
+        # Signed documents get Acrobat-style status on arrival — a TAMPERED
+        # file must be flagged, not silently rendered.
+        self._announce_signatures(view)
 
     # --- single-instance external open ----------------------------------
     def handle_external_open(self, paths: list[str]) -> None:
@@ -1466,8 +1483,10 @@ class MainWindow(QMainWindow):
             return view.save()
         return True  # Discard
 
-    def _prompt_password(self, doc: PdfDocument, path: Path) -> bool:
-        """Prompt until the password authenticates or the user cancels."""
+    def _prompt_password(self, doc: PdfDocument, path: Path) -> str | None:
+        """Prompt until the password authenticates (returning it) or the user
+        cancels (None). The password is kept in memory on the view only —
+        signature checks on an encrypted+signed file need it to decrypt."""
         while True:
             pw, ok = QInputDialog.getText(
                 self,
@@ -1476,9 +1495,9 @@ class MainWindow(QMainWindow):
                 QLineEdit.EchoMode.Password,
             )
             if not ok:
-                return False
+                return None
             if doc.authenticate(pw):
-                return True
+                return pw
             QMessageBox.warning(self, "Wrong password", "That password did not work. Try again.")
 
     # --- delegations to the active view ---------------------------------
@@ -1628,6 +1647,105 @@ class MainWindow(QMainWindow):
             dialog.exec()
         return dialog
 
+    def _announce_signatures(self, view: DocumentView) -> None:
+        """On open: surface a signed document's status — Acrobat's banner.
+
+        A tampered signed file must be FLAGGED the moment it opens (user
+        report: Acrobat flags it, we showed nothing). Verification runs on
+        the FILE bytes as read from disk — never a flatten, which would
+        break the very signatures being measured.
+        """
+        path = view.path
+        if path is None or not view.document.has_signatures():
+            return
+        try:
+            checks = signing.verify_pdf_signatures(path.read_bytes(), password=view.open_password)
+        except (ValueError, OSError) as exc:
+            self.statusBar().showMessage(f"Could not check this document's signatures: {exc}", 8000)
+            return
+        broken = [c for c in checks if not (c.intact and c.valid)]
+        if checks and not broken:
+            names = ", ".join(sorted({c.signer_name or "an unknown signer" for c in checks}))
+            self.statusBar().showMessage(
+                f"Digitally signed by {names} — signature intact (identity not verified).",
+                8000,
+            )
+            return
+        # Widgets say signed but nothing verifiable (checks == []), or a
+        # broken check. Only claim MODIFICATION when it was positively
+        # determined — an unverifiable signature gets honest wording, never
+        # a tamper accusation the engine did not make.
+        if checks and any(c.tampered for c in broken):
+            status_msg = (
+                "⚠ SIGNATURE PROBLEM: this document was modified after it was "
+                "signed (Sign → Signature status… for details)."
+            )
+            dialog_msg = (
+                "This document's digital signature is BROKEN — the file was "
+                "modified after it was signed.\n\n"
+                "The content shown may not be what the signer approved. "
+                "Sign → Signature status… has the details."
+            )
+        else:
+            status_msg = (
+                "⚠ SIGNATURE PROBLEM: this document displays a signature that "
+                "cannot be verified (Sign → Signature status… for details)."
+            )
+            dialog_msg = (
+                "This document displays a digital signature that CANNOT be "
+                "verified.\n\n"
+                "Treat it as unsigned — the content is not vouched for. "
+                "Sign → Signature status… has the details."
+            )
+        self.statusBar().showMessage(status_msg, 8000)
+        if self.isVisible():
+            QMessageBox.warning(self, "Signature problem", dialog_msg)
+
+    def signature_status_text(self, view: DocumentView) -> str:
+        """Plain-words status of every signature in the view's ON-DISK file."""
+        path = view.path
+        if path is None:
+            return "This document has no digital signatures."
+        try:
+            checks = signing.verify_pdf_signatures(path.read_bytes(), password=view.open_password)
+        except (ValueError, OSError) as exc:
+            return f"Could not check this document's signatures:\n{exc}"
+        if not checks:
+            if view.document.has_signatures():
+                # Widgets DISPLAY a signature no validator can see — the same
+                # state the sign flow refuses as broken; don't call it clean.
+                return (
+                    "This document DISPLAYS a digital signature, but it cannot "
+                    "be verified — treat the document as unsigned."
+                )
+            return "This document has no digital signatures."
+        lines = []
+        for check in checks:
+            who = check.signer_name or "an unknown signer"
+            if check.intact and check.valid:
+                state = "INTACT — the document has not been changed since it was signed"
+                if not check.trusted:
+                    state += "\n   (signer identity not verified — the certificate is not trusted)"
+            else:
+                state = f"BROKEN — {check.problem}"
+            lines.append(f"{check.field_name}: signed by {who}\n   {state}")
+        if view.dirty:
+            lines.append(
+                "Note: this tab has UNSAVED changes — they are not part of the signed file on disk."
+            )
+        return "\n\n".join(lines)
+
+    def show_signature_status(self) -> None:
+        """Sign → Signature status…: the per-signature detail view."""
+        view = self.active_view
+        if view is None:
+            return
+        text = self.signature_status_text(view)
+        if self.isVisible():
+            QMessageBox.information(self, "Signature status", text)
+        else:
+            self.statusBar().showMessage(text.splitlines()[0], 8000)
+
     def _run_sign_flow(self, view: DocumentView, *, page_index: int | None, rect) -> None:
         """Interactive signing: sign dialog → save-as picker → _execute_signing.
 
@@ -1717,16 +1835,19 @@ class MainWindow(QMainWindow):
                 )
             if already_signed and view.path is not None and not view.dirty:
                 data = view.path.read_bytes()
-                if not signing.signatures_cover_file(data):
-                    # A signed file that was edited and RE-SAVED has a clean
-                    # stack but already-broken signatures (the rewrite killed
-                    # them) — appending would produce output readers flag as
-                    # invalid while we claim the opposite.
+                # REAL cryptographic verification, not the layout heuristic
+                # (the user's hand-test slipped a broken file past the cheap
+                # check): a signed file that was edited and re-saved has a
+                # clean stack but already-broken signatures, and appending
+                # would produce output readers flag as invalid while we
+                # claim the opposite. Zero verifiable signatures on a file
+                # whose widgets SAY signed is the same broken state.
+                checks = signing.verify_pdf_signatures(data, password=view.open_password)
+                if not checks or any(not (c.intact and c.valid) for c in checks):
                     raise ValueError(
                         "this file's existing signatures are already broken — "
-                        "it was re-saved after signing, and any rewrite "
-                        "invalidates them. Sign a fresh copy of the original "
-                        "document instead"
+                        "the file was modified after signing. Sign a fresh "
+                        "copy of the original document instead"
                     )
                 # Add a signature WITHOUT re-serialising: incremental updates
                 # compose, so every prior signature stays valid.
@@ -1818,8 +1939,25 @@ class MainWindow(QMainWindow):
             view.insert_from_path(Path(path_str), view.current_page + 1)
 
     def _on_edit_mode_toggled(self, checked: bool) -> None:
-        if (v := self.active_view) is not None and v.edit_mode != checked:
-            v.set_edit_mode(checked)
+        if (v := self.active_view) is None or v.edit_mode == checked:
+            return
+        # Entering EDIT mode on a digitally signed document: every edit path
+        # (text redaction, image move, page ops …) invalidates the signatures
+        # — warn ONCE at the door, like Acrobat, instead of relying on each
+        # downstream path to notice (user report: an edit slipped through
+        # without any warning).
+        if checked and v.document.has_signatures() and self.isVisible():
+            answer = QMessageBox.question(
+                self,
+                "Document is digitally signed",
+                "This document is digitally signed. ANY change that gets saved "
+                "invalidates its signatures — readers will flag them as "
+                "broken.\n\nSwitch to Edit mode anyway?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._sync_chrome()  # un-toggle the action
+                return
+        v.set_edit_mode(checked)
 
     def _on_show_areas_toggled(self, checked: bool) -> None:
         # Persist as the app-level default for newly opened documents (last
@@ -2125,6 +2263,7 @@ class MainWindow(QMainWindow):
         # _page_edit_actions (a content stamp); Manage is app-level.
         self._place_signature_action.setEnabled(has)
         self._sign_invisible_action.setEnabled(has)
+        self._signature_status_action.setEnabled(has)
 
         self._thumbs_action.setEnabled(has)
         self._thumbs_action.blockSignals(True)

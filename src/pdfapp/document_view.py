@@ -137,6 +137,10 @@ class DocumentView(QWidget):
     def __init__(self, doc: PdfDocument, parent=None) -> None:
         super().__init__(parent)
         self._doc: PdfDocument = doc
+        # The password this document was OPENED with (None = none needed).
+        # Memory-only, never persisted — the signature-status surface needs
+        # it to decrypt the on-disk bytes of an encrypted+signed file.
+        self.open_password: str | None = None
         self._current_page = 0
         self._cache = RenderCache(capacity=_CACHE_ITEMS, max_cost=_CACHE_BYTES)
         # Editable geometry per page (U1) — same invalidation funnel as the
