@@ -27,6 +27,7 @@ samples/*
 !samples/sample_quote.pdf
 !samples/sample_cad_drawing.pdf
 !samples/sample_invoice_ocr.pdf
+!samples/document_with_hyperlink.pdf
 
 # OS / editor cruft
 Thumbs.db
