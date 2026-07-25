@@ -111,16 +111,19 @@ def test_view_menu_dark_toggle_switches_theme_and_rebrushes(theme_app, text_pdf)
     app, theme = theme_app
     window = MainWindow()
     window.open_path(text_pdf)
-    assert window._dark_theme_action.isChecked()  # dark is the launch default
+    # The action names the mode it switches TO — dark launch default offers light.
+    assert window._dark_theme_action.text() == "&Light theme"
 
-    window._dark_theme_action.setChecked(False)  # user picks light
+    window._dark_theme_action.trigger()  # user picks light
     assert theme.current_mode() == theme.LIGHT
+    assert window._dark_theme_action.text() == "Dar&k theme"  # now offers dark
     assert "pdf-editor-addendum" in app.styleSheet()
     view = window.active_view
     assert view._canvas.backgroundBrush() == theme.canvas_brush(theme.LIGHT)
 
-    window._dark_theme_action.setChecked(True)  # and back
+    window._dark_theme_action.trigger()  # and back
     assert theme.current_mode() == theme.DARK
+    assert window._dark_theme_action.text() == "&Light theme"
     assert view._canvas.backgroundBrush() == theme.canvas_brush(theme.DARK)
     window.close()
 

@@ -287,14 +287,14 @@ class MainWindow(QMainWindow):
         self._thumbs_action.setChecked(self._thumbs_visible)  # persisted (settings)
         self._thumbs_action.toggled.connect(self._toggle_thumbnails)
 
-        # Checked = the mode already applied at startup. Theme IS persisted now
-        # (settings.json): app.main applies the saved mode before this window
-        # builds, so current_mode() already reflects it; runtime toggles persist
-        # via _on_theme_changed.
-        self._dark_theme_action = QAction("Dar&k theme", self)
-        self._dark_theme_action.setCheckable(True)
-        self._dark_theme_action.setChecked(theme.current_mode() == theme.DARK)
-        self._dark_theme_action.toggled.connect(self._on_dark_theme_toggled)
+        # Names the mode it switches TO (in dark → "Light theme"), not the
+        # current one — a checkable "Dark theme" toggle read ambiguously (user
+        # feedback). Not checkable: the label carries the state. Theme IS
+        # persisted (settings.json): app.main applies the saved mode before this
+        # window builds, so current_mode() already reflects it; runtime toggles
+        # persist via _on_theme_changed, which also re-labels this action.
+        self._dark_theme_action = QAction(self._theme_action_label(theme.current_mode()), self)
+        self._dark_theme_action.triggered.connect(self._on_dark_theme_triggered)
 
         # Per-document Markup/Edit switch (U0). Documents open in MARKUP mode
         # (annotate: highlight/comment/callout, select + copy); checked = the
@@ -648,16 +648,22 @@ class MainWindow(QMainWindow):
         help_menu.addAction(self._about_action)
 
     # --- theme ------------------------------------------------------------
-    def _on_dark_theme_toggled(self, checked: bool) -> None:
+    @staticmethod
+    def _theme_action_label(mode: str) -> str:
+        """Label for the theme action — the mode it switches TO. In dark mode
+        the action offers "Light theme"; in light mode, "Dark theme". The
+        mnemonic tracks the visible word (Alt+L / Alt+K)."""
+        return "&Light theme" if mode == theme.DARK else "Dar&k theme"
+
+    def _on_dark_theme_triggered(self) -> None:
         app = QApplication.instance()
-        mode = theme.DARK if checked else theme.LIGHT
-        if app is not None and theme.current_mode() != mode:
+        mode = theme.LIGHT if theme.current_mode() == theme.DARK else theme.DARK
+        if app is not None:
             theme.apply_theme(app, mode)
 
     def _on_theme_changed(self, mode: str) -> None:
-        # No-op re-entry: setChecked fires the toggle handler, which sees
-        # current_mode() already equals the target and does nothing.
-        self._dark_theme_action.setChecked(mode == theme.DARK)
+        # Re-label to the NEW target (dark applied → now offers "Light theme").
+        self._dark_theme_action.setText(self._theme_action_label(mode))
         self._assign_icons()  # glyph colour follows the mode
         for view in self._views():
             view.refresh_theme()

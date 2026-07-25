@@ -34,6 +34,14 @@ def test_about_html_states_version_and_licence():
     assert "github.com" in html  # source-availability link
 
 
+def test_source_link_is_darker_blue_in_light_theme():
+    from pdfapp import theme
+
+    # Light mode needs a darker link than dark mode for contrast on white.
+    assert "#0b5394" in about_html(theme.LIGHT)
+    assert "#6ab0f3" in about_html(theme.DARK)
+
+
 def test_dialog_builds_offscreen(qapp):
     dialog = AboutDialog()
     assert dialog.windowTitle() == f"About {APP_NAME}"
