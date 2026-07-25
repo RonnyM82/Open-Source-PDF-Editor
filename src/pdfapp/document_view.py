@@ -54,6 +54,7 @@ from pdfcore.links import LinkInfo
 from pdfcore.textedit import (
     FLAG_BOLD,
     FLAG_ITALIC,
+    LIST_INDENT_STEP,
     SCRIPT_NORMAL,
     SCRIPT_SUB,
     SCRIPT_SUPER,
@@ -62,6 +63,7 @@ from pdfcore.textedit import (
     TextSpan,
     TextStyle,
     fingerprint_lineset,
+    list_item_kind,
     logical_line_groups,
     map_font_to_base14,
     merge_paragraphs,
@@ -2938,6 +2940,23 @@ class DocumentView(QWidget):
 
         self._push_command(labels[kind], op, ("page", n))
 
+    def _indent_list_items(self, delta: float, n: int, paras: list[Paragraph]) -> None:
+        """Increase/decrease the indent of the selected list item(s) (L4)."""
+        if not self.can_edit_content:
+            return
+        items = [p for p in paras if list_item_kind(p)[0] is not None]
+        if not items:
+            return
+
+        def op(doc: PdfDocument) -> None:
+            for para in items:
+                box = self._box_for(doc, n, para.bbox, para.text)
+                result = doc.indent_list_item(n, para, delta)
+                if box is not None and result.new_bbox is not None:
+                    doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+
+        self._push_command("Increase indent" if delta > 0 else "Decrease indent", op, ("page", n))
+
     def _scene_delta_to_page(self, dsx: float, dsy: float, n: int) -> tuple[float, float]:
         """Convert a SCENE (on-screen) offset to a page offset — rotation-safe
         (deltas transform linearly; the group move does the same via
@@ -3373,6 +3392,10 @@ class DocumentView(QWidget):
             actions["list_clear"] = list_menu.addAction(
                 icons.icon("list_clear"), "Remove list formatting"
             )
+            if any(list_item_kind(p)[0] is not None for p in list_targets):
+                list_menu.addSeparator()
+                actions["indent_more"] = list_menu.addAction("Increase indent")
+                actions["indent_less"] = list_menu.addAction("Decrease indent")
         if image is not None:
             if not menu.isEmpty():
                 menu.addSeparator()
@@ -3444,6 +3467,10 @@ class DocumentView(QWidget):
             self._apply_list_style("number", n, list_targets)
         elif chosen is actions.get("list_clear"):
             self._apply_list_style(None, n, list_targets)
+        elif chosen is actions.get("indent_more"):
+            self._indent_list_items(LIST_INDENT_STEP, n, list_targets)
+        elif chosen is actions.get("indent_less"):
+            self._indent_list_items(-LIST_INDENT_STEP, n, list_targets)
         elif chosen is actions.get("replace"):
             self._replace_image_at(n, image)
         elif chosen is actions.get("rotate_cw"):

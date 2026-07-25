@@ -695,6 +695,31 @@ def test_clear_list_strips_marker(tmp_path):
         assert "Text to bullet and then clear" in p.text
 
 
+def test_indent_list_item_shifts_and_keeps_bullet(tmp_path):
+    src = _para_pdf(tmp_path, ["A list item to indent right and left."])
+    with PdfDocument.open(src) as doc:
+        doc.set_list_style(0, doc.paragraphs(0)[0], "bullet")
+        out = tmp_path / "b.pdf"
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        before = doc.paragraphs(0)[0]
+        left0 = before.bbox[0]
+        doc.indent_list_item(0, before, 18.0)
+        out2 = tmp_path / "i.pdf"
+        doc.save(out2)
+    with PdfDocument.open(out2) as doc:
+        after = doc.paragraphs(0)[0]
+        assert after.bbox[0] == pytest.approx(left0 + 18.0, abs=1.5)  # whole item shifted right
+        assert after.hang_indent > 0  # still a grouped bullet
+        assert after.text.lstrip()[:1] in ("•", "·")
+
+
+def test_indent_non_list_item_refused(tmp_path):
+    with PdfDocument.open(_para_pdf(tmp_path, ["A plain paragraph, not a list."])) as doc:
+        with pytest.raises(ValueError):
+            doc.indent_list_item(0, doc.paragraphs(0)[0], 18.0)
+
+
 def test_numbered_inline_marker_not_folded(tmp_path):
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)

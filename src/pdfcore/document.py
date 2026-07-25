@@ -578,6 +578,15 @@ class PdfDocument:
         """
         return textedit.set_list_style(self._doc, n, para, kind, ordinal=ordinal)
 
+    def indent_list_item(
+        self,
+        n: int,
+        para: Paragraph,
+        delta: float,
+    ) -> textedit.ParagraphReplaceResult:
+        """Shift a list item's box left/right by ``delta`` (L4 indent)."""
+        return textedit.indent_list_item(self._doc, n, para, delta)
+
     def style_paragraph_selection(
         self,
         n: int,

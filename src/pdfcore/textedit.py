@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pymupdf
 
-from pdfcore.lists import is_bullet_only, split_leading_marker
+from pdfcore.lists import is_bullet_only, leading_marker, split_leading_marker
 
 # get_text("dict") span flag bits. Verified empirically (flags-probe test and
 # the real quote sample: Helvetica-Bold spans report flags=16).
@@ -1942,6 +1942,7 @@ def replace_paragraph_runs(
     exact_font: bool = True,
     align: str | None = None,
     hang: float | None = None,
+    indent: float = 0.0,
 ) -> ParagraphReplaceResult:
     """Replace a paragraph with RICH runs, laid out by the engine (E9).
 
@@ -1984,17 +1985,16 @@ def replace_paragraph_runs(
     align_val = para.align if align is None else _check_align(align)
     pitch_val = pitch if pitch is not None else para.pitch
     wrap = max(20.0, width if width is not None else (para.bbox[2] - para.bbox[0]))
-    # Hanging indent (list L1): a folded bullet item keeps its ORIGINAL marker
+    # Hanging indent (list L1/L2). A folded bullet item keeps its ORIGINAL marker
     # span (a symbol-font bullet does not round-trip through insert_text — it has
-    # no Unicode cmap entry), and redacts + re-lays only the BODY at box-left +
-    # hang. The leading marker is split off the runs so it is not laid out
-    # twice. Editing the bullet AWAY (no leading marker in the runs) collapses to
-    # a plain paragraph — the old bullet is then redacted with everything else.
-    # Hanging indent. ``hang`` OVERRIDES the paragraph's own indent — L2's
-    # make_list passes it to CREATE a list item from plain text; None keeps the
-    # detected indent. Disabled only on a MOVE: the kept bullet must not stay
-    # behind while the body translates, so a moved list item degrades to a plain
-    # paragraph (marker inline). A width change (box resize) keeps the hang.
+    # no Unicode cmap entry) and redacts + re-lays only the BODY at box-left +
+    # hang; the leading marker is split off the runs so it is not laid out twice.
+    # ``hang`` OVERRIDES the detected indent (make_list creates a list item;
+    # None keeps it). Disabled only on a MOVE: a kept bullet must not stay behind
+    # while the body translates, so a moved item degrades to plain (marker
+    # inline). A width change (box resize) keeps the hang. ``indent`` shifts the
+    # whole item's box-left (L4 increase/decrease indent) and forces the marker
+    # to be DRAWN at the new position (the kept-glyph span cannot be moved).
     in_place = offset == (0.0, 0.0)
     detected_hang = para.hang_indent if in_place else 0.0
     hang = detected_hang if hang is None else (hang if in_place else 0.0)
@@ -2005,12 +2005,13 @@ def replace_paragraph_runs(
         if marker_runs is None:  # no leading marker in the runs — plain paragraph
             hang, body_runs = 0.0, runs
     # KEEP an existing folded bullet's original span (preserve its exact symbol
-    # glyph) when editing it in place; a CREATED marker (no such span, or a
-    # numbered marker) is DRAWN instead.
+    # glyph) when editing it in place; a CREATED marker (no such span, a numbered
+    # marker, or an INDENT that moves the whole item) is DRAWN instead.
     keep_span = (
         para.spans[0]
         if (
             marker_runs is not None
+            and indent == 0.0
             and para.hang_indent > 0
             and para.spans
             and is_bullet_only(para.spans[0].text)
@@ -2038,7 +2039,7 @@ def replace_paragraph_runs(
         needed = ascent + (len(lines) - 1) * pitch_val + descent
         if needed > page_h + 0.5:  # pre-flight: nothing mutated yet
             raise ValueError("The replacement text does not fit the paragraph box — shorten it.")
-        origin_x = min(max(para.bbox[0] + offset[0], 0.0), max(0.0, page_w - wrap))
+        origin_x = min(max(para.bbox[0] + offset[0] + indent, 0.0), max(0.0, page_w - wrap))
         first_baseline = para.first_origin[1] + offset[1]
 
         def line_shift(line: list[_Fragment]) -> float:
@@ -2191,6 +2192,7 @@ def set_list_style(
     kind: str | None,
     *,
     ordinal: int = 1,
+    indent: float = 0.0,
 ) -> ParagraphReplaceResult:
     """Convert a paragraph to/from a list item (L2, user request).
 
@@ -2209,18 +2211,58 @@ def set_list_style(
     # own width. None (clear) keeps the paragraph's own width.
     para_width = para.bbox[2] - para.bbox[0]
     if kind is None:
-        return replace_paragraph_runs(doc, page_index, para, body_runs, hang=0.0)
+        return replace_paragraph_runs(doc, page_index, para, body_runs, hang=0.0, indent=indent)
     if kind == "bullet":
         runs = [StyledRun("• ", marker_style), *body_runs]
         width = para_width + _LIST_HANG
-        return replace_paragraph_runs(doc, page_index, para, runs, hang=_LIST_HANG, width=width)
+        return replace_paragraph_runs(
+            doc, page_index, para, runs, hang=_LIST_HANG, width=width, indent=indent
+        )
     if kind == "number":
         marker = f"{ordinal}. "
         marker_w = pymupdf.get_text_length(marker, fontname=marker_style.code, fontsize=para.size)
         runs = [StyledRun(marker, marker_style), *body_runs]
         width = para_width + marker_w + 2.0
-        return replace_paragraph_runs(doc, page_index, para, runs, hang=0.0, width=width)
+        return replace_paragraph_runs(
+            doc, page_index, para, runs, hang=0.0, width=width, indent=indent
+        )
     raise ValueError(f"list kind must be one of {LIST_KINDS} or None, not {kind!r}")
+
+
+def list_item_kind(para: Paragraph) -> tuple[str | None, int]:
+    """The list kind of a paragraph: ``("bullet", 1)`` for a folded bullet,
+    ``("number", n)`` for a leading ordinal, ``(None, 1)`` for a plain
+    paragraph. Drives the toolbar/menu state and re-application on indent."""
+    if para.hang_indent > 0 and para.spans and is_bullet_only(para.spans[0].text):
+        return "bullet", 1
+    marker = leading_marker(para.text)
+    if marker is not None and marker.kind != "bullet":
+        return "number", marker.ordinal or 1
+    if marker is not None and marker.kind == "bullet":
+        return "bullet", 1
+    return None, 1
+
+
+# The indent step (pt) for L4 increase/decrease indent — the samples' marker gap.
+LIST_INDENT_STEP = 18.0
+
+
+def indent_list_item(
+    doc: pymupdf.Document,
+    page_index: int,
+    para: Paragraph,
+    delta: float,
+) -> ParagraphReplaceResult:
+    """Shift a list item's whole box left/right by ``delta`` (L4 increase /
+    decrease indent), re-drawing its marker at the new position.
+
+    Only for a list item (a plain paragraph is returned unchanged). The marker
+    is REDRAWN, so an imported symbol bullet becomes a standard bullet glyph on
+    indent (its original span cannot be translated) — an accepted trade-off."""
+    kind, ordinal = list_item_kind(para)
+    if kind is None:
+        raise ValueError("not a list item")
+    return set_list_style(doc, page_index, para, kind, ordinal=ordinal, indent=delta)
 
 
 def _split_span_selection(

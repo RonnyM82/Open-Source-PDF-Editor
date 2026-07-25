@@ -1330,6 +1330,25 @@ def test_ui_format_paragraph_as_list_and_clear(qapp, tmp_path):
         window.close()
 
 
+def test_ui_indent_list_item(qapp, tmp_path):
+    """Increase-indent shifts a list item right as one undoable command."""
+    window = MainWindow()
+    try:
+        window.open_path(_wide_paragraph_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 200, 97)
+        view._apply_list_style("bullet", 0, [para])
+        item = next(p for p in view.document.paragraphs(0) if p.hang_indent > 0)
+        left0 = item.bbox[0]
+        view._indent_list_items(18.0, 0, [item])
+        after = next(p for p in view.document.paragraphs(0) if p.hang_indent > 0)
+        assert after.bbox[0] > left0 + 10  # shifted right, still a bullet
+    finally:
+        window.close()
+
+
 def test_ui_embedded_font_map_empty_for_non_embedded(qapp, tmp_path):
     """A non-embedded (base-14) paragraph populates no embedded-font map, so the
     commit path takes the normal helv/base-14 route."""
