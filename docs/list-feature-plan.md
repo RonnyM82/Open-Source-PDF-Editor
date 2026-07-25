@@ -158,7 +158,96 @@ All mutating ops go through the existing SnapshotCommand/undo funnel and the
   paragraphs/geometry (add to the `after_command` funnel, don't invent a new
   invalidation path).
 
-## 6. Open scope questions (for the user)
+## 6. UI & interaction design
+
+Grounded in patterns the app already has — nothing here invents a new widget
+kind. **The load-bearing decision is Q7 below: the marker is a PROPERTY of the
+item, not editable text.** Everything else follows from that.
+
+### 6.1 Toolbar
+
+All controls live on the existing **Text style toolbar**, next to the
+justification dropdown, and are **edit-mode only**. Bump `_STATE_VERSION`
+(main_window.py) so a stale saved layout is dropped. Icons come from
+`pdfapp/icons.py` (`mdi6.*`), re-baked on theme change via `_assign_icons`.
+
+- **Bulleted list** toggle (`format-list-bulleted`) and **Numbered list** toggle
+  (`format-list-numbered`). Mutually exclusive; **checked** when the caret /
+  selection sits in a list of that kind (reflected the same way B/I/U track the
+  selection — `selectionFormatChanged` / `styleContextChanged`). Clicking a
+  checked toggle **unlists** (`clear_list`).
+- **Marker-style dropdown** — built by the SHARED `MainWindow._make_dropdown_
+  button` (InstantPopup; the exact flat-button-with-corner-arrow used by the
+  alignment control and the highlighter swatch — NOT a split button). The button
+  wears the active marker's glyph; its menu lists the kind's options
+  (`•  ◦  ▪  –` for bullets; `1.  1)  (1)  a.  i.` for numbered) as an exclusive
+  `QActionGroup`. **Sticky** — persisted like `last_text_align` /
+  `last_highlight_color` so it starts on the last-used marker.
+- **Increase / Decrease indent** buttons (`format-indent-increase` /
+  `-decrease`). Distinct MDI glyphs from the `format-align-*` justification set
+  (same distinction already drawn for `box_align_*` vs `format-align-*`). Step =
+  one indent unit (§6.4). Disabled at level 0 for decrease.
+
+Gating mirrors the other content controls: enabled on `has_page and edit_mode`
+with a text selection or an open paragraph editor; a checked/greyed state
+reflects the caret's paragraph. Disabled on rotated or embedded-unsupported
+spans (same refusal the paragraph editor already makes).
+
+### 6.2 Editing an existing list item
+
+The marker is a property, so **the paragraph editor overlay opens over the item
+BODY only** — the `•`/`1.` is never in the QTextEdit. Concretely:
+
+- Double-click (or Ctrl+double-click) an item → `paragraph_at` returns the
+  list-aware `Paragraph` whose first line's origin is the **text indent** `x_t`;
+  the overlay is positioned there, and the marker renders on the page to its
+  left, untouched. This reuses the existing overlay verbatim — it already opens
+  at a paragraph's own box and grows to fit.
+- **Enter stays a line break** within the item (unchanged paragraph-editor
+  behaviour); Ctrl+Enter commits. Committing re-lays marker + body via
+  `replace_paragraph_runs`, marker pinned at `x_m`, body wrapped at `x_t` — the
+  hanging indent is preserved for free because it is the paragraph's box.
+- The style toolbar's list toggles reflect "this is a bulleted/numbered item"
+  while the editor is open, and the marker-style dropdown shows its marker.
+- **Emptying the body** → Q6 decides (drop the marker, or keep an empty item).
+
+### 6.3 Creating a list
+
+Two paths, both reusing existing machinery:
+
+- **From existing text** (L2): select paragraphs with the tools that already
+  exist — Ctrl/Shift+click or the box marquee (`_multi_paragraphs`) — then click
+  the Bulleted/Numbered toggle. One undoable `make_list` command markers each
+  selected paragraph and sets the hanging indent; numbering follows selection
+  order. Unlisting is the same selection + toggle-off.
+- **From scratch** (L3): Edit → "Insert list…" arms a click-to-place gesture
+  (`arm_insert_point` + a persistent chip via `theme.armed_chip_qss()`, exactly
+  like "Insert text…"). The click opens the paragraph editor seeded with the
+  first marker's kind/style (from the sticky dropdown). Committing an item and
+  pressing Enter-for-next is the L3 continuation behaviour; an empty item ends
+  the list. (Continuation detail is the main L3 design work.)
+
+### 6.4 Indentation
+
+- **One indent unit = 18 pt** (the marker→text gap in the sample; also a sane
+  default step). Increase/Decrease shift the item's `x_m` and `x_t` together by
+  one unit and re-lay via `replace_paragraph_runs` with an `offset`/indent
+  parameter — a pure geometry change, one undoable command, no text change.
+- **Tab / Shift+Tab at the START of an item** mirror the buttons (word-processor
+  convention). Guarded so they only fire at the item's start caret — elsewhere
+  in the editor Tab keeps its normal meaning; this needs a small key handler on
+  the paragraph editor, gated to list items.
+- For a **flat** list this simply moves the item; **nesting** (recomputing
+  levels, indent-drives-marker-style) is L4 and out of the first cut.
+- Optional (defer): a drag affordance on the hanging indent, like the paragraph
+  editor's wrap-width grip. Not needed for L1–L3.
+
+### 6.5 What this does NOT add
+
+No ruler, no tab stops, no list-continuation across page breaks, no bullet
+image/picture markers. Those are word-processor scope and stay out.
+
+## 7. Open scope questions (for the user)
 
 1. **How far to go?** L1 (grouping fix) only, L1+L2 (format existing), or through
    L3 (create)? L4 (auto-renumber/nesting) recommended deferred.
@@ -169,8 +258,16 @@ All mutating ops go through the existing SnapshotCommand/undo funnel and the
 5. **A real sample with a NUMBERED list** would de-risk detection — the current
    samples are bullets only. Can one be provided?
 6. **Deleting an item's text**: drop the marker too, or leave an empty bullet?
+7. **Marker as property vs. editable text** (§6.2) — the plan assumes the marker
+   is a PROPERTY (never in the editor, re-drawn by the engine). The alternative
+   (marker is literal editable text the user can retype) is simpler to build but
+   lets the user corrupt the sequence and fights auto-numbering. Confirm the
+   property model.
+8. **Indent step & drag** (§6.4) — is an 18 pt button/Tab step enough, or do you
+   want a drag-adjustable hanging indent (ruler-like) too? The latter is more
+   work and edges toward word-processor territory.
 
-## 7. Test strategy
+## 8. Test strategy
 
 - Pure detection tests on `document_with_hyperlink.pdf` (bullets) + a synthetic
   numbered-list fixture built in conftest (embed a marker + hanging text).
