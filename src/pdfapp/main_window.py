@@ -358,6 +358,11 @@ class MainWindow(QMainWindow):
         self._show_log_action = QAction("Show &diagnostics log", self)
         self._show_log_action.triggered.connect(self.show_diagnostics_log)
 
+        # Help → About (app name, release version, component versions, licence).
+        # Never gated.
+        self._about_action = QAction("&About PDF Editor", self)
+        self._about_action.triggered.connect(self.show_about)
+
         # Tools → Extract text (X1): a READ feature — enabled whenever a
         # document is open, never edit-gated (extraction mutates nothing).
         self._extract_text_action = QAction("Extract &text…", self)
@@ -639,6 +644,8 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction(self._gestures_action)
         help_menu.addAction(self._show_log_action)
+        help_menu.addSeparator()
+        help_menu.addAction(self._about_action)
 
     # --- theme ------------------------------------------------------------
     def _on_dark_theme_toggled(self, checked: bool) -> None:
@@ -2028,6 +2035,16 @@ class MainWindow(QMainWindow):
         from pdfapp.help_dialog import GestureHelpDialog
 
         dialog = GestureHelpDialog(self)
+        if self.isVisible():
+            dialog.exec()
+        return dialog
+
+    def show_about(self):
+        """Open the About dialog; returns it (exec'd only when on screen —
+        offscreen tests inspect the return)."""
+        from pdfapp.about_dialog import AboutDialog
+
+        dialog = AboutDialog(self)
         if self.isVisible():
             dialog.exec()
         return dialog
