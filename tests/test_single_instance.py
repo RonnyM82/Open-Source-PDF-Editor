@@ -198,7 +198,11 @@ def _election_worker(key: str, myfile: str, outdir: str, expected: int) -> None:
 
     def on_paths(paths: list[str]) -> None:
         collected.extend(paths)
-        if len(collected) >= expected:
+        # Count UNIQUE files: a delivery whose ack was lost is retried, so the
+        # same path can arrive twice (harmless — focus-existing-tab dedupes it).
+        # Quitting on the raw count could stop early on a duplicate and miss a
+        # real forward.
+        if len(set(collected)) >= expected:
             loop.quit()
 
     server.set_handler(on_paths)

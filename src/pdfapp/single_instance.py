@@ -93,30 +93,42 @@ def _grant_foreground_to_primary() -> None:
 
 
 def try_forward_to_running(paths: list[str], key: str | None = None) -> bool:
-    """If another instance is listening, send it ``paths`` and return True.
+    """If another instance is listening, send it ``paths`` and return True ONLY
+    when the primary has ACKNOWLEDGED receipt.
 
-    Returns False when no instance owns the socket — the caller should then
-    become the primary. Filenames cannot contain newlines on Windows, so the
-    payload is simply newline-joined UTF-8 (empty = a bare re-launch that should
-    just raise the running window).
+    Returns False when no instance owns the socket OR when a connection was made
+    but delivery could not be confirmed — either way the caller retries (via the
+    election poll loop) rather than dropping the file. Confirming delivery is
+    load-bearing: the old code returned True the moment ``connectToServer``
+    succeeded, so under contention (Explorer launching one process per file at
+    once) a secondary could connect, fail to deliver, and exit anyway — the file
+    silently vanished (the flaky-CI symptom, and a real dropped-file bug). The
+    primary acks by CLOSING the connection, but only after it has consumed the
+    whole length-prefixed message, so a completed disconnect ⟺ delivered.
+
+    Filenames cannot contain newlines on Windows, so the payload is
+    newline-joined UTF-8 (empty = a bare re-launch that should raise the window).
+    Duplicate delivery from a retry is harmless — the primary opens each path via
+    focus-existing-tab, so a re-sent file just re-focuses its tab.
     """
     key = key or default_key()
     socket = QLocalSocket()
     socket.connectToServer(key)
     if not socket.waitForConnected(_CONNECT_TIMEOUT_MS):
-        return False
+        return False  # no primary listening — the caller becomes/awaits one
     _grant_foreground_to_primary()
-    # Length-prefixed so the primary knows when the whole message has arrived
-    # and can close the connection to acknowledge it. We then wait for THAT
-    # close instead of tearing the socket down ourselves — a self-initiated
-    # disconnect can race ahead of the primary reading the bytes (data loss
-    # under load). We keep the pipe open until the primary has consumed it.
     payload = "\n".join(paths).encode(_ENCODING)
     socket.write(len(payload).to_bytes(_HEADER_LEN, "big") + payload)
     socket.flush()
     socket.waitForBytesWritten(_WRITE_TIMEOUT_MS)
-    socket.waitForDisconnected(_ACK_TIMEOUT_MS)
-    return True
+    # The primary disconnects once it has the whole framed message (its ack). A
+    # very fast primary may have closed before we start waiting, hence the
+    # already-unconnected check. No ack within the window = NOT delivered ->
+    # return False so the caller retries instead of losing the file.
+    return (
+        socket.state() == QLocalSocket.LocalSocketState.UnconnectedState
+        or socket.waitForDisconnected(_ACK_TIMEOUT_MS)
+    )
 
 
 def _lock_path(key: str) -> str:
