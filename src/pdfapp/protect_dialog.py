@@ -32,6 +32,32 @@ from PySide6.QtWidgets import (
 from pdfcore import protect
 from pdfcore.protect import ChangesAllowed, ProtectionSpec
 
+# Plain-words hint per "Changes allowed" level (user request: the presets are
+# Acrobat's five — a LADDER over four permission bits, not mix-and-match, and
+# the page-ops level forks off on its own — so each selection explains itself).
+_CHANGES_HINTS: dict[ChangesAllowed, str] = {
+    ChangesAllowed.NONE: (
+        "No changes at all — the document is read-only. Printing and copying "
+        "follow the settings below."
+    ),
+    ChangesAllowed.PAGES: (
+        "Only whole-page changes: insert, delete, rotate and reorder pages. "
+        "Content on pages — existing or inserted — cannot be edited."
+    ),
+    ChangesAllowed.FORM_FILL: (
+        "Only filling in form fields and signing existing signature fields — "
+        "no other changes. (This app has no form editing, so here the "
+        "document behaves as read-only.)"
+    ),
+    ChangesAllowed.COMMENT_FORM_FILL: (
+        "Commenting (highlights, comments, callouts) plus form filling and "
+        "signing. No content or page changes."
+    ),
+    ChangesAllowed.ANY_EXCEPT_EXTRACT: (
+        "Full editing — everything except extracting pages into other documents."
+    ),
+}
+
 # Combo order == Acrobat's dropdown order.
 _CHANGES_OPTIONS: list[tuple[str, ChangesAllowed]] = [
     ("None", ChangesAllowed.NONE),
@@ -86,6 +112,11 @@ class ProtectDialog(QDialog):
         for label, _value in _CHANGES_OPTIONS:
             self._changes_combo.addItem(label)
         restrict_form.addRow(QLabel("Changes allowed:"), self._changes_combo)
+        self._changes_hint = QLabel("")
+        self._changes_hint.setWordWrap(True)
+        restrict_form.addRow(self._changes_hint)
+        self._changes_combo.currentIndexChanged.connect(self._update_changes_hint)
+        self._update_changes_hint()
         self._copy_check = QCheckBox("Enable copying of text, images, and other content")
         self._copy_check.setChecked(True)
         restrict_form.addRow(self._copy_check)
@@ -143,6 +174,10 @@ class ProtectDialog(QDialog):
             if value is changes:
                 self._changes_combo.setCurrentIndex(index)
                 break
+
+    def _update_changes_hint(self) -> None:
+        level = _CHANGES_OPTIONS[self._changes_combo.currentIndex()][1]
+        self._changes_hint.setText(_CHANGES_HINTS[level])
 
     # --- accept / result --------------------------------------------------
     def _fail(self, message: str) -> None:

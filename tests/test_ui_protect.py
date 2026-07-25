@@ -73,6 +73,29 @@ def test_dialog_validation_rejections(qapp):
         dlg.deleteLater()
 
 
+def test_dialog_changes_hint_tracks_selection(qapp):
+    """Each 'Changes allowed' level explains itself in plain words (user
+    request — the Acrobat ladder is not self-evident)."""
+    dlg = ProtectDialog(None)
+    try:
+        expectations = {
+            ChangesAllowed.NONE: "read-only",
+            ChangesAllowed.PAGES: "whole-page",
+            ChangesAllowed.FORM_FILL: "form fields",
+            ChangesAllowed.COMMENT_FORM_FILL: "commenting",
+            ChangesAllowed.ANY_EXCEPT_EXTRACT: "full editing",
+        }
+        seen = set()
+        for changes, keyword in expectations.items():
+            dlg.set_restrictions("pw", changes=changes)
+            hint = dlg._changes_hint.text()
+            assert keyword in hint.lower()
+            seen.add(hint)
+        assert len(seen) == len(expectations)  # every level has its OWN hint
+    finally:
+        dlg.deleteLater()
+
+
 def test_dialog_remove_protection(qapp):
     dlg = ProtectDialog(None, currently_protected=True)
     try:
