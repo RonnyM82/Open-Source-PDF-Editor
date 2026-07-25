@@ -593,6 +593,102 @@ def test_font_change_reflows_within_box(real_embedded_bug_pdf):
     assert frozen_failures > 0  # the frozen-line bug reproduces
 
 
+# --- list recognition (L1): bullet folding + hanging-indent editing ----------
+
+
+def _bullet_list_pdf(tmp_path):
+    """A bulleted list: a bullet span at x=90 sharing the body's baseline, the
+    body hanging at x=108. Two items, the first wrapping to a second line."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((90, 100), "•", fontsize=11)
+    page.insert_text(
+        (108, 100), "First item body running fairly wide across the column here now", fontsize=11
+    )
+    page.insert_text((108, 116), "and wrapping onto a second line of the same item.", fontsize=11)
+    page.insert_text((90, 150), "•", fontsize=11)
+    page.insert_text((108, 150), "Second short item.", fontsize=11)
+    path = tmp_path / "bullets.pdf"
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_bullet_items_fold_into_one_paragraph(tmp_path):
+    with PdfDocument.open(_bullet_list_pdf(tmp_path)) as doc:
+        paras = doc.paragraphs(0)
+        items = [p for p in paras if p.hang_indent > 0]
+    assert len(items) == 2  # two grouped bullet items, not 4 stray fragments
+    first = next(p for p in items if "First item" in p.text)
+    assert first.text.lstrip().startswith(("•", "·"))  # marker at the front
+    assert first.hang_indent == pytest.approx(18.0, abs=1.0)
+    assert len(first.lines) == 2  # bullet folded onto the body, body wraps once
+
+
+def test_bullet_item_hit_test_includes_marker(tmp_path):
+    with PdfDocument.open(_bullet_list_pdf(tmp_path)) as doc:
+        # a click on the body resolves the WHOLE item (marker + body)
+        para = doc.paragraph_at(0, 150, 148)
+    assert para is not None
+    assert para.hang_indent > 0
+    assert "Second short item" in para.text
+
+
+def test_edit_bullet_item_preserves_marker_and_hang(tmp_path):
+    src = _bullet_list_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        para = next(p for p in doc.paragraphs(0) if "First item" in p.text)
+        runs = _para_runs(para, embed=False, text_map=lambda t: t.replace("First", "Edited"))
+        doc.replace_paragraph_runs(0, para, runs)
+        out = tmp_path / "edited.pdf"
+        doc.save(out)
+    with PdfDocument.open(out) as doc:
+        item = next((p for p in doc.paragraphs(0) if "Edited item" in p.text), None)
+        assert item is not None  # edit applied
+        assert item.hang_indent > 0  # STILL grouped (cross-block fold) with a hang
+        assert item.text.lstrip().startswith(("•", "·"))  # marker survived
+        # the marker sits at the box left, the body hangs deeper
+        assert item.lines[0][0].bbox[0] == pytest.approx(90.0, abs=1.5)
+        body = next(s for s in item.lines[0] if s.text.strip() and s.bbox[0] > 100)
+        assert body.bbox[0] == pytest.approx(108.0, abs=1.5)
+
+
+def test_numbered_inline_marker_not_folded(tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 100), "1. An inline numbered heading on one line.", fontsize=11)
+    path = tmp_path / "num.pdf"
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        para = pdoc.paragraphs(0)[0]
+    assert para.hang_indent == 0.0  # inline number, no hanging indent to reproduce
+    assert para.text.strip().startswith("1.")
+
+
+_LIST_SAMPLES = [
+    Path(__file__).resolve().parents[1] / "samples" / name
+    for name in ("document_with_hyperlink.pdf", "sample_lists.pdf")
+]
+
+
+def test_real_sample_bullets_grouped():
+    """The real Word-export samples' bulleted lists group into hanging-indent
+    items. Skips when the (local-only) samples are absent."""
+    present = [p for p in _LIST_SAMPLES if p.exists()]
+    if not present:
+        pytest.skip("no list sample present (samples/ is local-only)")
+    for path in present:
+        with PdfDocument.open(path) as doc:
+            grouped = [
+                p for n in range(doc.page_count) for p in doc.paragraphs(n) if p.hang_indent > 0
+            ]
+        assert grouped, f"expected grouped bullet items in {path.name}"
+        for item in grouped:
+            assert item.text.lstrip().startswith(("•", "·"))
+            assert item.hang_indent == pytest.approx(18.0, abs=4.0)
+
+
 def test_replace_with_empty_string_deletes(quote_pdf, tmp_path):
     out, result = _replace_and_reopen(quote_pdf.path, tmp_path, quote_pdf.date, "")
     assert not result.inserted

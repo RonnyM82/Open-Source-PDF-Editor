@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pymupdf
 
+from pdfcore.lists import is_bullet_only, split_leading_marker
+
 # get_text("dict") span flag bits. Verified empirically (flags-probe test and
 # the real quote sample: Helvetica-Bold spans report flags=16).
 FLAG_SUPERSCRIPT = 1
@@ -322,6 +324,30 @@ def _dominant_label(runs: list[StyledRun]) -> str:
     return _style_label(best.style)
 
 
+def _split_marker_runs(
+    runs: list[StyledRun],
+) -> tuple[list[StyledRun] | None, list[StyledRun]]:
+    """Split a leading list marker off rich runs (list L1 hanging indent).
+
+    Returns ``(marker_runs, body_runs)`` when the runs begin with a list marker
+    (``"• "``, ``"1. "``), else ``(None, runs)``. The marker (with its trailing
+    gutter whitespace) keeps its own style so a bullet re-inserts in its own
+    font; the body is everything after it, laid out at the hanging indent."""
+    for idx, run in enumerate(runs):
+        if "\n" in run.text:  # a marker never spans a hard line break
+            return None, runs
+        if not run.text.strip():
+            continue  # skip a purely-whitespace leading run
+        split = split_leading_marker(run.text)
+        if split is None:
+            return None, runs
+        marker_text, body_text = split
+        marker_runs = [*runs[:idx], StyledRun(marker_text, run.style)]
+        body_runs = ([StyledRun(body_text, run.style)] if body_text else []) + list(runs[idx + 1 :])
+        return marker_runs, body_runs
+    return None, runs
+
+
 @dataclass(frozen=True)
 class Paragraph:
     """A user-editable multi-line unit: a uniform-pitch run of lines.
@@ -355,6 +381,12 @@ class Paragraph:
     # "left" | "right" | "center". Reproduced on re-insert; "left" when
     # ambiguous (single line, or edges too irregular to call).
     align: str = "left"
+    # Hanging indent (pt): a bulleted list item folds its marker onto the front
+    # of the body (list L1), and this is the gap from the marker's indent to the
+    # body's — the marker draws at the box left, the body (first line after the
+    # marker AND every wrapped line) at box-left + hang_indent. 0 = not a
+    # hanging-indent item. See replace_paragraph_runs' hang layout.
+    hang_indent: float = 0.0
 
 
 # Line edges within this many points of each other count as "aligned".
@@ -405,6 +437,33 @@ def _detect_alignment(line_tuples: tuple[tuple[TextSpan, ...], ...]) -> str:
     if max(mids) - min(mids) <= _ALIGN_TOL:
         return "center"
     return "left"
+
+
+def _hang_indent(line_tuples: tuple[tuple[TextSpan, ...], ...]) -> float:
+    """The hanging indent of a FOLDED bullet list item (list L1): the gap from
+    the marker's left to the body text's left. 0 for any non-list paragraph.
+
+    Only a folded bullet gets a hang — the first line's first span is a lone
+    bullet and the body sits at a deeper x. The body left is the leftmost NON-
+    blank span past the marker (the bullet's own trailing-space span is skipped
+    — it can be a separate Arial space span) and, when the item wraps, the
+    continuation indent (the definitive hanging indent). Inline numbered markers
+    share the body span, so no gap is read here (intentional; L1 reproduces the
+    bullet hanging indent only)."""
+    if not line_tuples:
+        return 0.0
+    first = line_tuples[0]
+    if not first or not is_bullet_only(first[0].text):
+        return 0.0
+    marker_x = first[0].bbox[0]
+    # The body text's left = the leftmost non-blank span on the FIRST line past
+    # the marker (reliable — the marker was folded ONTO the body line; a stray
+    # short continuation that wrapped back to the marker indent must not count).
+    body_xs = [s.bbox[0] for s in first[1:] if s.text.strip() and s.bbox[0] > marker_x + 2.0]
+    if not body_xs:
+        return 0.0
+    hang = min(body_xs) - marker_x
+    return hang if hang > 1.0 else 0.0
 
 
 # A visual line ending within this many ems of the paragraph's widest right
@@ -1268,6 +1327,87 @@ def _repair_foreign_spans(
 _PITCH_TOL = 0.7
 
 
+def _line_text(line: dict) -> str:
+    return "".join(_raw_text(raw) for raw in line["spans"])
+
+
+# A lone bullet-marker line is folded onto a body line sharing its baseline
+# (same visual row, split by the x-gap) that starts deeper and within this gap.
+# The gap bound keeps a bullet from folding into an unrelated same-baseline line
+# in another column; a hanging indent is only ~18 pt.
+_MARKER_FOLD_BASELINE_TOL = 2.0
+_MARKER_FOLD_MAX_GAP = 72.0
+
+
+def _merge_lines(marker: dict, body: dict) -> dict:
+    """One line dict: a marker line's spans prepended to a body line's spans."""
+    mb, bb = marker["bbox"], body["bbox"]
+    return {
+        "spans": list(marker["spans"]) + list(body["spans"]),
+        "bbox": (min(mb[0], bb[0]), min(mb[1], bb[1]), max(mb[2], bb[2]), max(mb[3], bb[3])),
+        "dir": body.get("dir", (1.0, 0.0)),
+        "wmode": body.get("wmode", 0),
+    }
+
+
+def _folded_page_blocks(page: pymupdf.Page, keep) -> list[list[dict]]:
+    """Per-block line lists with lone bullet markers folded onto their body
+    lines — ACROSS blocks (list L1).
+
+    On the page a bullet is its own span at a lesser indent, sharing the first
+    body line's baseline (MuPDF splits them by the x-gap); the pitch-run
+    grouping, needing a real vertical advance, otherwise leaves it its own
+    paragraph. After an EDIT the re-inserted body can also land in a DIFFERENT
+    MuPDF block from its (kept) bullet, so the match is cross-block: each bullet
+    folds onto the NEAREST body line sharing its baseline that starts deeper and
+    within ``_MARKER_FOLD_MAX_GAP``. ``_build_paragraph`` reads the folded
+    marker/body x-gap back as a hanging indent. (Numbered markers are inline in
+    the body span already, so only bullets fold.)"""
+    blocks = [
+        [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
+        for block in page.get_text("rawdict")["blocks"]
+        if block.get("type") == 0
+    ]
+    bodies = [
+        (bi, li, _line_baseline(line), line["bbox"][0])
+        for bi, lines in enumerate(blocks)
+        for li, line in enumerate(lines)
+        if _line_rotation(line) == 0 and not is_bullet_only(_line_text(line))
+    ]
+    merge_into: dict[tuple[int, int], dict] = {}  # (bi, li) body -> marker line
+    remove: set[tuple[int, int]] = set()  # bullet lines consumed
+    claimed: set[tuple[int, int]] = set()
+    for bi, lines in enumerate(blocks):
+        for li, line in enumerate(lines):
+            if _line_rotation(line) != 0 or not is_bullet_only(_line_text(line)):
+                continue
+            mbase, mx = _line_baseline(line), line["bbox"][0]
+            best = None
+            for bbi, bli, bbase, bx0 in bodies:
+                if (bbi, bli) in claimed:
+                    continue
+                gap = bx0 - mx
+                aligned = abs(bbase - mbase) <= _MARKER_FOLD_BASELINE_TOL
+                if aligned and 1.0 < gap <= _MARKER_FOLD_MAX_GAP:
+                    if best is None or gap < best[0]:
+                        best = (gap, bbi, bli)
+            if best is not None:
+                _, bbi, bli = best
+                merge_into[(bbi, bli)] = line
+                claimed.add((bbi, bli))
+                remove.add((bi, li))
+    out: list[list[dict]] = []
+    for bi, lines in enumerate(blocks):
+        folded = [
+            _merge_lines(merge_into[(bi, li)], line) if (bi, li) in merge_into else line
+            for li, line in enumerate(lines)
+            if (bi, li) not in remove
+        ]
+        if folded:
+            out.append(folded)
+    return out
+
+
 def _block_units(lines: list[dict]) -> list[list[int]]:
     """Split a block's line INDICES into paragraph-candidate units.
 
@@ -1316,8 +1456,7 @@ def paragraph_at(
     bounds = _normalize_boundaries(boundaries)
     # Hit-test in ORIGINAL block/line order — overlap ties (a box's line bbox
     # bleeding into a neighbour's) must resolve exactly as they always did.
-    for block in page.get_text("rawdict")["blocks"]:
-        lines = [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
+    for lines in _folded_page_blocks(page, keep):
         hit = None
         for line in lines:
             bx0, by0, bx1, by1 = line["bbox"]
@@ -1385,8 +1524,7 @@ def _partition_lines(
     """
     region_lines: dict[int, list[dict]] = {}
     plain_blocks: list[list[dict]] = []
-    for block in page.get_text("rawdict")["blocks"]:
-        lines = [line for line in block.get("lines", ()) if line["spans"] and keep(line)]
+    for lines in _folded_page_blocks(page, keep):
         if not bounds:
             if lines:
                 plain_blocks.append(lines)
@@ -1623,6 +1761,7 @@ def _build_paragraph(
         pitch = rep.size * 1.2
     return Paragraph(
         align=_detect_alignment(line_tuples),
+        hang_indent=_hang_indent(line_tuples),
         page_index=page_index,
         text=text,
         bbox=bbox,
@@ -1844,7 +1983,27 @@ def replace_paragraph_runs(
     align_val = para.align if align is None else _check_align(align)
     pitch_val = pitch if pitch is not None else para.pitch
     wrap = max(20.0, width if width is not None else (para.bbox[2] - para.bbox[0]))
-    lines = _layout_runs(runs, wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
+    # Hanging indent (list L1): a folded bullet item keeps its ORIGINAL marker
+    # span (a symbol-font bullet does not round-trip through insert_text — it has
+    # no Unicode cmap entry), and redacts + re-lays only the BODY at box-left +
+    # hang. The leading marker is split off the runs so it is not laid out
+    # twice. Editing the bullet AWAY (no leading marker in the runs) collapses to
+    # a plain paragraph — the old bullet is then redacted with everything else.
+    # Only for an IN-PLACE edit (offset 0, box not widened): on a MOVE the kept
+    # bullet must not stay behind while the body translates, so a moved list item
+    # degrades to a plain paragraph (marker inline).
+    in_place = offset == (0.0, 0.0) and width is None
+    hang = para.hang_indent if (para.hang_indent > 0 and in_place) else 0.0
+    keep_span = (
+        para.spans[0] if (hang > 0 and para.spans and is_bullet_only(para.spans[0].text)) else None
+    )
+    body_runs = runs
+    if keep_span is not None:
+        marker_runs, body_runs = _split_marker_runs(runs)
+        if marker_runs is None:  # the bullet was edited away — plain paragraph
+            keep_span, hang, body_runs = None, 0.0, runs
+    body_wrap = max(20.0, wrap - hang)
+    lines = _layout_runs(body_runs, body_wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
     while lines and not lines[-1]:
         lines.pop()  # trailing empty lines add height but render nothing
     has_text = any(frag.text.strip() for line in lines for frag in line)
@@ -1869,10 +2028,11 @@ def replace_paragraph_runs(
 
         def line_shift(line: list[_Fragment]) -> float:
             """Justification x-shift (E9.6): right/centre-aligned paragraphs
-            keep their right edge / midpoint within the box."""
+            keep their right edge / midpoint within the box. Measured against
+            the BODY width (the box minus any hanging indent)."""
             if not line:
                 return 0.0
-            return _align_shift(align_val, wrap, line[-1].x + line[-1].width)
+            return _align_shift(align_val, body_wrap, line[-1].x + line[-1].width)
 
         # Clamp onto the page: ascender room at the top, slide up at the bottom.
         lowest_first = page_h - descent - (len(lines) - 1) * pitch_val
@@ -1905,8 +2065,8 @@ def replace_paragraph_runs(
                     o_bot = other.origin[1] + 0.25 * other.size
                     for b, line in outside:
                         size = max(f.style.size for f in line)
-                        x0 = origin_x + line_shift(line) + line[0].x
-                        x1 = origin_x + line_shift(line) + line[-1].x + line[-1].width
+                        x0 = origin_x + hang + line_shift(line) + line[0].x
+                        x1 = origin_x + hang + line_shift(line) + line[-1].x + line[-1].width
                         if (
                             b - 0.8 * size < o_bot
                             and b + 0.25 * size > o_top
@@ -1923,8 +2083,10 @@ def replace_paragraph_runs(
     from pdfcore import comments as comments_module
     from pdfcore import links as links_module
 
-    bands = [_redact_band(span) for span in para.spans]
-    member_bboxes = [span.bbox for span in para.spans]
+    # A kept bullet marker (list L1) is NOT redacted — only the body spans.
+    redact_spans = [span for span in para.spans if span is not keep_span]
+    bands = [_redact_band(span) for span in redact_spans]
+    member_bboxes = [span.bbox for span in redact_spans]
     foreign = _capture_foreign_spans(doc, page_index, bands, member_bboxes)
     moved = (para.bbox, offset[0], offset[1]) if offset != (0.0, 0.0) else None
     comment_guard = comments_module.guard(doc, page_index, moved=moved)
@@ -1933,18 +2095,22 @@ def replace_paragraph_runs(
         page.add_redact_annot(band, fill=fill)
     _apply_text_only_redactions(page)
     _repair_foreign_spans(doc, page_index, foreign, member_bboxes)
-    _remove_member_rules(page, para.spans)
+    _remove_member_rules(page, redact_spans)
     comment_guard.restore()
     link_guard.restore()
     new_bbox = None
     if has_text:
         for i, line in enumerate(lines):
-            _insert_line(page, origin_x + line_shift(line), first_baseline + i * pitch_val, line)
+            _insert_line(
+                page, origin_x + hang + line_shift(line), first_baseline + i * pitch_val, line
+            )
+        # The bullet marker (kept_span) is NOT re-drawn — its original span
+        # survives the redaction, preserving the exact symbol glyph.
         new_bbox = (
             origin_x,
             first_baseline - ascent,
             origin_x + wrap,
-            first_baseline + (len(lines) - 1) * pitch_val + descent,
+            first_baseline + (max(len(lines), 1) - 1) * pitch_val + descent,
         )
     return ParagraphReplaceResult(
         inserted=has_text,

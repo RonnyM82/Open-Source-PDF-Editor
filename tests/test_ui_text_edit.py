@@ -1234,6 +1234,75 @@ def test_ui_font_change_commits_on_word_export(qapp, real_embedded_bug_pdf):
         window.close()
 
 
+def _bullet_list_pdf(tmp_path):
+    """A bulleted list: a bullet at x=90 sharing the body's baseline (x=108)."""
+    import pymupdf
+
+    path = tmp_path / "bullets.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((90, 100), "•", fontsize=11)
+    page.insert_text(
+        (108, 100), "First item body running fairly wide across the column now", fontsize=11
+    )
+    page.insert_text((108, 116), "wrapping onto a second line here.", fontsize=11)
+    page.insert_text((90, 150), "•", fontsize=11)
+    page.insert_text((108, 150), "Second short item.", fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_ui_bullet_item_opens_grouped_with_marker(qapp, tmp_path):
+    """Double-clicking a bulleted item opens the WHOLE item (marker + body) as
+    one hanging-indent paragraph, and an unchanged commit is a no-op."""
+    window = MainWindow()
+    try:
+        window.open_path(_bullet_list_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 150, 148)  # the second item
+        assert para is not None and para.hang_indent > 0
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+        assert editor.toPlainText().lstrip()[:1] in ("•", "·")  # marker shown
+        editor.commit()  # unchanged
+        assert view.undo_stack.count() == 0
+    finally:
+        window.close()
+
+
+def test_ui_edit_bullet_item_keeps_marker_and_hang(qapp, tmp_path):
+    """Editing a bulleted item's body commits, preserves the marker glyph and
+    the hanging indent, and the item stays grouped."""
+    from PySide6.QtGui import QTextCursor
+
+    window = MainWindow()
+    try:
+        window.open_path(_bullet_list_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 150, 148)
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+        cur = editor.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cur)
+        editor.insertPlainText(" APPENDED")
+        editor.commit()
+        assert view.undo_stack.count() == 1  # committed, not refused
+
+        items = [
+            p for p in view.document.paragraphs(0) if p.hang_indent > 0 and "APPENDED" in p.text
+        ]
+        assert items, "edited item lost its grouping/hang"
+        assert items[0].text.lstrip()[:1] in ("•", "·")  # marker survived
+    finally:
+        window.close()
+
+
 def test_ui_embedded_font_map_empty_for_non_embedded(qapp, tmp_path):
     """A non-embedded (base-14) paragraph populates no embedded-font map, so the
     commit path takes the normal helv/base-14 route."""
