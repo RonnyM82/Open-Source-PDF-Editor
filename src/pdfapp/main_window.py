@@ -239,6 +239,13 @@ class MainWindow(QMainWindow):
         self._protect_action = QAction("Pro&tect document…", self)
         self._protect_action.triggered.connect(self.protect_document)
 
+        # The ONE unlock entry point for restricted documents. The disabled
+        # Edit/print/etc. buttons' permission tooltips point here — a
+        # prompt-on-click Edit button read as "editing is possible" (user
+        # report), so restricted commands disable like Print does instead.
+        self._unlock_action = QAction("&Unlock document…", self)
+        self._unlock_action.triggered.connect(self.unlock_document)
+
         self._print_action = QAction("&Print…", self)
         self._print_action.setShortcut(QKeySequence.StandardKey.Print)
         self._print_action.triggered.connect(self.print_current)
@@ -497,6 +504,7 @@ class MainWindow(QMainWindow):
             self._insert_comment_action: "insert_comment",
             self._insert_callout_action: "insert_callout",
             self._protect_action: "protect_document",
+            self._unlock_action: "unlock_document",
             self._place_signature_action: "place_signature",
             self._sign_invisible_action: "sign_invisible",
             self._place_initials_action: "place_initials",
@@ -558,6 +566,10 @@ class MainWindow(QMainWindow):
         }
         for action, tip in tooltips.items():
             action.setToolTip(tip)
+        # Originals for the permission-tooltip swap (a disabled button must
+        # explain WHY — user request; defaults recorded lazily for actions
+        # not in the dict).
+        self._default_tooltips: dict[QAction, str] = dict(tooltips)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -572,6 +584,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._save_action)
         file_menu.addAction(self._save_as_action)
         file_menu.addAction(self._protect_action)
+        file_menu.addAction(self._unlock_action)
         file_menu.addSeparator()
         file_menu.addAction(self._print_action)
         file_menu.addSeparator()
@@ -2010,18 +2023,30 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 self._sync_chrome()  # un-toggle the action
                 return
-        # Restricted document (permission flags deny modification AND page
-        # assembly): entering Edit mode needs the permissions password —
-        # honoring the flags is what makes us a compliant reader.
-        if checked and v.document.is_protected:
-            perms = v.document.permissions
-            if not (perms.can_modify or perms.can_assemble):
-                if not self.isVisible() or not self._prompt_owner_password(
-                    v, "This document's permissions restrict editing."
-                ):
-                    self._sync_chrome()  # un-toggle the action
-                    return
+        # No permission prompt here: a restricted document DISABLES the Edit
+        # button (see _sync_chrome), so this handler is only reached when
+        # editing is permitted. Unlocking is its own File → Unlock document…
+        # command — a prompt-on-click Edit button read as "editing is
+        # possible" and hid the reason in the status bar (user report).
         v.set_edit_mode(checked)
+
+    def unlock_document(self) -> None:
+        """File → Unlock document…: lift permission restrictions for the
+        session with the owner (permissions) password. The disabled
+        edit/print/page-op buttons point here via their tooltips."""
+        view = self.active_view
+        if view is None:
+            return
+        doc = view.document
+        if not doc.is_protected or doc.is_owner:
+            self.statusBar().showMessage(
+                "This document has no editing restrictions to unlock.", 8000
+            )
+            return
+        if self.isVisible() and self._prompt_owner_password(
+            view, "This document's permissions restrict editing and printing."
+        ):
+            self.statusBar().showMessage("Document unlocked for this session.", 8000)
 
     def _on_show_areas_toggled(self, checked: bool) -> None:
         # Persist as the app-level default for newly opened documents (last
@@ -2163,6 +2188,21 @@ class MainWindow(QMainWindow):
             view.set_thumbnails_visible(checked)
 
     # --- save -----------------------------------------------------------
+    def _set_permission_action(
+        self, action: QAction, enabled: bool, denied_by_permission: bool, reason: str
+    ) -> None:
+        """Enable/disable ``action`` and, when it is disabled specifically
+        BECAUSE a permission denies it, swap in an explanatory tooltip (the
+        disabled button then teaches WHY, like Print does — user request).
+        Restores the default tooltip otherwise."""
+        action.setEnabled(enabled)
+        if action not in self._default_tooltips:
+            self._default_tooltips[action] = action.toolTip()
+        if not enabled and denied_by_permission:
+            action.setToolTip(reason)
+        else:
+            action.setToolTip(self._default_tooltips[action])
+
     # --- password protection ---------------------------------------------
     def _update_protection_label(self, view: DocumentView | None) -> None:
         """The permanent status-bar indicator beside the mode label."""
@@ -2200,7 +2240,7 @@ class MainWindow(QMainWindow):
             self._protection_label.setToolTip(
                 "This document's permissions deny: "
                 + ", ".join(denied)
-                + ". Entering Edit mode asks for the permissions password."
+                + ". File → Unlock document… to enter the permissions password."
             )
 
     def _prompt_owner_password(self, view: DocumentView, why: str) -> bool:
@@ -2419,34 +2459,66 @@ class MainWindow(QMainWindow):
         # by an owner unlock).
         perms = view.document.permissions if has else None
         can_modify = perms.can_modify if perms is not None else False
-        can_pages = (perms.can_assemble or perms.can_modify) if perms is not None else False
+        can_assemble = perms.can_assemble if perms is not None else False
+        can_pages = can_assemble or can_modify
+        _MODIFY_DENIED = "content editing is restricted by this document's permissions"
+        _PAGES_DENIED = "page changes are restricted by this document's permissions"
         # CONTENT-edit actions require edit mode (U0) + the modify permission.
         for action in self._page_edit_actions:
-            action.setEnabled(has and edit_on and can_modify)
+            self._set_permission_action(
+                action, has and edit_on and can_modify, has and not can_modify, _MODIFY_DENIED
+            )
         # Page ops honor the ASSEMBLE bit (Acrobat's page-layout level) — an
         # assemble-only document gets page ops in edit mode, nothing else.
-        self._rotate_cw_action.setEnabled(has and edit_on and can_pages)
-        self._rotate_ccw_action.setEnabled(has and edit_on and can_pages)
-        self._insert_action.setEnabled(has and edit_on and can_pages)
-        # A PDF must keep at least one page.
-        self._delete_action.setEnabled(has and edit_on and count > 1 and can_pages)
-        self._move_up_action.setEnabled(has and edit_on and not at_start and can_pages)
-        self._move_down_action.setEnabled(has and edit_on and not at_end and can_pages)
+        for action, extra in (
+            (self._rotate_cw_action, True),
+            (self._rotate_ccw_action, True),
+            (self._insert_action, True),
+            (self._delete_action, count > 1),
+            (self._move_up_action, not at_start),
+            (self._move_down_action, not at_end),
+        ):
+            self._set_permission_action(
+                action,
+                has and edit_on and can_pages and extra,
+                has and not can_pages,
+                _PAGES_DENIED,
+            )
         # Annotation actions are available in BOTH modes (highlight/comment/
         # callout are markup, not content) — enabled on `has` alone, but they
         # DO honor the annotation permission.
         can_annotate = perms.can_annotate if perms is not None else False
         for action in self._annotate_actions:
-            action.setEnabled(has and can_annotate)
+            self._set_permission_action(
+                action,
+                has and can_annotate,
+                has and not can_annotate,
+                "commenting is restricted by this document's permissions",
+            )
         # Undo/redo follow the stack in EITHER mode: annotations now mutate in
         # Markup mode, so a restore must be reachable there too (undo is
         # document-wide — it may also reverse an earlier content edit).
         self._undo_action.setEnabled(view is not None and view.undo_stack.canUndo())
         self._redo_action.setEnabled(view is not None and view.undo_stack.canRedo())
-        self._edit_mode_action.setEnabled(has)
+        # Edit mode is meaningful when the document permits ANY content or page
+        # change; a fully restricted doc DISABLES the button with a reason (a
+        # prompt-on-click button read as "editing is possible" — user report).
+        restricted = perms is not None and not perms.all_allowed
+        self._set_permission_action(
+            self._edit_mode_action,
+            has and (can_pages or edit_on),
+            restricted and not can_pages,
+            "editing is restricted by this document's permissions — "
+            "File → Unlock document… to enter the permissions password",
+        )
         self._edit_mode_action.blockSignals(True)
         self._edit_mode_action.setChecked(edit_on)
         self._edit_mode_action.blockSignals(False)
+        # The unlock command is offered only for a restricted doc not yet
+        # unlocked this session.
+        self._unlock_action.setEnabled(
+            has and view.document.is_protected and not view.document.is_owner
+        )
         # Armed one-shot modes show as checked on their launching action (U4).
         armed = view.armed_action if view is not None else None
         self._insert_text_action.setChecked(armed == "text")
@@ -2476,21 +2548,41 @@ class MainWindow(QMainWindow):
         self._save_action.setEnabled(has)
         self._save_as_action.setEnabled(has)
         self._protect_action.setEnabled(has)
-        self._print_action.setEnabled(has and (perms.can_print if perms is not None else False))
+        can_print = perms.can_print if perms is not None else False
+        can_copy = perms.can_copy if perms is not None else False
+        self._set_permission_action(
+            self._print_action,
+            has and can_print,
+            has and not can_print,
+            "printing is restricted by this document's permissions",
+        )
         # Read features (X1/SR2): available whenever a document is open, even
         # read-only — deliberately NOT in _page_edit_actions. Extract honors
         # the COPY permission (extraction IS the copy bit; accessibility
         # extraction is the reader's business, not our extract tool's).
-        self._extract_text_action.setEnabled(
-            has and (perms.can_copy if perms is not None else False)
+        self._set_permission_action(
+            self._extract_text_action,
+            has and can_copy,
+            has and not can_copy,
+            "copying/extraction is restricted by this document's permissions",
         )
         self._find_action.setEnabled(has)
-        self._detect_links_action.setEnabled(has and edit_on and can_modify)  # a content op
+        self._set_permission_action(
+            self._detect_links_action,
+            has and edit_on and can_modify,
+            has and not can_modify,
+            "content editing is restricted by this document's permissions",
+        )
         # Signing writes a signed COPY (terminal op, never mutates the open
         # document) — but the copy is a MODIFIED derivative, so signing
         # honors the modify permission on restricted files. Initials ride
         # _page_edit_actions (a content stamp); Manage is app-level.
-        self._place_signature_action.setEnabled(has and can_modify)
+        self._set_permission_action(
+            self._place_signature_action,
+            has and can_modify,
+            has and not can_modify,
+            "signing is restricted by this document's permissions",
+        )
         self._sign_invisible_action.setEnabled(has and can_modify)
         self._signature_status_action.setEnabled(has)
 

@@ -160,7 +160,9 @@ encryption preserves it (`PDF_ENCRYPT_KEEP` — including inside undo snapshots,
 which would otherwise silently launder protection away after the first undo).
 
 The app also *honours* permission flags on files it opens — restricted actions
-disable, and entering Edit mode prompts for the permissions password. Two
+disable with a tooltip explaining why (like a greyed-out Print button), and
+File → Unlock document… lifts them for the session with the permissions
+password. Two
 engine subtleties worth knowing: MuPDF applies the auth level of the password
 it last saw (so a stray user-password authentication after an owner unlock
 would downgrade the session — only `unlock()` may authenticate after open),

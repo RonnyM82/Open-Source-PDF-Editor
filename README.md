@@ -49,8 +49,10 @@ the document (real AES-256 encryption) and/or a permissions password that
 **restricts editing and printing** — Acrobat's standard options: printing
 on/off, five "changes allowed" levels (none / page ops / form fill & sign /
 commenting / anything except extraction), and a copy toggle. The app also
-*honours* restrictions on files it opens: restricted actions are disabled, and
-entering Edit mode asks for the permissions password. Honest caveat: the open
+*honours* restrictions on files it opens: restricted actions (edit, print,
+page ops, commenting…) are disabled with a tooltip explaining why, and File →
+Unlock document… lifts them for the session with the permissions password.
+Honest caveat: the open
 password is real cryptography; the permission flags bind well-behaved PDF
 readers (like this one) but are not a security boundary.
 

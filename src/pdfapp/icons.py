@@ -108,6 +108,7 @@ _NAMES = {
     "manage_signatures": "mdi6.card-account-details-outline",
     "signature_status": "mdi6.shield-check-outline",
     "protect_document": "mdi6.lock-outline",
+    "unlock_document": "mdi6.lock-open-variant-outline",
     # Search (SR2)
     "search": "mdi6.magnify",
     "search_prev": "mdi6.chevron-up",

@@ -234,11 +234,29 @@ def test_restricted_document_gating(qapp, restricted_pdf):
             assert not action.isEnabled()
         assert not window._place_signature_action.isEnabled()
 
-        # Offscreen edit-mode entry on a restricted doc is refused (the
-        # unlock prompt needs a visible window).
-        window._edit_mode_action.setChecked(True)
-        assert view.edit_mode is False
-        assert not window._edit_mode_action.isChecked()
+        # A restricted doc DISABLES the Edit button (not a prompt-on-click),
+        # with an explanatory tooltip pointing at Unlock — user request.
+        assert not window._edit_mode_action.isEnabled()
+        assert "unlock" in window._edit_mode_action.toolTip().lower()
+        assert window._unlock_action.isEnabled()
+
+        # A disabled command's tooltip explains WHY (like Print).
+        assert "restricted" in window._extract_text_action.toolTip().lower()
+        assert "restricted" in window._insert_comment_action.toolTip().lower()
+    finally:
+        window.close()
+
+
+def test_disabled_command_tooltips_restore_when_permitted(qapp, text_pdf):
+    """A permission tooltip is transient: an unrestricted document keeps the
+    default tooltips, not a stale 'restricted' one."""
+    window = MainWindow()
+    try:
+        window.open_path(text_pdf)
+        assert "restricted" not in window._extract_text_action.toolTip().lower()
+        assert window._extract_text_action.isEnabled()
+        assert window._edit_mode_action.isEnabled()
+        assert not window._unlock_action.isEnabled()  # nothing to unlock
     finally:
         window.close()
 
@@ -260,28 +278,36 @@ def test_restricted_copy_guard(qapp, restricted_pdf):
         window.close()
 
 
-def test_edit_mode_unlock_with_owner_password(qapp, restricted_pdf, monkeypatch):
-    answers = [restricted_pdf.owner_pw]
+def test_unlock_document_with_owner_password(qapp, restricted_pdf, monkeypatch):
+    """File → Unlock document… lifts restrictions live: the Edit button and
+    the permission-gated commands re-enable, indicator flips to Protected."""
     monkeypatch.setattr(
         QInputDialog,
         "getText",
-        staticmethod(lambda *a, **k: (answers.pop(0), True)),
+        staticmethod(lambda *a, **k: (restricted_pdf.owner_pw, True)),
     )
     window = MainWindow()
     try:
         window.open_path(restricted_pdf.path)
         window.show()  # the unlock prompt needs a visible window
         view = window.active_view
-        window._edit_mode_action.setChecked(True)
-        assert view.edit_mode is True  # unlocked
+        assert not window._edit_mode_action.isEnabled()  # locked
+
+        window.unlock_document()
         assert view.document.permissions.all_allowed
+        assert view.document.is_owner is True
         assert window._protection_label.text() == "Protected"  # no longer limited
-        assert window._extract_text_action.isEnabled()  # gates lifted live
+        assert window._edit_mode_action.isEnabled()  # now editable
+        assert window._extract_text_action.isEnabled()
+        assert not window._unlock_action.isEnabled()  # nothing left to unlock
+        # And Edit mode now enters with no further prompt.
+        window._edit_mode_action.setChecked(True)
+        assert view.edit_mode is True
     finally:
         window.close()
 
 
-def test_edit_mode_unlock_wrong_password_stays_markup(qapp, restricted_pdf, monkeypatch):
+def test_unlock_document_wrong_password_stays_locked(qapp, restricted_pdf, monkeypatch):
     calls = {"n": 0}
 
     def fake_get_text(*a, **k):
@@ -295,10 +321,9 @@ def test_edit_mode_unlock_wrong_password_stays_markup(qapp, restricted_pdf, monk
         window.open_path(restricted_pdf.path)
         window.show()
         view = window.active_view
-        window._edit_mode_action.setChecked(True)
-        assert view.edit_mode is False
-        assert not window._edit_mode_action.isChecked()
+        window.unlock_document()
         assert view.document.is_owner is False
+        assert not window._edit_mode_action.isEnabled()  # still locked
     finally:
         window.close()
 
@@ -343,10 +368,13 @@ def test_assemble_only_gestures_and_menus_refused(qapp, text_pdf, tmp_path):
     try:
         window.open_path(path)
         view = window.active_view
+        # Edit button ENABLED (page ops are permitted) — no unlock needed.
+        assert window._edit_mode_action.isEnabled()
         window._edit_mode_action.setChecked(True)
         assert view.edit_mode is True  # allowed: page ops are permitted
         assert window._rotate_cw_action.isEnabled()  # the assemble bit
         assert not window._insert_text_action.isEnabled()  # content denied
+        assert "restricted" in window._insert_text_action.toolTip().lower()
 
         # Drag funnel refuses content targets.
         para = view.page_geometry(0).paragraphs[0]
