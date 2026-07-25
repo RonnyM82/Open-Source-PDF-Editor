@@ -91,10 +91,15 @@ def _session_banner(app) -> None:
 
         from PySide6 import __version__ as pyside_version
 
+        from pdfapp import __version__ as app_version
+
         _write("\n" + "=" * 70)
         _write(f"session start  {time.strftime('%Y-%m-%d %H:%M:%S')}")
         frozen = getattr(sys, "frozen", False)
-        _write(f"python {platform.python_version()}  PySide6 {pyside_version}  frozen={frozen}")
+        _write(
+            f"pdf-editor {app_version}  python {platform.python_version()}  "
+            f"PySide6 {pyside_version}  frozen={frozen}"
+        )
         _write(f"os {platform.platform()}")
         try:
             for i, s in enumerate(app.screens()):

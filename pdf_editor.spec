@@ -52,6 +52,12 @@ datas = collect_data_files("qt_material") + collect_data_files("qtawesome")
 # build, so it must ride in datas and be resolved via sys._MEIPASS at runtime.
 datas += [("assets/icon.png", "assets")]
 
+# Version single source: pdfcore/version.py reads [project].version from
+# <_MEIPASS>/pyproject.toml at runtime (About dialog, diagnostics banner) —
+# the frozen build has no .dist-info, so without this it degrades to the
+# loud "0.0.0" fallback.
+datas += [("pyproject.toml", ".")]
+
 # The whole staged runtime: exe + closure DLLs + tessdata (model + configs),
 # tessdata next to the exe (tesseract resolves it exe-relative — no env vars,
 # no --tessdata-dir; see pdfcore/ocr.py).

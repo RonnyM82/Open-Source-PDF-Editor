@@ -7,11 +7,13 @@ short-lived so state is baked at construction, and the version data is
 gathered by a pure helper (`component_versions` / `about_html`) so an
 offscreen test can assert the content without showing a window.
 
-Versions come from the LIVE modules (``PySide6.__version__``,
+Component versions come from the LIVE modules (``PySide6.__version__``,
 ``pymupdf.__version__``, ``platform.python_version()``), never from
 ``importlib.metadata`` — PyInstaller does not collect ``.dist-info`` by
 default, so metadata lookups would read ``—`` in the frozen build while the
-module attributes are always present.
+module attributes are always present. The APP version is single-sourced from
+pyproject.toml via ``pdfcore/version.py`` (the spec bundles pyproject.toml so
+the frozen build reads the same source).
 """
 
 from __future__ import annotations
