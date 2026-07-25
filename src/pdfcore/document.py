@@ -323,6 +323,15 @@ class PdfDocument:
         placeholder field is NOT a signature)."""
         return signing.has_signatures(self._doc)
 
+    def strip_signatures(self) -> int:
+        """Remove every signature field (stamps included); returns the count.
+
+        Used by the save flow with the user's consent — a rewrite breaks
+        signatures anyway, and a stripped file is honest where a
+        broken-signature file reads as tampered.
+        """
+        return signing.strip_signatures(self._doc)
+
     def replace_text_runs(
         self,
         n: int,

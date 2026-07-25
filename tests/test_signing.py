@@ -438,6 +438,29 @@ def test_verify_encrypted_signed_needs_password(text_pdf, signer):
     assert checks[0].intact and checks[0].valid
 
 
+def test_strip_signatures_roundtrip(text_pdf, signer, tmp_path):
+    """Strip removes SIGNED fields (stamps included) but keeps EMPTY
+    placeholder fields — an edited template stays fillable."""
+    templated = _with_placeholder_field(text_pdf.read_bytes())
+    signed = signing.sign_pdf_bytes(templated, signer, rect=(100.0, 300.0, 300.0, 360.0)).pdf_bytes
+    src = tmp_path / "to-strip.pdf"
+    src.write_bytes(signed)
+
+    out = tmp_path / "stripped.pdf"
+    with PdfDocument.open(src) as doc:
+        assert doc.has_signatures() is True
+        assert doc.strip_signatures() == 1  # only the SIGNED field
+        assert doc.has_signatures() is False
+        assert doc.signature_field_names() == ["Placeholder"]  # template survives
+        assert doc.strip_signatures() == 0  # idempotent
+        doc.save(out)
+
+    with PdfDocument.open(out) as doc:
+        assert doc.has_signatures() is False
+        assert doc.signature_field_names() == ["Placeholder"]
+    assert signing.verify_pdf_signatures(out.read_bytes()) == []
+
+
 def test_verify_real_signed_samples(real_signed_pdf, real_tampered_signed_pdf):
     """The user's hand-made samples: signed verifies intact, tampered flags."""
     good = signing.verify_pdf_signatures(real_signed_pdf.read_bytes())

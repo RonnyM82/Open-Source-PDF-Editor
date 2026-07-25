@@ -382,6 +382,18 @@ class DocumentView(QWidget):
     def _on_sig_banner_dismissed(self) -> None:
         self._sig_banner_dismissed = True
 
+    def remove_signatures(self) -> None:
+        """Strip every signature (stamps included) as ONE undoable command.
+
+        The save flow's consented step — undo restores the signed state
+        (and re-dirties past the save, as with any undone mutation).
+        """
+
+        def op(doc: PdfDocument) -> None:
+            doc.strip_signatures()
+
+        self._push_command("Remove signatures", op, ("all", -1))
+
     # --- read-only state ------------------------------------------------
     @property
     def ocr_word_cache(self) -> OcrWordCache:

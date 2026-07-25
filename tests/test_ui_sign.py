@@ -243,10 +243,12 @@ def test_execute_signing_refuses_out_path_open_in_other_tab(qapp, text_pdf, sign
         window.close()
 
 
-def test_resigning_laundered_file_refused(qapp, text_pdf, signer, sample_png, tmp_path):
-    """Edit a signed copy, save it (the rewrite silently breaks its signature
-    on disk, and the stack is now clean) — the append branch must detect the
-    broken coverage and refuse, not produce output readers flag as invalid."""
+def test_edit_save_strips_signatures_then_resign_succeeds(
+    qapp, text_pdf, signer, sample_png, tmp_path
+):
+    """The consented strip-on-save (Word's model): saving an edited signed
+    copy REMOVES the signatures — the file is an honest unsigned derivative
+    (never one carrying broken signatures) and re-signing just works."""
     window = MainWindow()
     try:
         window.open_path(text_pdf)
@@ -255,20 +257,48 @@ def test_resigning_laundered_file_refused(qapp, text_pdf, signer, sample_png, tm
         signed_view = window.active_view
         signed_view.set_edit_mode(True)
         signed_view._place_image(0, 100.0, 100.0, sample_png)
-        window.save()  # offscreen: the signed-doc save warning auto-proceeds
-        assert not signed_view.dirty  # clean stack, laundered file
+        commands_before = signed_view.undo_stack.count()
+        window.save()  # offscreen: consents; strips as one undoable command
 
-        result = window._execute_signing(signed_view, tmp_path / "resigned.pdf", signer)
+        assert not signed_view.dirty
+        assert signed_view.document.has_signatures() is False
+        assert signed_view.undo_stack.count() == commands_before + 1  # the strip step
+        assert signing.verify_pdf_signatures(out.read_bytes()) == []  # honest on disk
+        assert signed_view._sig_banner.isHidden()  # nothing left to vouch for
+
+        resigned = tmp_path / "resigned.pdf"
+        result = window._execute_signing(signed_view, resigned, signer)
+        assert result is not None
+        assert _validly_signed(resigned.read_bytes(), signer)
+    finally:
+        window.close()
+
+
+def test_foreign_laundered_file_still_refused(qapp, text_pdf, signer, tmp_path):
+    """A file some OTHER tool rewrote after signing (broken sigs, fields
+    kept) must still hit the append gate's plain-words refusal."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    with pymupdf.open(stream=signed, filetype="pdf") as doc:
+        laundered = doc.tobytes(garbage=4, deflate=True)
+    path = tmp_path / "foreign-laundered.pdf"
+    path.write_bytes(laundered)
+
+    window = MainWindow()
+    try:
+        window.open_path(path)
+        result = window._execute_signing(window.active_view, tmp_path / "resign.pdf", signer)
         assert result is None
         assert "already broken" in window.statusBar().currentMessage().lower()
     finally:
         window.close()
 
 
-def test_laundered_visible_signature_refused(qapp, text_pdf, signer, sample_png, tmp_path):
-    """The user's exact hand-test: VISIBLE image signature → edit the signed
-    copy → Ctrl+S → re-sign. The append gate now uses REAL verification, so
-    the broken file is refused however the cheap heuristic fares."""
+def test_visible_signature_stamp_removed_by_strip_save(
+    qapp, text_pdf, signer, sample_png, tmp_path
+):
+    """The user's exact hand-test flow, under strip-on-save: a VISIBLE image
+    signature's stamp disappears with the signature when an edited copy is
+    saved — no widget left behind, no broken signature on disk."""
     window = MainWindow()
     try:
         window.open_path(text_pdf)
@@ -286,12 +316,14 @@ def test_laundered_visible_signature_refused(qapp, text_pdf, signer, sample_png,
         signed_view = window.active_view
         signed_view.set_edit_mode(True)
         signed_view._place_image(0, 100.0, 100.0, sample_png)
-        window.save()  # offscreen: the signed-doc save warning auto-proceeds
-        assert not signed_view.dirty
+        window.save()
 
-        result = window._execute_signing(signed_view, tmp_path / "resigned.pdf", signer)
-        assert result is None
-        assert "already broken" in window.statusBar().currentMessage().lower()
+        assert signed_view.document.signature_field_names() == []  # stamp + field gone
+        assert signing.verify_pdf_signatures(out.read_bytes()) == []
+        # Undoing the save's strip step brings the signed state back in memory.
+        signed_view.undo_stack.undo()
+        assert signed_view.document.has_signatures() is True
+        assert signed_view.dirty  # undone past the save re-dirties
     finally:
         window.close()
 
@@ -544,12 +576,9 @@ def test_banner_absent_on_unsigned_documents(qapp, text_pdf):
         window.close()
 
 
-def test_banner_flips_to_problem_after_saving_edited_signed(
-    qapp, text_pdf, signer, sample_png, tmp_path
-):
-    """Saving an edited signed doc rewrites the file — the banner must stop
-    vouching for the now-dead signature (and a dismissed intact banner must
-    not suppress the problem variant)."""
+def test_banner_clears_after_strip_save(qapp, text_pdf, signer, sample_png, tmp_path):
+    """Saving an edited signed doc STRIPS the signatures — the banner must
+    clear (nothing left to vouch for or warn about), not go red."""
     out = tmp_path / "flip.pdf"
     out.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
 
@@ -557,15 +586,13 @@ def test_banner_flips_to_problem_after_saving_edited_signed(
     try:
         window.open_path(out)
         view = window.active_view
-        view._sig_banner._dismiss.click()  # user closed the intact banner
+        assert not view._sig_banner.isHidden()  # intact banner up
         view.set_edit_mode(True)
         view._place_image(0, 100.0, 100.0, sample_png)
-        window.save()  # offscreen: warnings auto-proceed
+        window.save()  # offscreen: consents; strips
 
-        banner = view._sig_banner
-        assert not banner.isHidden()
-        assert banner.problem is True
-        assert banner._dismiss.isHidden()
+        assert view._sig_banner.isHidden()
+        assert view.document.has_signatures() is False
     finally:
         window.close()
 

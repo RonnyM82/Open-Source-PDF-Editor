@@ -1660,7 +1660,13 @@ class MainWindow(QMainWindow):
         answered the save warning; only the banner should update).
         """
         path = view.path
-        if path is None or not view.document.has_signatures():
+        if path is None:
+            return
+        if not view.document.has_signatures():
+            # No signatures (any more) — a stale banner must not keep
+            # vouching for (or warning about) signatures that are gone,
+            # e.g. right after a consented strip-on-save.
+            view.set_signature_banner("none")
             return
         try:
             checks = signing.verify_pdf_signatures(path.read_bytes(), password=view.open_password)
@@ -1956,9 +1962,10 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Document is digitally signed",
-                "This document is digitally signed. ANY change that gets saved "
-                "invalidates its signatures — readers will flag them as "
-                "broken.\n\nSwitch to Edit mode anyway?",
+                "This document is digitally signed. Edits cannot preserve the "
+                "signatures — SAVING will REMOVE them (you'll be asked again "
+                "then, and Save As… keeps the signed original).\n\n"
+                "Switch to Edit mode anyway?",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 self._sync_chrome()  # un-toggle the action
@@ -2095,41 +2102,80 @@ class MainWindow(QMainWindow):
             view.set_thumbnails_visible(checked)
 
     # --- save -----------------------------------------------------------
-    def _confirm_breaking_signatures(self, view: DocumentView) -> bool:
-        """True to proceed with a save that would REWRITE a SIGNED document.
+    def _signed_save_choice(self, view: DocumentView) -> str:
+        """``"save"`` / ``"save_as"`` / ``"cancel"`` for saving a SIGNED doc.
 
-        Any save re-serialises the file, which invalidates its digital
-        signatures — silently doing so is how a user launders a signed file
-        into one readers flag as broken (adversarial-review finding). Warn
-        when actually on screen; offscreen (tests) proceeds.
+        A save rewrites the file, which breaks its signatures anyway — with
+        consent they are REMOVED (stripped) so the result is an honest
+        unsigned derivative, never a file carrying broken signatures that
+        read as tampering (Word's model). Save As… is offered first so the
+        signed ORIGINAL survives untouched. Offscreen (tests) consents to a
+        plain save; the dialog is hand-verified.
         """
         if not view.document.has_signatures() or not self.isVisible():
-            return True
-        answer = QMessageBox.question(
-            self,
-            "Document is digitally signed",
-            "Saving re-writes the file, which INVALIDATES its digital "
-            "signatures — readers will flag them as broken.\n\nSave anyway?",
+            return "save"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Document is digitally signed")
+        box.setText(
+            "Saving re-writes the file, and digital signatures cannot survive "
+            "that. They will be REMOVED (visible stamps included) so the saved "
+            "file isn't left with broken signatures.\n\n"
+            "Save As… keeps the signed original untouched."
         )
-        return answer == QMessageBox.StandardButton.Yes
+        save_as_button = box.addButton("Save As…", QMessageBox.ButtonRole.ActionRole)
+        save_button = box.addButton("Save anyway", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(save_as_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_as_button:
+            return "save_as"
+        if clicked is save_button:
+            return "save"
+        return "cancel"
+
+    def _strip_signatures_step(self, view: DocumentView) -> None:
+        """The consented removal, as ONE undoable command (no-op unsigned)."""
+        if view.document.has_signatures():
+            view.remove_signatures()
 
     def save(self) -> None:
         view = self.active_view
-        if view is None or not self._confirm_breaking_signatures(view):
+        if view is None:
             return
+        choice = self._signed_save_choice(view)
+        if choice == "cancel":
+            return
+        if choice == "save_as":
+            self.save_as(confirmed=True)
+            return
+        self._strip_signatures_step(view)
         if view.save():
             self.statusBar().showMessage(f"Saved {view.path}")
-            # A save REWRITES the file — a signed document's banner must flip
-            # from intact to broken, not keep vouching for dead signatures
-            # (banner only: the user just answered the save warning).
+            # The banner must stop vouching for signatures the save removed
+            # (banner only: the user just answered the save dialog).
             self._announce_signatures(view, dialog=False)
 
-    def save_as(self) -> None:
+    def save_as(self, confirmed: bool = False) -> None:
         view = self.active_view
-        if view is None or not self._confirm_breaking_signatures(view):
+        if view is None:
             return
+        if not confirmed and view.document.has_signatures() and self.isVisible():
+            answer = QMessageBox.question(
+                self,
+                "Document is digitally signed",
+                "The new file cannot keep this document's digital signatures — "
+                "they will be REMOVED in the copy (visible stamps included). "
+                "The original file stays untouched.\n\nContinue?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         out_str, _ = QFileDialog.getSaveFileName(self, "Save PDF as", "", "PDF files (*.pdf)")
-        if out_str and view.save_as_path(Path(out_str)):
+        if not out_str:
+            return
+        self._strip_signatures_step(view)
+        if view.save_as_path(Path(out_str)):
             self.statusBar().showMessage(f"Saved {out_str}")
             self._announce_signatures(view, dialog=False)
 

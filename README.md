@@ -94,7 +94,10 @@ not who you are. Opening a signed document shows its status in a banner across t
 the view (Sign → Signature status… for details) — intact is dismissable, but
 a **tampered** signed file gets a permanent red banner that stays for the
 life of the tab, just like Acrobat. Entering Edit mode on a signed document
-warns you first, since any saved change breaks its signatures.
+warns you first, and saving an edited signed document **removes** its
+signatures with your consent (offering Save As… so the signed original
+survives) — an edited file is honestly unsigned rather than carrying broken
+signatures that readers flag as tampering.
 
 Full text reflow and form filling are out of scope.
 

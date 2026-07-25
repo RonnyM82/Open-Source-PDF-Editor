@@ -282,6 +282,27 @@ def _verify_embedded(embedded, vc) -> list[SignatureVerification]:
     return results
 
 
+def strip_signatures(doc: pymupdf.Document) -> int:
+    """Remove EVERY signature form field (visible stamps included); count removed.
+
+    The honest companion to editing a signed document (Word's model): a save
+    rewrites the file, which breaks its signatures anyway — and a BROKEN
+    signature reads as tampering in every reader, which is WORSE than no
+    signature. Stripping (with the user's consent, collected by the save
+    flow) makes the saved file a plain unsigned derivative instead of one
+    carrying a cryptographic accusation against itself. EMPTY placeholder
+    fields are deliberately KEPT — an edited contract template keeps its
+    fillable signature boxes; only actual signatures are removed.
+    """
+    removed = 0
+    for page in doc:
+        for widget in list(page.widgets()):
+            if widget.field_type == pymupdf.PDF_WIDGET_TYPE_SIGNATURE and widget.is_signed:
+                page.delete_widget(widget)
+                removed += 1
+    return removed
+
+
 def signature_field_names(doc: pymupdf.Document) -> list[str]:
     """Names of all signature form fields in the document (filled or empty).
 
