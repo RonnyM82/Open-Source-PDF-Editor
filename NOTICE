@@ -51,7 +51,66 @@ This product bundles the following third-party components:
 
 - Pillow  (https://python-pillow.github.io/)
     License: MIT-CMU
-    Imaging library used to hand rendered pages to the OCR engine.
+    Imaging library used to hand rendered pages to the OCR engine, and by
+    pyHanko to render image signature appearances.
+
+- pyHanko  (https://github.com/MatthiasValvekens/pyHanko)
+    License: MIT
+    Cryptographic PDF signing library — appends digital signatures to
+    finished documents as incremental updates. Ships some PyPDF2-derived
+    code under its included LICENSE.PyPDF2 (BSD-3-Clause-style).
+
+- pyhanko-certvalidator  (https://github.com/MatthiasValvekens/certvalidator)
+    License: MIT
+    X.509 certificate path validation used by pyHanko (transitive
+    dependency, bundled in the frozen build).
+
+- asn1crypto  (https://github.com/wbond/asn1crypto)
+    License: MIT
+    ASN.1 parsing/serialisation used by pyHanko (transitive dependency).
+
+- oscrypto  (https://github.com/wbond/oscrypto)
+    License: MIT
+    OS-backed crypto primitives used by pyhanko-certvalidator (transitive
+    dependency).
+
+- uritools  (https://github.com/tkem/uritools)
+    License: MIT
+    RFC 3986 URI parsing used by pyhanko-certvalidator (transitive
+    dependency).
+
+- cryptography  (https://cryptography.io/)
+    License: Apache-2.0 OR BSD-3-Clause
+    Cryptographic primitives: loads PKCS#12 certificate bundles and
+    generates the optional self-signed signing certificates. Binds OpenSSL
+    (Apache-2.0) via cffi (MIT) and pycparser (BSD-3-Clause).
+
+- requests  (https://requests.readthedocs.io/)
+    License: Apache-2.0
+    HTTP client required by pyHanko (transitive dependency; used for
+    optional online validation/timestamping, which this app does not do).
+    Brings certifi (MPL-2.0), urllib3 (MIT), charset-normalizer (MIT) and
+    idna (BSD-3-Clause).
+
+- PyYAML  (https://pyyaml.org/)
+    License: MIT
+    YAML parsing required by pyHanko's configuration layer (transitive
+    dependency; unused at runtime by this app).
+
+- lxml  (https://lxml.de/)
+    License: BSD-3-Clause
+    XML tooling required by pyHanko (transitive dependency); binds libxml2
+    and libxslt (MIT-style licences).
+
+- tzlocal  (https://github.com/regebro/tzlocal)
+    License: MIT
+    Local-timezone lookup used by pyHanko for signing timestamps; brings
+    tzdata (Apache-2.0, IANA time-zone data).
+
+- python-barcode  (https://github.com/WhyNotHugo/python-barcode)
+    License: MIT
+    Barcode rendering pulled in by pyHanko's image-support extra (unused at
+    runtime by this app).
 
 - Tesseract OCR  (https://github.com/tesseract-ocr/tesseract)
     License: Apache-2.0

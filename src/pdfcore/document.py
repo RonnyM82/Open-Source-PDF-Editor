@@ -20,6 +20,7 @@ from pdfcore import (
     links,
     ocr,
     pages,
+    signing,
     textedit,
     textselect,
     textsource,
@@ -268,6 +269,49 @@ class PdfDocument:
             self._doc = pymupdf.open(stream=data, filetype="pdf")
             raise
         self._doc = pymupdf.open(source)
+
+    def save_signed(
+        self,
+        path: str | Path,
+        signer: signing.Signer,
+        *,
+        field_name: str = signing.DEFAULT_FIELD_NAME,
+        reason: str | None = None,
+        location: str | None = None,
+        page_index: int = 0,
+        rect: tuple[float, float, float, float] | None = None,
+        image_path: str | Path | None = None,
+    ) -> signing.SignResult:
+        """Flatten the current state and write a digitally SIGNED copy to a NEW path.
+
+        TERMINAL: the current state is flattened to final bytes (the same
+        ``garbage=4, deflate=True`` options as :meth:`save`) and pyHanko signs
+        THOSE bytes as an incremental update — never through PyMuPDF's save
+        path. The OPEN document stays UNSIGNED: further edits/saves produce
+        unsigned output, and re-saving the signed file with PyMuPDF would
+        invalidate the signature. Refuses the currently-open path (like
+        :meth:`save`). Encryption is dropped in the flattened bytes (as with
+        save/snapshot). ``rect``/``image_path`` place a visible signature;
+        see :func:`pdfcore.signing.sign_pdf_bytes`.
+        """
+        dest = Path(path)
+        if self._source is not None and _same_path(dest, self._source):
+            raise ValueError(
+                "Cannot sign over the currently-open file; save the signed copy to a new path."
+            )
+        data = self._doc.tobytes(garbage=4, deflate=True)
+        result = signing.sign_pdf_bytes(
+            data,
+            signer,
+            field_name=field_name,
+            reason=reason,
+            location=location,
+            page_index=page_index,
+            rect=rect,
+            image_path=image_path,
+        )
+        dest.write_bytes(result.pdf_bytes)
+        return result
 
     def replace_text_runs(
         self,

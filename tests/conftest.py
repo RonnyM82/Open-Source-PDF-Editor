@@ -337,6 +337,26 @@ def sample_png(tmp_path) -> Path:
     return path
 
 
+# --- digital signing (pyHanko) ----------------------------------------------
+# The test certificate is GENERATED at test time via the engine's own
+# self-signed helper — no cert material is ever committed. Session-scoped to
+# amortise the RSA keygen across the signing tests.
+
+SignerP12 = namedtuple("SignerP12", ["path", "password", "common_name"])
+
+
+@pytest.fixture(scope="session")
+def signer_p12(tmp_path_factory) -> SignerP12:
+    """A generated self-signed PKCS#12 bundle + its password and subject CN."""
+    from pdfcore.signing import generate_self_signed_p12
+
+    common_name = "PDF Editor Test Signer"
+    password = "test-p12-pass"
+    path = tmp_path_factory.mktemp("signing") / "test-signer.p12"
+    generate_self_signed_p12(path, common_name, password)
+    return SignerP12(path=path, password=password, common_name=common_name)
+
+
 # The quote sample is a SANITISED public document (fabricated identifiers):
 # files carry SANITISED sample data (see the public samples/ directory).
 REAL_QUOTE_PDF = Path(__file__).resolve().parents[1] / "samples" / "sample_quote.pdf"
@@ -621,8 +641,8 @@ def real_cad_pdf() -> Path:
     return REAL_CAD_PDF
 
 
-# The invoice sample (no text layer — the OCR target). LOCAL-ONLY like
-# the real quote: samples/ is gitignored, tests skip when it is absent.
+# The invoice sample (no text layer — the OCR target). A SANITISED public file
+# like the quote; tests skip cleanly when it is absent.
 REAL_INVOICE_PDF = Path(__file__).resolve().parents[1] / "samples" / "Invoice OCR.pdf"
 
 

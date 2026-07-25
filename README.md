@@ -74,7 +74,19 @@ gestures" lists every interaction.
 | Zoom in / out | Ctrl+= / Ctrl+- | Print | Ctrl+P |
 | Undo / Redo | Ctrl+Z / Ctrl+Y | Edit mode | Ctrl+E |
 
-Full text reflow, form filling, and digital signatures are out of scope.
+**Digital signing (engine):** real cryptographic signatures via
+[pyHanko](https://github.com/MatthiasValvekens/pyHanko) — sign with your own
+PKCS#12 (.p12/.pfx) certificate, visibly (your signature image becomes the
+stamp over a real signature) or invisibly, or generate a self-signed
+certificate for tamper-evidence. Signing is the **final** step: the signature
+is appended to the finished file, and any further edit invalidates it (that's
+how PDF signatures work — tamper-evidence is the point). Self-signed
+signatures show as "unknown/untrusted" in readers until the recipient trusts
+the certificate — they prove the document hasn't changed, not who you are.
+The signing UI is still in progress; today this is an engine API
+(`pdfcore.signing`, `PdfDocument.save_signed`).
+
+Full text reflow and form filling are out of scope.
 
 **Search & Extract Text:** find text across the document (Ctrl+F) and Tools →
 Extract text. Both work on normal PDFs and, for pages with **no text layer**
@@ -100,8 +112,7 @@ no real data.
 - **Fast native desktop app** — powered by PyMuPDF, with a modern dark/light UI.
 
 Scope note: this is a focused viewer/editor, not a full Adobe Acrobat replacement —
-form filling, digital signatures, and full text reflow are intentionally out of
-scope.
+form filling and full text reflow are intentionally out of scope.
 
 ## FAQ
 
@@ -133,8 +144,9 @@ insert pages.
 See [Set PDF Editor as your default PDF viewer](#set-pdf-editor-as-your-default-pdf-viewer).
 
 **Is it a replacement for Adobe Acrobat?**
-It covers everyday viewing, editing, page organisation, printing, and OCR. It does
-**not** do AcroForm filling, digital signatures, or full document reflow.
+It covers everyday viewing, editing, page organisation, printing, OCR, and
+cryptographic digital signing (engine API today; UI in progress). It does
+**not** do AcroForm filling or full document reflow.
 
 ## Setup (Windows, PowerShell)
 
@@ -282,8 +294,10 @@ It also bundles **PySide6** (LGPL-3.0), **qt-material** (BSD-2-Clause, + the
 bundled Roboto font, Apache-2.0), **QtAwesome** (MIT, + Material Design Icons,
 Apache-2.0), and **Jinja2** (BSD-3-Clause), plus — for OCR — **pytesseract**
 (Apache-2.0) and **Pillow** (MIT-CMU), which drive the external **Tesseract OCR**
-engine (Apache-2.0) shipped as a bundled asset in packaged builds. Full
-third-party attribution and licences are in [NOTICE](NOTICE).
+engine (Apache-2.0) shipped as a bundled asset in packaged builds. Digital
+signing brings **pyHanko** (MIT) and **cryptography** (Apache-2.0 OR
+BSD-3-Clause) with their dependency stack. Full third-party attribution and
+licences are in [NOTICE](NOTICE).
 
 This is a desktop application, not a network service, so the AGPL's section 13
 network-interaction clause is not triggered; the standard copyleft obligations of

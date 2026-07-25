@@ -19,6 +19,13 @@ dependencies = [
     # and its tessdata are bundled assets (see CLAUDE.md), not pip packages.
     "pytesseract==0.3.13",
     "Pillow==12.3.0",
+    # Digital signing: deliberate RANGE pin (the one exception to exact pins) —
+    # pyHanko is 0.x, so minor bumps may break the API; the ceiling guards that
+    # while letting patch fixes in. MIT licence, AGPL-compatible.
+    "pyHanko[image-support]>=0.35.1,<0.36",
+    # Imported directly by pdfcore.signing's self-signed-cert helper (also a
+    # pyHanko dependency, floor >=48). Pinned at what resolved at first install.
+    "cryptography==49.0.0",
 ]
 
 [project.optional-dependencies]
