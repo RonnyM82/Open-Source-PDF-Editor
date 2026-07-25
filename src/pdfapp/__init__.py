@@ -4,4 +4,4 @@ Imports pdfcore only. Wires widgets to engine calls and renders; contains no PDF
 logic of its own. The single Qt<->engine seam is pdfapp/qt_image.py.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.8.0"

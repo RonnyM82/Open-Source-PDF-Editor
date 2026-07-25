@@ -6,4 +6,4 @@ editing operations live here as functions/classes with plain inputs and outputs,
 fully testable with pytest and no GUI.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.8.0"
