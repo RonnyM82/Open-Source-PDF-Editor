@@ -1159,6 +1159,81 @@ def test_ui_embedded_font_reused_on_paragraph_edit(qapp, embedded_nonstandard_fo
         window.close()
 
 
+def _wide_paragraph_pdf(tmp_path):
+    """A wide 3-line prose paragraph (one dict block) — the reflow case."""
+    import pymupdf
+
+    path = tmp_path / "wide.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    for i, line in enumerate(
+        [
+            "This is a wide flowing paragraph that fills the whole text column across the page",
+            "and continues onto a second line running the full column width before ending soon",
+            "on a short third line.",
+        ]
+    ):
+        page.insert_text((72, 100 + i * 14), line, fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_ui_wide_paragraph_reflows_in_editor(qapp, tmp_path):
+    """A wide wrapped paragraph opens as ONE reflowable editor block (not one
+    frozen block per visual line), and an unchanged commit is still a no-op."""
+    window = MainWindow()
+    try:
+        window.open_path(_wide_paragraph_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 100, 97)
+        assert para is not None and len(para.lines) == 3
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+        assert editor.document().blockCount() == 1  # 3 wraps -> 1 reflowable block
+
+        editor.commit()  # unchanged content
+        assert view.undo_stack.count() == 0  # no command (reflow no-op preserved)
+    finally:
+        window.close()
+
+
+def test_ui_font_change_commits_on_word_export(qapp, real_embedded_bug_pdf):
+    """End-to-end: changing the font of a wide Word-export paragraph commits
+    (reflow) instead of being refused with the growth error."""
+    from PySide6.QtGui import QTextCharFormat, QTextCursor
+
+    window = MainWindow()
+    try:
+        window.open_path(real_embedded_bug_pdf)
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        warnings: list[str] = []
+        view.editWarning.connect(warnings.append)
+        para = next(
+            p
+            for p in view.document.paragraphs(0)
+            if len(p.lines) >= 2 and (p.bbox[2] - p.bbox[0]) >= 200
+        )
+        view._begin_paragraph_edit(0, para)
+        editor = view._para_editor
+        cursor = editor.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        editor.setTextCursor(cursor)
+        fmt = QTextCharFormat()
+        fmt.setFontFamilies(["Arial"])
+        assert view.apply_format_to_editor(fmt)  # merged into the whole selection
+
+        editor.commit()  # captures the rich (Arial) pieces and drives the real path
+        assert view.undo_stack.count() == 1  # committed, not refused
+        assert not any("failed" in w.lower() for w in warnings)
+    finally:
+        window.close()
+
+
 def test_ui_embedded_font_map_empty_for_non_embedded(qapp, tmp_path):
     """A non-embedded (base-14) paragraph populates no embedded-font map, so the
     commit path takes the normal helv/base-14 route."""

@@ -407,6 +407,57 @@ def _detect_alignment(line_tuples: tuple[tuple[TextSpan, ...], ...]) -> str:
     return "left"
 
 
+# A visual line ending within this many ems of the paragraph's widest right
+# edge is treated as FULL — the break after it is a soft WRAP, joined on reflow.
+# A line ending further short is an INTENTIONAL break (a heading, a hard
+# newline) and is preserved.
+_WRAP_FULL_SLACK_EM = 3.0
+# Reflow only genuinely WIDE text columns (flowing prose). Narrow blocks — a
+# totals column, an address, a tight table cell — are structured lines whose
+# breaks are intentional even though each line "fills" its own narrow width, so
+# they are never reflowed (merging them would run separate values together).
+# Real prose columns run 400+ pt; totals/cells run under ~150 pt.
+_MIN_REFLOW_WIDTH = 200.0
+
+
+def logical_line_groups(
+    para: Paragraph,
+) -> list[list[tuple[TextSpan, ...]]]:
+    """Group a paragraph's visual lines into LOGICAL (reflowable) lines.
+
+    Consecutive visual lines are joined where the break between them is a soft
+    WRAP (the earlier line fills the paragraph box) and split where it is an
+    intentional break (a clearly short line). The paragraph editor prefills one
+    logical line per group, so a font/size change re-wraps the group within the
+    box instead of overflowing the frozen original wrap positions — the "grows
+    into occupied space" refusal on a mere font change (root cause: the editor
+    used to bake a hard break between every wrapped line).
+
+    A NARROW paragraph (a totals column, an address, a tight cell) is never
+    reflowed — each visual line stays its own logical line — because its lines
+    are structured, not wrapped, even though each fills its own narrow width.
+
+    Returns a list of groups; each group is a list of visual lines (each a tuple
+    of member spans) in order.
+    """
+    lines = [ln for ln in para.lines if ln]
+    if not lines:
+        return []
+    right = max(max(s.bbox[2] for s in ln) for ln in lines)
+    left = min(min(s.bbox[0] for s in ln) for ln in lines)
+    if right - left < _MIN_REFLOW_WIDTH:
+        return [[ln] for ln in lines]  # narrow structured block — preserve lines
+    groups: list[list[tuple[TextSpan, ...]]] = [[lines[0]]]
+    for prev, cur in zip(lines, lines[1:], strict=False):
+        prev_right = max(s.bbox[2] for s in prev)
+        size = max((s.size for s in prev), default=11.0)
+        if prev_right >= right - _WRAP_FULL_SLACK_EM * size:
+            groups[-1].append(cur)  # wrap -> same logical line
+        else:
+            groups.append([cur])  # intentional short-line break -> new line
+    return groups
+
+
 @dataclass(frozen=True)
 class ParagraphReplaceResult:
     """Outcome of :func:`replace_paragraph_text` (fit is pre-checked: text

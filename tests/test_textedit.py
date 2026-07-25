@@ -24,6 +24,7 @@ from pdfcore.textedit import (
     TextStyle,
     _embedded_font_map,
     extract_spans,
+    logical_line_groups,
     map_font_to_base14,
     replace_paragraph_runs,
     srgb_to_rgb,
@@ -497,6 +498,99 @@ def test_real_embedded_bug_helv_path_still_refuses(real_embedded_bug_pdf):
             except ValueError:
                 refused += 1
     assert refused > 0
+
+
+# --- paragraph reflow (the "change the font -> grows into occupied space" bug:
+# the editor used to freeze every wrapped line as a hard break) -----------------
+
+
+def _para_pdf(tmp_path, lines, *, x0=72.0, y0=100.0, size=11.0, pitch=14.0, fontname="helv"):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    for i, text in enumerate(lines):
+        page.insert_text((x0, y0 + i * pitch), text, fontname=fontname, fontsize=size)
+    path = tmp_path / "para.pdf"
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def _reflowed_runs(para, code="helv"):
+    """Runs the paragraph EDITOR produces after a font change: one logical group
+    per reflowable line (soft-joined), the WHOLE paragraph re-styled."""
+    runs = []
+    for gi, group in enumerate(logical_line_groups(para)):
+        if gi:
+            runs.append(StyledRun("\n", TextStyle()))
+        for li, line in enumerate(group):
+            if li:
+                prev = runs[-1].text if runs else ""
+                lead = line[0].text[:1] if line and line[0].text else ""
+                if prev and not prev[-1:].isspace() and not lead[:1].isspace():
+                    runs.append(StyledRun(" ", runs[-1].style))
+            for span in line:
+                runs.append(StyledRun(span.text, TextStyle(code=code, size=span.size)))
+    return runs
+
+
+def test_logical_line_groups_reflows_wide_prose(tmp_path):
+    lines = [
+        "This is a wide flowing prose paragraph that fills the whole text column here now today",
+        "and it continues onto a second line that also runs the full width of the text column",
+        "before ending on a shorter third and final line.",
+    ]
+    src = _para_pdf(tmp_path, lines)
+    with PdfDocument.open(src) as doc:
+        para = doc.paragraphs(0)[0]
+        assert len(para.lines) == 3
+        assert len(logical_line_groups(para)) == 1  # one reflowable logical line
+
+
+def test_logical_line_groups_preserves_narrow_column(tmp_path):
+    # A totals column: distinct values, each intentionally on its own line.
+    src = _para_pdf(tmp_path, ["1,210.47", "200.00", "$1,410.47"], x0=500.0, size=8.0, pitch=8.0)
+    with PdfDocument.open(src) as doc:
+        para = doc.paragraphs(0)[0]
+        groups = logical_line_groups(para)
+    assert len(groups) == len(para.lines)  # narrow block -> every line preserved
+
+
+def _frozen_runs(para, code="helv"):
+    """The OLD editor behaviour: a hard break per wrapped visual line."""
+    runs = []
+    for i, line in enumerate(para.lines):
+        if i:
+            runs.append(StyledRun("\n", TextStyle()))
+        for span in line:
+            runs.append(StyledRun(span.text, TextStyle(code=code, size=span.size)))
+    return runs
+
+
+def test_font_change_reflows_within_box(real_embedded_bug_pdf):
+    """The reported bug: changing the font of a wide Word-export paragraph hit
+    the growth refusal because the editor froze every wrapped line as a hard
+    break. Reflow re-wraps the whole flow within the box. At least one wide
+    paragraph reproduces the frozen failure; reflow succeeds on ALL of them
+    (if it raised, the loop would error out)."""
+    with PdfDocument.open(real_embedded_bug_pdf) as doc:
+        wide = [
+            p.text
+            for p in doc.paragraphs(0)
+            if len(p.lines) >= 2 and (p.bbox[2] - p.bbox[0]) >= 200
+        ]
+    assert wide, "expected wide multi-line paragraphs in the sample"
+    frozen_failures = 0
+    for para_text in wide:
+        with PdfDocument.open(real_embedded_bug_pdf) as doc:
+            para = next(p for p in doc.paragraphs(0) if p.text == para_text)
+            try:
+                doc.replace_paragraph_runs(0, para, _frozen_runs(para, code="helv"))
+            except ValueError:
+                frozen_failures += 1
+        with PdfDocument.open(real_embedded_bug_pdf) as doc:
+            para = next(p for p in doc.paragraphs(0) if p.text == para_text)
+            doc.replace_paragraph_runs(0, para, _reflowed_runs(para, code="helv"))  # must not raise
+    assert frozen_failures > 0  # the frozen-line bug reproduces
 
 
 def test_replace_with_empty_string_deletes(quote_pdf, tmp_path):

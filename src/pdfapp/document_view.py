@@ -62,6 +62,7 @@ from pdfcore.textedit import (
     TextSpan,
     TextStyle,
     fingerprint_lineset,
+    logical_line_groups,
     map_font_to_base14,
     merge_paragraphs,
 )
@@ -252,6 +253,8 @@ class DocumentView(QWidget):
         # keyed on the base family because Qt's QFont drops a ",Bold" suffix into
         # a bold FLAG (family() returns "Aptos" for "Aptos,Bold").
         self._edit_embedded_fonts: dict[tuple[str, bool, bool], str] = {}
+        # The paragraph editor's reflowed plain text as opened (no-op baseline).
+        self._edit_open_text = ""
         # Review comments (E11): pending create (page, rect, callout target),
         # pending text edit (page, xref), and an in-flight Ctrl+drag move.
         self._pending_comment: tuple[int, tuple, tuple | None] | None = None
@@ -1395,13 +1398,25 @@ class DocumentView(QWidget):
         self._edit_open_align = self._current_align()
         self._edit_open_zoom = self._canvas.zoom
         # Rich prefill from the paragraph's own spans: existing bold words,
-        # colours etc. survive an edit untouched instead of flattening.
+        # colours etc. survive an edit untouched instead of flattening. Visual
+        # lines are grouped into LOGICAL lines (logical_line_groups): soft wraps
+        # become ONE editor block that reflows, only intentional short-line
+        # breaks stay hard "\n". Without this a font/size change re-wrapped each
+        # frozen visual line and overflowed ("grows into occupied space").
         pieces: list = []
-        for i, line in enumerate(para.lines):
-            if i:
+        for gi, group in enumerate(logical_line_groups(para)):
+            if gi:
                 pieces.append(("\n", QTextCharFormat()))
-            for line_span in line:
-                pieces.extend(self._pieces_from_span(line_span))
+            for li, line in enumerate(group):
+                if li:
+                    # Soft-join wrapped lines with a single space (a wrap point
+                    # carries no literal character), unless one already abuts.
+                    prev = pieces[-1][0] if pieces else ""
+                    lead = line[0].text[:1] if line and line[0].text else ""
+                    if prev and not prev[-1:].isspace() and not lead[:1].isspace():
+                        pieces.append((" ", pieces[-1][1]))
+                for line_span in line:
+                    pieces.extend(self._pieces_from_span(line_span))
         if not pieces:
             pieces = [(para.text, self._char_format_for(para))]
         font = self._editor_font_for(para)
@@ -1424,6 +1439,9 @@ class DocumentView(QWidget):
             base_size_pt=para.size if para.size > 0 else None,
         )
         self._edit_open_sig = self._pieces_signature(self._para_editor)
+        # The reflowed plain text as opened — the no-op baseline (comparing to
+        # para.text would false-negative now that wraps became spaces).
+        self._edit_open_text = self._para_editor.toPlainText()
         self.editWarning.emit("Editing paragraph — Ctrl+Enter applies, Esc cancels.")
         self.stateChanged.emit()  # the Hyperlink command greys out while editing
 
@@ -2229,7 +2247,7 @@ class DocumentView(QWidget):
             runs, resolved = self._runs_from_pieces(pieces)
             signature = tuple((run.text, run.style) for run in runs)
             if (
-                text == para.text
+                text == self._edit_open_text
                 and width_pts is None
                 and signature == self._edit_open_sig
                 and same_align
@@ -2243,7 +2261,7 @@ class DocumentView(QWidget):
         else:  # direct-call fallback: one uniform style for the whole block
             style = self._current_style()
             if (
-                text == para.text
+                text == self._edit_open_text
                 and width_pts is None
                 and style == self._edit_open_style
                 and same_align
