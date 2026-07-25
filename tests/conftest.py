@@ -301,6 +301,55 @@ def quote_pdf(tmp_path) -> QuotePDF:
 
 
 _ARIAL_TTF = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf"
+# A font whose NAME maps to NO base-14 family (unlike Arial->helv): the
+# Word/browser-export case (Aptos, Calibri, ...). Editing text in such a font
+# reuses the DOCUMENT's own embedded subset — a helv substitute measures ~9%
+# wider and manufactured phantom wrap lines (the "grows into occupied space"
+# refusal on unchanged text). Calibri preferred (Office default, like the real
+# Aptos report); Verdana is the fallback.
+_NONSTANDARD_TTFS = [
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / name
+    for name in ("calibri.ttf", "verdana.ttf")
+]
+
+
+@pytest.fixture
+def embedded_nonstandard_font_pdf(tmp_path) -> Path:
+    """A PDF whose text uses an EMBEDDED font with NO base-14 mapping (Calibri
+    or Verdana) — the Word-export scenario the embedded-font-reuse edit path
+    targets. One near-full-width line so a helv re-layout wraps to an extra
+    line; a short second line and a distant third for round-trip checks.
+
+    Skips when neither font is installed (acceptable for a Windows-internal
+    tool). The reported bug used Aptos, which isn't installed on CI machines;
+    Calibri/Verdana reproduce the same no-base-14-mapping condition.
+    """
+    ttf = next((p for p in _NONSTANDARD_TTFS if p.exists()), None)
+    if ttf is None:
+        pytest.skip("no non-base-14 system font (calibri/verdana) available")
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    # ~92 chars ≈ full column width in Calibri at 12pt; helv is ~9% wider, so a
+    # helv re-layout of this line overflows its last word onto a second line.
+    long_line = (
+        "Embedded Calibri paragraph that stretches nearly the whole text column "
+        "width across the page here"
+    )
+    page.insert_text((72, 100), long_line, fontname="Emb", fontfile=str(ttf), fontsize=12)
+    page.insert_text(
+        (72, 118), "and reconciles cleanly.", fontname="Emb", fontfile=str(ttf), fontsize=12
+    )
+    page.insert_text(
+        (72, 320),
+        "A distant paragraph elsewhere on the page.",
+        fontname="Emb",
+        fontfile=str(ttf),
+        fontsize=12,
+    )
+    path = tmp_path / "embedded_nonstandard_font.pdf"
+    doc.save(str(path))
+    doc.close()
+    return path
 
 
 @pytest.fixture
@@ -394,6 +443,22 @@ def real_quote_pdf() -> Path:
     if not REAL_QUOTE_PDF.exists():
         pytest.skip("real quote sample not present (samples/ is local-only)")
     return REAL_QUOTE_PDF
+
+
+# The Word-export bug report (local-only): embedded Aptos paragraphs that
+# failed to edit ("grows into occupied space" on unchanged text) before the
+# embedded-font-reuse fix. Skips cleanly when absent.
+REAL_EMBEDDED_BUG_PDF = (
+    Path(__file__).resolve().parents[1] / "samples" / "Bortome-Darren Edit Bug.pdf"
+)
+
+
+@pytest.fixture
+def real_embedded_bug_pdf() -> Path:
+    """The real embedded-font (Aptos) edit-bug sample; skips when absent."""
+    if not REAL_EMBEDDED_BUG_PDF.exists():
+        pytest.skip("embedded-font bug sample not present (samples/ is local-only)")
+    return REAL_EMBEDDED_BUG_PDF
 
 
 # --- OCR fixtures (O-series) -------------------------------------------------

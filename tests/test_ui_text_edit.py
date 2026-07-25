@@ -1128,3 +1128,48 @@ def test_paragraph_editor_opens_without_a_scrollbar(qapp, tmp_path):
         editor.cancel()
     finally:
         window.close()
+
+
+def test_ui_embedded_font_reused_on_paragraph_edit(qapp, embedded_nonstandard_font_pdf):
+    """The commit path (editor pieces -> _runs_from_pieces) reuses the document's
+    OWN embedded font for a Word-export paragraph: the run carries an embed_name
+    intent and the saved edit re-embeds that font (not helv)."""
+    window = MainWindow()
+    try:
+        window.open_path(embedded_nonstandard_font_pdf)
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 200, 97)  # the full-width embedded line
+        assert para is not None and para.embedded
+
+        view._begin_paragraph_edit(0, para)
+        assert view._edit_embedded_fonts  # base-family -> embedded name, populated at open
+        pieces = view._para_editor._pieces()
+        runs, _resolved = view._runs_from_pieces(pieces)
+        assert any(r.style.embed_name for r in runs)  # editor pieces map back to the doc font
+
+        view._pending_paragraph = (0, para)
+        view._on_paragraph_committed(para.text.replace("stretches", "reaches"))
+        text = _page_text(view)
+        assert "reaches" in text and "stretches" not in text
+        fonts = {f[3] for f in view.document._doc[0].get_fonts()}
+        assert any("Calibri" in n or "Verdana" in n for n in fonts)
+    finally:
+        window.close()
+
+
+def test_ui_embedded_font_map_empty_for_non_embedded(qapp, tmp_path):
+    """A non-embedded (base-14) paragraph populates no embedded-font map, so the
+    commit path takes the normal helv/base-14 route."""
+    window = MainWindow()
+    try:
+        window.open_path(_paragraph_pdf(tmp_path))
+        view = window.active_view
+        view.set_edit_mode(True)
+        view.set_dblclick_paragraph(False)
+        para = view.document.paragraph_at(0, 100, 118)
+        view._begin_paragraph_edit(0, para)
+        assert view._edit_embedded_fonts == {}
+    finally:
+        window.close()

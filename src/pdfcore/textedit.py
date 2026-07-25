@@ -15,9 +15,11 @@ Embedded fonts are never reproduced; they are flagged (``embedded=True``,
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pymupdf
@@ -111,6 +113,16 @@ class TextStyle:
     base-14 fallback used when ``fontfile`` is None. ``underline`` draws a
     vector line under each inserted line, ``strike`` one across it (PDF has
     no underline/strikethrough fonts — both are drawn rules).
+
+    ``embed_name`` is an INTENT to reuse the DOCUMENT's own embedded font (by
+    its subset-stripped basefont name, e.g. ``"Aptos,Bold"``) so a Word/browser
+    export edits with pixel-faithful metrics instead of a helv substitute
+    (which measures wider and manufactured spurious wrap lines — the E9.4
+    "grows into occupied space" refusal on unchanged text). Resolved and
+    coverage-checked by the layout ops (:func:`_resolve_embed_runs`): a
+    character the subset lacks falls back to ``code``. ``embed_name`` never
+    survives that resolution — the ops rewrite each run to a concrete
+    ``fontfile``/``code`` before layout, so nothing downstream reads it.
     """
 
     code: str = "helv"
@@ -120,6 +132,7 @@ class TextStyle:
     underline: bool = False
     strike: bool = False
     script: int = SCRIPT_NORMAL
+    embed_name: str | None = None
 
 
 def _effective_size(style: TextStyle) -> float:
@@ -408,6 +421,10 @@ class ParagraphReplaceResult:
     exact_font: bool
     uniform_style: bool
     resized: bool = False
+    # True when the text reused the document's own embedded font but some
+    # character was not in that font's subset and fell back to a base-14
+    # substitute (the UI says so — distinct from exact_font).
+    font_fallback: bool = False
     # The re-laid-out box extent (unrotated page pts): x spans the wrap box,
     # y the first line's ascent to the last line's descent. None when nothing
     # was inserted (empty replacement). Lets the UI keep an inserted box's
@@ -435,6 +452,8 @@ class ReplaceResult:
     overflow: bool
     used_font: str
     exact_font: bool
+    # See ParagraphReplaceResult.font_fallback.
+    font_fallback: bool = False
 
 
 # MuPDF removes every character whose box INTERSECTS the redact rect, and
@@ -606,9 +625,32 @@ def replace_span_text(
     """
     if "\n" in new_text or "\r" in new_text:
         raise ValueError("replacement text must be a single line")
-    if style is None:  # automatic matching of the original (never embeds)
-        style = TextStyle(code=span.base14 or "helv", size=span.size, color=span.color)
-        exact_font = span.base14 is not None and not span.embedded
+    if style is None:  # automatic matching of the original
+        # Reuse the DOCUMENT's own embedded font ONLY when the family name maps
+        # to NO base-14 family (Aptos, Calibri, ...). A mapped embedded font
+        # (Arial->helv, Times->tiro) already substitutes with metric-compatible
+        # base-14 metrics, so it never triggered the wide-substitute growth bug
+        # and keeps its full glyph coverage — no reason to swap in a tiny
+        # subset. NB extraction forces base14=None for EVERY embedded span (the
+        # conservative flag rule), so the name map — not span.base14 — is what
+        # tells an embedded Arial from an embedded Aptos here. The base-14 code
+        # is the fallback for a character the reused subset lacks; weight-correct
+        # so that fallback matches a bold/italic original.
+        reuse = span.embedded and map_font_to_base14(span.font, span.flags) is None
+        codes = _BASE14_CODES["helv"]
+        idx = (1 if span.flags & FLAG_BOLD else 0) + (2 if span.flags & FLAG_ITALIC else 0)
+        style = TextStyle(
+            code=span.base14 or codes[idx],
+            size=span.size,
+            color=span.color,
+            embed_name=span.font if reuse else None,
+        )
+        # Exact when we can reproduce the font: a mapped base-14 (non-embedded)
+        # OR the document's own reused embedded font (glyph-coverage misses
+        # surface as font_fallback on the result, not here). An embedded
+        # base-14-mapped font stays flagged (helv for an embedded Arial diverges
+        # on non-Windows viewers — the standing CLAUDE.md rule).
+        exact_font = (span.base14 is not None and not span.embedded) or reuse
     else:  # explicit user style — honoured as chosen
         exact_font = True
     runs = [StyledRun(new_text, style)] if new_text else []
@@ -637,6 +679,7 @@ def replace_span_runs(
     rotation = span.rotation
     if rotation is None:  # BEFORE any mutation — the band would be wrong
         raise ValueError("this text is rotated at an unsupported angle")
+    runs, font_fallback = _resolve_embed_runs(doc, page_index, runs)
     from pdfcore import comments as comments_module
     from pdfcore import links as links_module
 
@@ -671,6 +714,7 @@ def replace_span_runs(
         overflow=overflow,
         used_font=_dominant_label(runs),
         exact_font=exact_font,
+        font_fallback=font_fallback,
     )
 
 
@@ -1741,6 +1785,11 @@ def replace_paragraph_runs(
     """
     if any(span.rotation != 0 for span in para.spans):
         raise ValueError("rotated text is edited as a single line, not a paragraph")
+    # Resolve embedded-font intents to concrete fonts FIRST: the growth-collision
+    # pre-flight (E9.4) and the fit check both read the laid-out lines, and a
+    # helv substitute for an embedded font measures wider — it manufactured
+    # phantom wrap lines that failed those checks on unchanged Word-export text.
+    runs, font_fallback = _resolve_embed_runs(doc, page_index, runs)
     align_val = para.align if align is None else _check_align(align)
     pitch_val = pitch if pitch is not None else para.pitch
     wrap = max(20.0, width if width is not None else (para.bbox[2] - para.bbox[0]))
@@ -1854,6 +1903,7 @@ def replace_paragraph_runs(
         resized=resized,
         new_bbox=new_bbox,
         visual_lines=_visual_line_texts(lines),
+        font_fallback=font_fallback,
     )
 
 
@@ -2028,6 +2078,9 @@ def insert_new_runs(
     _check_align(align)
     if not _runs_have_text(runs):
         raise ValueError("no text to insert")
+    # Resolve any embedded-font intent (a duplicated box carries its source
+    # spans' fonts) to concrete fonts before layout.
+    runs, _font_fallback = _resolve_embed_runs(doc, page_index, runs)
     page = doc[page_index]
     width, height = page.rect.width, page.rect.height
     if page.rotation % 180 == 90:
@@ -2174,3 +2227,179 @@ def _embedded_font_map(doc: pymupdf.Document, page_index: int) -> dict[str, bool
         name = strip_subset_prefix(basefont)
         mapping[name] = mapping.get(name, False) or ext != "n/a"
     return mapping
+
+
+# Extracted embedded subsets are written to temp .ttf files (insert_text takes
+# a fontfile PATH — there is no fontbuffer kwarg) and cached by content hash so
+# repeated edits of the same document reuse one file. The file only has to
+# exist during the insert_text call (the glyphs are copied into the page's
+# resources then); leaving it in %TEMP% for the process is cheap and safe.
+_EMBED_FONT_FILE_CACHE: dict[str, str] = {}
+
+# Weight/slant WORDS a font name uses (regular/bold/italic/...) and the base-14
+# CODES that carry the same trait. Both feed the embedded-font match: a span's
+# get_text font name ("Calibri") and the same font's get_page_fonts basefont
+# ("Calibri Regular") differ, so matching by base FAMILY + weight is what pairs
+# them (exact-name matching silently failed and fell back to helv).
+_WEIGHT_WORDS = {"bold", "black", "heavy", "semibold", "demibold"}
+_ITALIC_WORDS = {"italic", "oblique"}
+_STYLE_WORDS = (
+    _WEIGHT_WORDS
+    | _ITALIC_WORDS
+    | {
+        "regular",
+        "roman",
+        "book",
+        "light",
+        "medium",
+        "thin",
+        "normal",
+    }
+)
+_BOLD_CODES = {"hebo", "hebi", "tibo", "tibi", "cobo", "cobi"}
+_ITALIC_CODES = {"heit", "hebi", "tiit", "tibi", "coit", "cobi"}
+
+
+def _font_family_key(name: str) -> str:
+    """A font name reduced to its base family (subset prefix and weight/slant
+    words dropped, separators normalised) for family matching."""
+    text = strip_subset_prefix(name).lower().replace(",", " ").replace("-", " ")
+    return " ".join(t for t in text.split() if t not in _STYLE_WORDS)
+
+
+def _font_style_bits(name: str) -> tuple[bool, bool]:
+    """(bold, italic) inferred from weight/slant WORDS in a font name."""
+    text = strip_subset_prefix(name).lower()
+    return (
+        any(w in text for w in _WEIGHT_WORDS),
+        any(w in text for w in _ITALIC_WORDS),
+    )
+
+
+def _code_style_bits(code: str) -> tuple[bool, bool]:
+    """(bold, italic) carried by a base-14 code (hebo/heit/...)."""
+    return code in _BOLD_CODES, code in _ITALIC_CODES
+
+
+def _embedded_fontfile(
+    doc: pymupdf.Document,
+    page_index: int,
+    name: str,
+    bold: bool = False,
+    italic: bool = False,
+) -> str | None:
+    """A temp ``.ttf`` path for the embedded font on this page whose base family
+    matches ``name`` and whose weight best matches ``(bold, italic)``, or
+    ``None`` when the page has no embedded font in that family.
+
+    Family + weight matching (not exact name) is deliberate: PyMuPDF reports a
+    font's ``get_text`` name and its ``get_page_fonts`` basefont differently
+    (``"Calibri"`` vs ``"Calibri Regular"``), so exact-name matching silently
+    failed and fell back to a helv substitute (the bug this fixes)."""
+    want_family = _font_family_key(name)
+    exact: int | None = None
+    weight_only: int | None = None
+    any_match: int | None = None
+    for entry in doc.get_page_fonts(page_index):
+        xref, ext, basefont = entry[0], entry[1], entry[3]
+        if ext == "n/a" or _font_family_key(basefont) != want_family:
+            continue
+        b, i = _font_style_bits(basefont)
+        if b == bold and i == italic:
+            exact = xref
+            break
+        if b == bold and weight_only is None:
+            weight_only = xref
+        if any_match is None:
+            any_match = xref
+    xref = exact if exact is not None else (weight_only if weight_only is not None else any_match)
+    if xref is None:
+        return None
+    try:
+        buffer = doc.extract_font(xref)[3]
+    except Exception:  # a malformed/unextractable embedded font — best effort
+        return None
+    if not buffer:
+        return None
+    digest = hashlib.md5(buffer).hexdigest()
+    cached = _EMBED_FONT_FILE_CACHE.get(digest)
+    if cached and os.path.exists(cached):
+        return cached
+    path = os.path.join(tempfile.gettempdir(), f"pdfedit_emb_{digest}.ttf")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(buffer)
+    except OSError:
+        return None
+    _EMBED_FONT_FILE_CACHE[digest] = path
+    return path
+
+
+def _coverage_segments(text: str, font: pymupdf.Font) -> list[tuple[str, bool]]:
+    """Split ``text`` into maximal ``(piece, covered)`` runs by whether the
+    embedded ``font`` has a glyph for each character.
+
+    Whitespace and control characters are neutral — they attach to the current
+    run without forcing a split — so a single uncovered letter fragments only
+    itself, not the spaces around it. A missing glyph renders as ``.notdef``
+    (blank) AND corrupts text extraction (NUL bytes), so uncovered pieces must
+    be rendered in the base-14 fallback instead."""
+    out: list[list] = []  # [chars, covered]
+    for ch in text:
+        neutral = ch.isspace()
+        covered = True if neutral else bool(font.has_glyph(ord(ch)))
+        if out and (neutral or out[-1][1] == covered):
+            out[-1][0].append(ch)
+        else:
+            out.append([[ch], covered])
+    return [("".join(chars), covered) for chars, covered in out]
+
+
+def _resolve_embed_runs(
+    doc: pymupdf.Document, page_index: int, runs: list[StyledRun]
+) -> tuple[list[StyledRun], bool]:
+    """Rewrite ``embed_name`` run intents into concrete fonts before layout.
+
+    Each run asking to reuse a document font (``style.embed_name``) is resolved
+    to that font's extracted file and split at glyph-coverage boundaries:
+    covered pieces get the embedded ``fontfile`` (pixel-faithful, self-consistent
+    metrics), uncovered pieces fall back to the run's base-14 ``code``. Runs with
+    no ``embed_name`` pass through untouched. Returns ``(runs, fell_back)`` —
+    ``fell_back`` True when a real (non-space) character had to substitute, so
+    the UI can say some characters were not in the document's font.
+    """
+    if not any(run.style.embed_name for run in runs):
+        return runs, False
+    resolved_fonts: dict[tuple[str, bool, bool], tuple[str | None, pymupdf.Font | None]] = {}
+    out: list[StyledRun] = []
+    fell_back = False
+    for run in runs:
+        name = run.style.embed_name
+        if not name:
+            out.append(run)
+            continue
+        # The run's base-14 code carries the intended weight/slant (set
+        # weight-correct by the callers), so a bold run pairs with the bold
+        # embedded face even when the family name itself omits the weight.
+        bold, italic = _code_style_bits(run.style.code)
+        key = (name, bold, italic)
+        if key not in resolved_fonts:
+            path = _embedded_fontfile(doc, page_index, name, bold, italic)
+            try:
+                font = pymupdf.Font(fontfile=path) if path else None
+            except Exception:  # a subset PyMuPDF can extract but not re-load
+                path, font = None, None
+            resolved_fonts[key] = (path, font)
+        path, font = resolved_fonts[key]
+        if path is None or font is None:  # not embedded here — use the fallback
+            out.append(StyledRun(run.text, replace(run.style, embed_name=None)))
+            continue
+        for piece, covered in _coverage_segments(run.text, font):
+            if covered:
+                style = replace(run.style, embed_name=None, fontfile=path)
+            else:
+                style = replace(run.style, embed_name=None, fontfile=None)
+                if piece.strip():
+                    fell_back = True
+            out.append(StyledRun(piece, style))
+    return out, fell_back

@@ -385,6 +385,120 @@ def test_replace_embedded_font_best_effort(embedded_font_pdf, tmp_path):
     assert "Embedded" not in text
 
 
+# --- embedded-font reuse (Word-export editing; the "grows into occupied
+# space" bug on unchanged text) ---------------------------------------------
+
+
+_HELV_CODES = ("helv", "hebo", "heit", "hebi")
+
+
+def _para_runs(para, *, embed=True, text_map=None):
+    """Engine runs mirroring the UI's _runs_from_paragraph: per-span, with an
+    embed_name intent for embedded non-base-14 spans (when ``embed``) and a
+    WEIGHT-CORRECT base-14 fallback code (the engine pairs a run with the
+    matching embedded weight via that code)."""
+    runs = []
+    for i, line in enumerate(para.lines):
+        if i:
+            runs.append(StyledRun("\n", TextStyle()))
+        for span in line:
+            reuse = embed and span.embedded and map_font_to_base14(span.font, span.flags) is None
+            idx = (1 if span.flags & FLAG_BOLD else 0) + (2 if span.flags & FLAG_ITALIC else 0)
+            text = span.text if text_map is None else text_map(span.text)
+            runs.append(
+                StyledRun(
+                    text,
+                    TextStyle(
+                        code=span.base14 or _HELV_CODES[idx],
+                        size=span.size,
+                        color=span.color,
+                        embed_name=span.font if reuse else None,
+                    ),
+                )
+            )
+    return runs
+
+
+def test_embedded_nonstandard_font_reused_on_edit(embedded_nonstandard_font_pdf, tmp_path):
+    """Editing an embedded no-base-14-mapping font reuses the DOCUMENT's own
+    font (not a helv substitute) and round-trips with the text changed."""
+    out = tmp_path / "edited.pdf"
+    with PdfDocument.open(embedded_nonstandard_font_pdf) as doc:
+        para = next(p for p in doc.paragraphs(0) if "stretches" in p.text)
+        runs = _para_runs(para, embed=True, text_map=lambda t: t.replace("stretches", "reaches"))
+        result = doc.replace_paragraph_runs(0, para, runs)
+        doc.save(out)
+    assert not result.font_fallback  # "reaches" uses only in-subset glyphs
+    text = _page_text(out)
+    assert "reaches" in text and "stretches" not in text
+    # The document's own embedded font (Calibri/Verdana) is re-embedded, not helv.
+    fonts = {f[3] for f in pymupdf.open(str(out))[0].get_fonts()}
+    assert any("Calibri" in n or "Verdana" in n for n in fonts)
+
+
+def test_embedded_font_no_phantom_wrap_line(embedded_nonstandard_font_pdf):
+    """The mechanism behind the bug: a full-width embedded line re-laid in helv
+    wraps to an extra line (~9% wider); reusing the embedded font does not."""
+    with PdfDocument.open(embedded_nonstandard_font_pdf) as doc:
+        para = next(p for p in doc.paragraphs(0) if "stretches" in p.text)
+        n_before = len(para.lines)
+        with PdfDocument.open(embedded_nonstandard_font_pdf) as doc_helv:
+            para_h = next(p for p in doc_helv.paragraphs(0) if "stretches" in p.text)
+            helv = doc_helv.replace_paragraph_runs(0, para_h, _para_runs(para_h, embed=False))
+        emb = doc.replace_paragraph_runs(0, para, _para_runs(para, embed=True))
+    assert len(emb.visual_lines) == n_before  # faithful — no phantom line
+    assert len(helv.visual_lines) > n_before  # the substitute manufactures one
+
+
+def test_embedded_font_missing_glyph_falls_back(real_embedded_bug_pdf, tmp_path):
+    """A character the real Word subset lacks (its Aptos subset omits q/z/...)
+    falls back to the base-14 code — the text stays intact (no NUL corruption)
+    and font_fallback is reported. Uses the real sample: a PyMuPDF-subsetted
+    synthetic font strips the Unicode cmap, so glyph coverage can't be probed
+    the way a genuine Word subset (which keeps its cmap) can."""
+    out = tmp_path / "edited.pdf"
+    with PdfDocument.open(real_embedded_bug_pdf) as doc:
+        para = next(p for p in doc.paragraphs(0) if p.embedded)
+        runs = [StyledRun("quiz zap", TextStyle(code="helv", size=para.size, embed_name=para.font))]
+        result = doc.replace_paragraph_runs(0, para, runs)
+        doc.save(out)
+    assert result.font_fallback  # q and z are not in the Aptos subset
+    assert "quiz zap" in _page_text(out)  # every character survived extraction
+
+
+def test_real_embedded_bug_paragraphs_edit_without_growth_error(real_embedded_bug_pdf):
+    """The exact reported regression: every embedded multi-line paragraph in the
+    Word-export sample failed to re-insert its OWN text (helv over-measured and
+    tripped the growth-collision refusal). With embedded-font reuse they all
+    succeed."""
+    with PdfDocument.open(real_embedded_bug_pdf) as doc:
+        paras = [p for p in doc.paragraphs(0) if p.embedded and len(p.lines) >= 2]
+        assert paras, "expected embedded multi-line paragraphs in the sample"
+        for para in paras:
+            # Re-insert unchanged text on a fresh copy (mutation is destructive).
+            with PdfDocument.open(real_embedded_bug_pdf) as fresh:
+                target = next(p for p in fresh.paragraphs(0) if p.text == para.text)
+                result = fresh.replace_paragraph_runs(0, target, _para_runs(target, embed=True))
+                assert not result.font_fallback  # unchanged text is fully covered
+
+
+def test_real_embedded_bug_helv_path_still_refuses(real_embedded_bug_pdf):
+    """Control: WITHOUT embedded-font reuse (the old behaviour) at least one of
+    those paragraphs still trips the growth refusal — confirms the sample
+    reproduces the bug and the reuse is what fixes it."""
+    refused = 0
+    with PdfDocument.open(real_embedded_bug_pdf) as doc:
+        targets = [p for p in doc.paragraphs(0) if p.embedded and len(p.lines) >= 2]
+    for para in targets:
+        with PdfDocument.open(real_embedded_bug_pdf) as fresh:
+            target = next(p for p in fresh.paragraphs(0) if p.text == para.text)
+            try:
+                fresh.replace_paragraph_runs(0, target, _para_runs(target, embed=False))
+            except ValueError:
+                refused += 1
+    assert refused > 0
+
+
 def test_replace_with_empty_string_deletes(quote_pdf, tmp_path):
     out, result = _replace_and_reopen(quote_pdf.path, tmp_path, quote_pdf.date, "")
     assert not result.inserted

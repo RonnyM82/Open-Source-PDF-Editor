@@ -62,6 +62,7 @@ from pdfcore.textedit import (
     TextSpan,
     TextStyle,
     fingerprint_lineset,
+    map_font_to_base14,
     merge_paragraphs,
 )
 
@@ -244,6 +245,13 @@ class DocumentView(QWidget):
             overlay.cancelled.connect(self.stateChanged)
         self._pending_paragraph: tuple[int, Paragraph] | None = None
         self._pending_insert: tuple[int, tuple[float, float]] | None = None
+        # (base-family, bold, italic) -> exact embedded font name, for the span(s)
+        # of the open editor. Lets a commit reuse the DOCUMENT's own embedded
+        # font (Word/browser exports) rather than a helv substitute that
+        # measures wider. Rebuilt each time an editor opens (see _begin_*_edit);
+        # keyed on the base family because Qt's QFont drops a ",Bold" suffix into
+        # a bold FLAG (family() returns "Aptos" for "Aptos,Bold").
+        self._edit_embedded_fonts: dict[tuple[str, bool, bool], str] = {}
         # Review comments (E11): pending create (page, rect, callout target),
         # pending text edit (page, xref), and an in-flight Ctrl+drag move.
         self._pending_comment: tuple[int, tuple, tuple | None] | None = None
@@ -1005,6 +1013,7 @@ class DocumentView(QWidget):
                 "Rotated text — shown horizontally while editing; it stays rotated on the page."
             )
         self._pending_edit = (page_index, span)
+        self._edit_embedded_fonts = self._embedded_font_keys([span])
         self.styleContextChanged.emit(span)
         self._edit_open_style = self._current_style()
         self._edit_open_zoom = self._canvas.zoom
@@ -1080,6 +1089,29 @@ class DocumentView(QWidget):
         font.setItalic(bool(span.flags & FLAG_ITALIC))
         return font
 
+    @staticmethod
+    def _embedded_font_keys(spans) -> dict[tuple[str, bool, bool], str]:
+        """(base-family, bold, italic) -> exact embedded font name, for the
+        given spans. The key's base family matches what a QFont reports for the
+        editor piece (a ",Bold" suffix becomes a bold flag, not part of the
+        family), so a commit can map an edited piece back to the document's own
+        embedded font."""
+        keys: dict[tuple[str, bool, bool], str] = {}
+        for span in spans:
+            # Only fonts whose NAME maps to no base-14 family reuse the embedded
+            # subset; a mapped embedded font (Arial/Times/Courier) keeps its
+            # full-coverage base-14 substitute (matches the engine's
+            # replace_span_text rule — extraction forces base14=None on every
+            # embedded span, so the name map is the real signal).
+            if not getattr(span, "embedded", False):
+                continue
+            if map_font_to_base14(span.font, span.flags) is not None:
+                continue
+            base = span.font.split(",")[0].strip()
+            key = (base, bool(span.flags & FLAG_BOLD), bool(span.flags & FLAG_ITALIC))
+            keys.setdefault(key, span.font)
+        return keys
+
     def _runs_from_pieces(self, pieces) -> tuple[list, bool]:
         """Editor (text, QTextCharFormat) pieces -> engine StyledRuns.
 
@@ -1100,7 +1132,13 @@ class DocumentView(QWidget):
             bold = font.bold() or fmt.fontWeight() >= 600
             italic = font.italic()
             code, fontfile, resolved = resolver(family, bold, italic)
-            all_resolved = all_resolved and resolved
+            # Prefer the document's own embedded font for a piece whose family
+            # came from an embedded span (Word/browser export): the engine
+            # reuses it for faithful metrics, falling back to `code` only for a
+            # character its subset lacks (reported as font_fallback). An
+            # embedded match counts as resolved — it is NOT a substitute.
+            embed_name = self._edit_embedded_fonts.get((family, bold, italic))
+            all_resolved = all_resolved and (resolved or embed_name is not None)
             pt_property = fmt.property(PT_PROPERTY)
             pixel = font.pixelSize()
             if isinstance(pt_property, float) and pt_property > 0:
@@ -1130,6 +1168,7 @@ class DocumentView(QWidget):
                         underline=fmt.fontUnderline() or font.underline(),
                         strike=fmt.fontStrikeOut() or font.strikeOut(),
                         script=script,
+                        embed_name=embed_name,
                     ),
                 )
             )
@@ -1270,7 +1309,11 @@ class DocumentView(QWidget):
         if not self._push_command("Edit text", op, ("page", page_index)):
             return
         result = results[0]
-        if not result.exact_font or not resolved:
+        if getattr(result, "font_fallback", False):
+            self.editWarning.emit(
+                "Some characters aren't in the document's font — a standard font was used."
+            )
+        elif not result.exact_font or not resolved:
             self.editWarning.emit("Font can't be matched exactly — closest standard font used.")
         if result.overflow:
             self.editWarning.emit("New text is wider than the original.")
@@ -1292,6 +1335,7 @@ class DocumentView(QWidget):
         bottom_right = self._canvas.mapFromScene(QPointF(scene_rect[2], scene_rect[3]))
         rect = QRect(top_left, bottom_right).normalized().adjusted(-2, -2, 2, 8)
         self._pending_paragraph = (page_index, para)
+        self._edit_embedded_fonts = self._embedded_font_keys(para.spans)
         # Emitted BEFORE the align capture: the toolbar reflects the
         # paragraph's own justification, and that reflected value is what the
         # commit compares against (so opening a right-aligned block and
@@ -2175,7 +2219,11 @@ class DocumentView(QWidget):
         if not self._push_command("Edit paragraph", op, ("page", page_index)):
             return
         result = results[0]
-        if not result.exact_font or not resolved:
+        if getattr(result, "font_fallback", False):
+            self.editWarning.emit(
+                "Some characters aren't in the document's font — a standard font was used."
+            )
+        elif not result.exact_font or not resolved:
             self.editWarning.emit("Font can't be matched exactly — closest standard font used.")
         if result.resized:
             self.editWarning.emit("The text box grew to fit the new text.")
@@ -3419,16 +3467,32 @@ class DocumentView(QWidget):
                 segments = getattr(line_span, "rule_segments", None) or (
                     (line_span.text, line_span.underline, line_span.strike),
                 )
+                if (
+                    line_span.embedded
+                    and map_font_to_base14(line_span.font, line_span.flags) is None
+                ):
+                    # Reuse the document's own embedded font on moves/merges too
+                    # (only when the name maps to no base-14 family — same rule
+                    # as edits); the base-14 fallback is weight-correct for a
+                    # missing glyph.
+                    bold = bool(line_span.flags & FLAG_BOLD)
+                    italic = bool(line_span.flags & FLAG_ITALIC)
+                    fallback_code = font_choice(line_span.font, bold, italic)[0]
+                    embed_name = line_span.font
+                else:
+                    fallback_code = line_span.base14 or "helv"
+                    embed_name = None
                 for text, underline, strike in segments:
                     runs.append(
                         StyledRun(
                             text,
                             TextStyle(
-                                code=line_span.base14 or "helv",
+                                code=fallback_code,
                                 size=line_span.size,
                                 color=line_span.color,
                                 underline=underline,
                                 strike=strike,
+                                embed_name=embed_name,
                             ),
                         )
                     )
