@@ -10,6 +10,12 @@
 #   built-in PySide6 hook; no manual plugin wiring needed.
 # - Unused heavy Qt modules are excluded to shrink the bundle. This is a
 #   QtWidgets-only app (no WebEngine/QML/Quick/3D/Multimedia/Charts).
+# - The digital-signing stack (pyHanko + cryptography + transitive deps,
+#   added 2026-07-25) needs NO spec entries: pyHanko/asn1crypto/certvalidator
+#   are pure Python (they ride the PYZ), cryptography has standard PyInstaller
+#   support, and tzdata's zone files are collected by hooks-contrib's tzdata
+#   hook automatically (verified: 605 zone files in the bundle, all frozen
+#   smokes green). Password protection is pure pymupdf — nothing to bundle.
 
 from pathlib import Path
 

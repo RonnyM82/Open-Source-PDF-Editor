@@ -119,10 +119,13 @@ def test_restore_then_save_in_place(multipage_pdf, page_marker):
 def test_snapshot_restore_encrypted_needs_no_reauth(encrypted_pdf):
     with PdfDocument.open(encrypted_pdf.path, password=encrypted_pdf.user_pw) as doc:
         doc.restore(doc.snapshot())
-        # Snapshots drop encryption (transient, in-memory only) — a restore
-        # must never re-prompt for the password.
-        assert doc.needs_pass is False
-        assert doc.render_page(0).width > 0
+        # Snapshots PRESERVE encryption (so a later save can KEEP it — the
+        # old drop-on-snapshot behaviour made post-undo saves write
+        # plaintext); the restore re-authenticates internally, so it still
+        # never re-prompts for the password.
+        assert doc.needs_pass is True  # the bytes carry the encryption
+        assert doc.is_protected is True
+        assert doc.render_page(0).width > 0  # …and we're authenticated
 
 
 def test_restore_undoes_rotation_dimensions(text_pdf):

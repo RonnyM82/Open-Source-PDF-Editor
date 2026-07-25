@@ -41,8 +41,18 @@ is fully testable with pytest, no GUI required.
 
 **Viewer:** open PDFs (incl. password-protected) in tabs, render pages, navigate,
 zoom (fit-page / fit-width / ±, Ctrl+wheel), a thumbnail sidebar, and print
-(colour/BW, paper size, per-page orientation, preview). Note: saving a
-password-protected file writes the output unencrypted.
+(colour/BW, paper size, per-page orientation, preview). Saving a
+password-protected file **keeps its protection**.
+
+**Password protection:** File → Protect document… sets a password to **open**
+the document (real AES-256 encryption) and/or a permissions password that
+**restricts editing and printing** — Acrobat's standard options: printing
+on/off, five "changes allowed" levels (none / page ops / form fill & sign /
+commenting / anything except extraction), and a copy toggle. The app also
+*honours* restrictions on files it opens: restricted actions are disabled, and
+entering Edit mode asks for the permissions password. Honest caveat: the open
+password is real cryptography; the permission flags bind well-behaved PDF
+readers (like this one) but are not a security boundary.
 
 **Page manipulation:** rotate, delete, reorder (move up/down), insert pages from
 another file, merge several PDFs, split into ranges — plus Save / Save As with an
@@ -157,9 +167,10 @@ insert pages.
 See [Set PDF Editor as your default PDF viewer](#set-pdf-editor-as-your-default-pdf-viewer).
 
 **Is it a replacement for Adobe Acrobat?**
-It covers everyday viewing, editing, page organisation, printing, OCR, and
-cryptographic digital signing (Sign menu). It does **not** do AcroForm
-filling or full document reflow.
+It covers everyday viewing, editing, page organisation, printing, OCR,
+cryptographic digital signing (Sign menu), and password protection with
+Acrobat-style permission restrictions (File → Protect document…). It does
+**not** do AcroForm filling or full document reflow.
 
 ## Setup (Windows, PowerShell)
 

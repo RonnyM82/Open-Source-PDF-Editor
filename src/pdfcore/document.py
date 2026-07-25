@@ -20,6 +20,7 @@ from pdfcore import (
     links,
     ocr,
     pages,
+    protect,
     signing,
     textedit,
     textselect,
@@ -46,14 +47,38 @@ class PdfDocument:
     def __init__(self, doc: pymupdf.Document, source: Path | None = None) -> None:
         self._doc = doc
         self._source = source
+        # Auth state (memory-only, never persisted): the last password that
+        # authenticated, and MuPDF's auth level (0 none / 2 user / 4 owner /
+        # 6 both). Needed so save_in_place/restore can re-authenticate their
+        # internal reopens — the engine still never prompts (rule 3).
+        self._password: str | None = None
+        self._auth_level: int = 0
+        # EVERY password that authenticated this session: undo can cross a
+        # password-CHANGING save, so a restored snapshot may carry OLDER
+        # encryption than the current password opens (adversarial-review
+        # finding — restore once bricked the doc after a re-protect).
+        self._known_passwords: list[str] = []
+        # The protection CHOICE for saves (Acrobat's model: a document
+        # property, applied at EVERY save). protect.KEEP = preserve whatever
+        # the file has; a ProtectionSpec = apply it; None = strip. The choice
+        # PERSISTS across saves and snapshot restores — consuming it after
+        # one save let undo-past-that-save silently launder the protection
+        # away (restored pre-protection bytes + KEEP = plaintext output).
+        self._pending: protect.ProtectionSpec | None | protect._Keep = protect.KEEP
 
     @classmethod
     def open(cls, path: str | Path, password: str | None = None) -> PdfDocument:
         source = Path(path)
         doc = pymupdf.open(source)
-        if doc.needs_pass and password is not None:
-            doc.authenticate(password)
-        return cls(doc, source=source)
+        wrapper = cls(doc, source=source)
+        # Authenticate for ANY encrypted flavour — owner-only files have
+        # needs_pass False (auto-auth) but the supplied password must still
+        # be applied to reach owner level (gating on needs_pass silently
+        # discarded it and locked the caller out of a file they had the
+        # password for — adversarial-review finding).
+        if password is not None and (doc.needs_pass or wrapper.is_protected):
+            wrapper.authenticate(password)
+        return wrapper
 
     @property
     def source(self) -> Path | None:
@@ -67,12 +92,116 @@ class PdfDocument:
 
         PyMuPDF keeps this truthy even after successful authentication — it
         reports that the file *is* encrypted, not the current auth state.
+        CAUTION: it is FALSE for owner-password-only (permissions-locked)
+        files, which auto-authenticate — use :attr:`is_protected` for the
+        "does this file carry encryption" question.
         """
         return bool(self._doc.needs_pass)
 
     def authenticate(self, password: str) -> bool:
-        """Try ``password``; return ``True`` on success."""
-        return bool(self._doc.authenticate(password))
+        """Try ``password``; return ``True`` on success.
+
+        Records the password + auth level (memory-only) so internal reopens
+        (save_in_place, restore) can re-authenticate. CAUTION: MuPDF applies
+        the level of the password GIVEN — authenticating with the USER
+        password after an owner unlock DOWNGRADES live permissions; use
+        :meth:`unlock` for owner-level auth, and nothing else in the app
+        should call this after open.
+        """
+        level = int(self._doc.authenticate(password))
+        if level:
+            self._password = password
+            self._auth_level = level
+            self._remember_password(password)
+        return bool(level)
+
+    def _remember_password(self, password: str) -> None:
+        if password not in self._known_passwords:
+            self._known_passwords.append(password)
+
+    def unlock(self, owner_pw: str) -> bool:
+        """Authenticate at OWNER level; True lifts permission limits live.
+
+        The open (user) password returns False — and any accidental
+        downgrade it caused is undone by re-authenticating with the
+        previously recorded password (MuPDF applies the level of whatever
+        password it last saw).
+        """
+        previous = self._password
+        level = int(self._doc.authenticate(owner_pw))
+        if level in (4, 6):
+            self._password = owner_pw
+            self._auth_level = level
+            self._remember_password(owner_pw)
+            return True
+        if level and previous is not None:
+            self._doc.authenticate(previous)  # undo the live downgrade
+        return False
+
+    @property
+    def is_protected(self) -> bool:
+        """True when the CURRENT bytes carry encryption.
+
+        ``needs_pass`` and ``is_encrypted`` both read False for
+        owner-password-only files (MuPDF auto-authenticates them with the
+        empty user password) — the metadata encryption entry is the one
+        reliable indicator (probe-verified).
+        """
+        return (self._doc.metadata or {}).get("encryption") is not None
+
+    @property
+    def is_owner(self) -> bool:
+        """True when authenticated at owner level (or the doc is unrestricted)."""
+        if not self.is_protected:
+            return True
+        return self._auth_level in (4, 6)
+
+    @property
+    def permissions(self) -> protect.Permissions:
+        """What the current auth level allows (all-allowed for plain docs)."""
+        if not self.is_protected:
+            return protect.Permissions.from_mask(-1)
+        return protect.Permissions.from_mask(int(self._doc.permissions))
+
+    @property
+    def auth_password(self) -> str | None:
+        """The password currently authenticating this document (memory-only)."""
+        return self._password
+
+    def set_protection(self, spec: protect.ProtectionSpec | None) -> None:
+        """Pend protection applied at EVERY subsequent save (Acrobat's model).
+
+        ``None`` strips protection at the next save. Deliberately NOT
+        undoable (like Acrobat) — the pending choice is wrapper state, not
+        document content, and survives snapshot restores.
+        """
+        self._pending = spec
+
+    @property
+    def pending_protection(self) -> protect.ProtectionSpec | None | protect._Keep:
+        """The pending choice: a spec, None (strip), or protect.KEEP."""
+        return self._pending
+
+    @property
+    def reopen_password(self) -> str | None:
+        """The password that opens this document's NEXT saved output."""
+        pending = self._pending
+        if isinstance(pending, protect.ProtectionSpec):
+            return pending.owner_pw or pending.user_pw
+        if pending is None:  # stripping — the output is plain
+            return None
+        return self._password  # KEEP: whatever authenticates today
+
+    def _encryption_kwargs(self) -> dict:
+        pending = self._pending
+        if isinstance(pending, protect.ProtectionSpec):
+            return protect.encryption_kwargs(pending)
+        if pending is None:
+            return {"encryption": pymupdf.PDF_ENCRYPT_NONE}
+        # KEEP preserves passwords + permission bits and is a no-op on plain
+        # documents (probe-verified) — the safe universal default that fixes
+        # the old always-strip behaviour (save's default is ENCRYPT_NONE).
+        return {"encryption": pymupdf.PDF_ENCRYPT_KEEP}
 
     # --- inspection -----------------------------------------------------
     @property
@@ -234,7 +363,10 @@ class PdfDocument:
                 "Cannot save over the currently-open file; save to a new path "
                 "or use save_in_place()."
             )
-        self._doc.save(str(dest), garbage=4, deflate=True)
+        # Encryption: apply the pending spec / strip / KEEP what exists —
+        # PyMuPDF's own default is ENCRYPT_NONE, which silently stripped
+        # protection from every save before this (the documented wart).
+        self._doc.save(str(dest), garbage=4, deflate=True, **self._encryption_kwargs())
 
     def save_in_place(self) -> None:
         """Atomically save changes back to the currently-open file.
@@ -255,8 +387,13 @@ class PdfDocument:
             raise ValueError("document has no source path; use save(path) instead")
         source = self._source
         tmp = source.with_name(source.name + ".tmp")
+        # The written file's password — captured BEFORE writing: the internal
+        # reopens below (happy path AND recovery) must authenticate it, and
+        # only the engine is present at that moment (the UI never sees these
+        # reopens). None when the output is plain.
+        new_pw = self.reopen_password
         try:
-            self._doc.save(str(tmp), garbage=4, deflate=True)
+            self._doc.save(str(tmp), garbage=4, deflate=True, **self._encryption_kwargs())
         except BaseException:
             tmp.unlink(missing_ok=True)  # a partial temp is only litter
             raise
@@ -267,8 +404,63 @@ class PdfDocument:
             data = tmp.read_bytes()
             tmp.unlink(missing_ok=True)
             self._doc = pymupdf.open(stream=data, filetype="pdf")
+            self._post_save_auth(new_pw)  # the temp bytes are encrypted too
             raise
         self._doc = pymupdf.open(source)
+        self._post_save_auth(new_pw)
+
+    def _reauth_internal(self, doc: pymupdf.Document) -> None:
+        """Re-authenticate an internally (re)opened document, never prompting.
+
+        Tries the current password first, then every other password seen this
+        session — a restored snapshot can carry OLDER encryption than the
+        current password opens (undo across a password-changing save). Runs
+        for EVERY encrypted flavour: owner-only files auto-auth with
+        needs_pass False, but the recorded owner password must still be
+        applied or a save/undo silently drops the owner unlock
+        (adversarial-review findings — never gate this on needs_pass).
+        """
+        if not doc.needs_pass and (doc.metadata or {}).get("encryption") is None:
+            self._auth_level = 0  # plain bytes — nothing to authenticate
+            return
+        candidates = [self._password] if self._password is not None else []
+        candidates += [p for p in self._known_passwords if p not in candidates]
+        for password in candidates:
+            level = int(doc.authenticate(password))
+            if level:
+                self._password = password
+                self._auth_level = level
+                return
+        # No session password opens these bytes (shouldn't happen — we only
+        # meet bytes we produced or opened). Owner-only bytes remain usable
+        # at their auto-auth level; user-pw bytes stay locked and the level
+        # honestly reads none.
+        self._auth_level = 0
+
+    def _post_save_auth(self, new_pw: str | None) -> None:
+        """Re-authenticate an internal reopen after a save.
+
+        A newly applied spec: authenticate with the password we just WROTE —
+        unconditionally, because an owner-only output auto-auths with
+        needs_pass False and would otherwise stay at the RESTRICTED level,
+        locking the owner out of their own document seconds after protecting
+        it (adversarial-review finding). A strip leaves a plain file. KEEP
+        re-authenticates the session password(s), so an owner unlock
+        survives every save. The pending CHOICE is deliberately NOT consumed
+        (see __init__ — consuming it let undo launder protection away).
+        """
+        pending = self._pending
+        if isinstance(pending, protect.ProtectionSpec):
+            if new_pw is not None:
+                level = int(self._doc.authenticate(new_pw))
+                self._password = new_pw
+                self._auth_level = level
+                self._remember_password(new_pw)
+        elif pending is None:  # stripped — the file is plain now
+            self._password = None
+            self._auth_level = 0
+        else:  # KEEP — restore the session's auth on the reopen
+            self._reauth_internal(self._doc)
 
     def save_signed(
         self,
@@ -290,9 +482,10 @@ class PdfDocument:
         path. The OPEN document stays UNSIGNED: further edits/saves produce
         unsigned output, and re-saving the signed file with PyMuPDF would
         invalidate the signature. Refuses the currently-open path (like
-        :meth:`save`). Encryption is dropped in the flattened bytes (as with
-        save/snapshot). ``rect``/``image_path`` place a visible signature;
-        see :func:`pdfcore.signing.sign_pdf_bytes`.
+        :meth:`save`). Encryption is dropped in the flattened bytes — a
+        SIGNED COPY IS UNPROTECTED by design (the UI warns; full
+        encrypt-then-sign compose is deferred). ``rect``/``image_path``
+        place a visible signature; see :func:`pdfcore.signing.sign_pdf_bytes`.
         """
         dest = Path(path)
         if self._source is not None and _same_path(dest, self._source):
@@ -676,21 +869,34 @@ class PdfDocument:
     def snapshot(self) -> bytes:
         """Serialized current state — transient, for undo; not archival.
 
-        ``garbage=0`` for speed (snapshots are held in memory, never written to
-        disk). Encryption is dropped in the bytes (PyMuPDF default), so a
-        restore never needs re-authentication.
+        ``garbage=0`` for speed (snapshots are held in memory, never written
+        to disk). Encryption is PRESERVED in the bytes (``PDF_ENCRYPT_KEEP``
+        — a no-op on plain docs): the old default silently DROPPED it, so the
+        first undo/redo restore left ``KEEP`` saves with nothing to keep and
+        every later save wrote plaintext (the milestone's landmine, probe-
+        found). :meth:`restore` re-authenticates internally — never a prompt.
         """
-        return self._doc.tobytes(garbage=0, deflate=True)
+        return self._doc.tobytes(garbage=0, deflate=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
 
     def restore(self, data: bytes) -> None:
         """Replace the document state from a :meth:`snapshot`.
 
         The source path is preserved; the document becomes stream-backed (no
         open handle on the source file), so :meth:`save_in_place` still works.
+        Snapshots of protected documents carry their encryption, so the
+        reopen re-authenticates with the recorded password (memory-only);
+        the pending protection choice is wrapper state and survives —
+        protection is deliberately not undoable, like Acrobat.
         """
         new = pymupdf.open(stream=data, filetype="pdf")
         self._doc.close()
         self._doc = new
+        # Multi-password internal re-auth: the snapshot may carry OLDER
+        # encryption than the current password (undo across a
+        # password-changing save once bricked the tab), and owner-only
+        # snapshots need the recorded owner password re-applied even though
+        # needs_pass is False (both adversarial-review findings).
+        self._reauth_internal(new)
 
     # --- lifecycle ------------------------------------------------------
     def close(self) -> None:

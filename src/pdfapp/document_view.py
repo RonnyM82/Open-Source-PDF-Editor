@@ -48,7 +48,7 @@ from pdfapp.signature_banner import SignatureBanner
 from pdfapp.text_editor_overlay import PT_PROPERTY, ParagraphEditorOverlay, TextEditorOverlay
 from pdfapp.thumbnail_panel import ThumbnailPanel
 from pdfapp.undo import SnapshotCommand, undo_limit_for
-from pdfcore import links, textselect
+from pdfcore import links, protect, textselect
 from pdfcore.document import PdfDocument
 from pdfcore.links import LinkInfo
 from pdfcore.textedit import (
@@ -351,6 +351,8 @@ class DocumentView(QWidget):
         self._sig_banner.detailsRequested.connect(self.signatureDetailsRequested)
         self._sig_banner.dismissed.connect(self._on_sig_banner_dismissed)
         self._sig_banner_dismissed = False
+        # Unsaved pending protection change (File → Protect document…).
+        self._protection_dirty = False
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self._thumbnails)
@@ -402,6 +404,38 @@ class DocumentView(QWidget):
 
         self._push_command("Remove signatures", op, ("all", -1))
 
+    # --- password protection ---------------------------------------------
+    def set_pending_protection(self, spec) -> None:
+        """Pend protection (a ProtectionSpec, or None to strip) for the next
+        save. Counts as unsaved work (dirty) but is NOT undoable — like
+        Acrobat, the protection choice is a document property, not an edit."""
+        self._doc.set_protection(spec)
+        self._protection_dirty = True
+        self.stateChanged.emit()
+
+    @property
+    def can_edit_content(self) -> bool:
+        """False when the document's permissions deny content modification
+        (an assemble-only file may be in edit mode for page ops, but the
+        text/image editors must not open)."""
+        return self._doc.permissions.can_modify
+
+    @property
+    def can_annotate(self) -> bool:
+        """False when the document's permissions deny commenting/annotation —
+        honored at every annotation entry point (toolbar, context menus,
+        comment drag/edit/delete), not just the toolbar actions."""
+        return self._doc.permissions.can_annotate
+
+    @property
+    def protection_state(self) -> str:
+        """ "none" | "pending" | "protected" | "restricted" — the indicator."""
+        if self._protection_dirty:
+            return "pending"
+        if not self._doc.is_protected:
+            return "none"
+        return "protected" if self._doc.permissions.all_allowed else "restricted"
+
     # --- read-only state ------------------------------------------------
     @property
     def ocr_word_cache(self) -> OcrWordCache:
@@ -422,7 +456,10 @@ class DocumentView(QWidget):
 
     @property
     def dirty(self) -> bool:
-        return not self._undo_stack.isClean()
+        # A pending protection change is unsaved work too — it rides the
+        # normal close-prompt/save flows via this flag (it is NOT on the undo
+        # stack: protection is deliberately not undoable, like Acrobat).
+        return not self._undo_stack.isClean() or self._protection_dirty
 
     @property
     def undo_stack(self) -> QUndoStack:
@@ -957,11 +994,18 @@ class DocumentView(QWidget):
         target = hover_target(geometry, px, py)
         # A comment is markup — double-click edits it in EITHER mode (comments
         # float on top). Checked BEFORE the Markup-mode word-selection branch.
+        # Editing markup is an annotation op — honored like the toolbar.
         if target is not None and target.kind == "comment":
-            self._begin_comment_edit(n, target.payload)
+            if self.can_annotate:
+                self._begin_comment_edit(n, target.payload)
             return
         if not self._edit_mode:
             self._select_word_at(sx, sy)  # Markup mode: word selection (X4)
+            return
+        if not self.can_edit_content:
+            # Permissions deny content modification: an assemble-only file can
+            # be IN edit mode for page ops, but the editors must not open.
+            self.editWarning.emit("Content editing is restricted by this document's permissions.")
             return
         if target is not None and target.kind == "text":
             para = target.payload
@@ -990,6 +1034,9 @@ class DocumentView(QWidget):
             self._replace_image_at(n, image)
 
     def _begin_text_edit(self, page_index: int, span: TextSpan) -> None:
+        if not self.can_edit_content:
+            self.editWarning.emit("Content editing is restricted by this document's permissions.")
+            return
         if span.rotation is None:
             self.editWarning.emit(
                 "This text is rotated at an unsupported angle and can't be edited."
@@ -1319,6 +1366,9 @@ class DocumentView(QWidget):
             self.editWarning.emit("New text is wider than the original.")
 
     def _begin_paragraph_edit(self, page_index: int, para: Paragraph) -> None:
+        if not self.can_edit_content:
+            self.editWarning.emit("Content editing is restricted by this document's permissions.")
+            return
         if para.spans and any(s.rotation != 0 for s in para.spans):
             # Rotated singletons edit through the span path (engine refuses
             # the horizontal paragraph layout for them).
@@ -1398,7 +1448,7 @@ class DocumentView(QWidget):
     def begin_insert_comment(self) -> None:
         """Arm click-to-place for a review comment (markup; never prints by
         default). An ANNOTATION — available in Markup mode, not gated on edit."""
-        if not self._canvas.has_page:
+        if not self._canvas.has_page or not self.can_annotate:
             return
         self._click_action = ("comment", None)
         self._canvas.arm_insert_point("Click where the comment should go · Esc cancels")
@@ -1455,7 +1505,7 @@ class DocumentView(QWidget):
     def begin_insert_callout(self) -> None:
         """Arm a TWO-click callout: first the arrow target, then the box.
         An ANNOTATION — available in Markup mode."""
-        if not self._canvas.has_page:
+        if not self._canvas.has_page or not self.can_annotate:
             return
         self._click_action = ("callout_target", None)
         self._canvas.arm_insert_point("Click what the callout should point AT · Esc cancels")
@@ -1463,7 +1513,7 @@ class DocumentView(QWidget):
     def begin_retarget_callout(self, n: int, comment) -> None:
         """Arm one click to re-point a callout's arrowhead (context menu).
         An ANNOTATION edit — available in Markup mode."""
-        if not self._canvas.has_page:
+        if not self._canvas.has_page or not self.can_annotate:
             return
         self._click_action = ("retarget", (n, comment.xref))
         self._canvas.arm_insert_point("Click what the arrowhead should point AT · Esc cancels")
@@ -1472,7 +1522,7 @@ class DocumentView(QWidget):
         """Arm the highlighter (STAYS on until Esc / a click off the page): drag
         a window over text, double-click a word, or triple-click a line to
         highlight it. An ANNOTATION — available in Markup mode."""
-        if not self._canvas.has_page:
+        if not self._canvas.has_page or not self.can_annotate:
             return
         self._click_action = None
         self._word_click_index = None
@@ -2299,6 +2349,14 @@ class DocumentView(QWidget):
         self._resize_image = None
         self._move_link = None
         self._resize_link = None
+        # Permission honoring at the GESTURE funnel (toolbar gating alone let
+        # drags mutate restricted content — adversarial-review finding):
+        # comments are annotations (annotate bit); everything else a drag can
+        # move/resize is content (modify bit).
+        if target.kind == "comment" and not self._doc.permissions.can_annotate:
+            return
+        if target.kind != "comment" and not self.can_edit_content:
+            return
         if target.kind == "comment":
             self._move_comment = (n, target.payload)
             scene_rect = page_coords.page_rect_to_scene(
@@ -2632,6 +2690,11 @@ class DocumentView(QWidget):
         a pure read — the undo stack is never touched."""
         if self._edit_mode or not self._text_selection:
             return
+        if not self._doc.permissions.can_copy:
+            # The ONE funnel for Ctrl+C and the context menu — honoring the
+            # document's copy restriction (we're a compliant reader now).
+            self.editWarning.emit("Copying is restricted by this document's permissions.")
+            return
         text = textselect.region_text(self._text_selection)
         if text:
             QApplication.clipboard().setText(text)
@@ -2682,7 +2745,10 @@ class DocumentView(QWidget):
 
         menu = QMenu(self)
         actions: dict[str, object] = {}
-        if comment is not None:  # markup floats on top: its menu comes first
+        # Annotation permission honored menu-wide (toolbar gating alone was
+        # bypassed here — review finding); Copy separately honors can_copy.
+        annotate_ok = self.can_annotate
+        if comment is not None and annotate_ok:  # markup floats on top
             actions["edit_comment"] = menu.addAction(
                 icons.icon("insert_comment"), "Edit comment\tDouble-click"
             )
@@ -2696,16 +2762,18 @@ class DocumentView(QWidget):
             menu.addSeparator()
         if self._text_selection is not None:
             actions["copy"] = menu.addAction(icons.icon("copy"), "Copy")
-            actions["highlight_selection"] = menu.addAction(
-                icons.icon("highlight"), "Highlight selection"
-            )
-        elif span is not None:
+            actions["copy"].setEnabled(self._doc.permissions.can_copy)
+            if annotate_ok:
+                actions["highlight_selection"] = menu.addAction(
+                    icons.icon("highlight"), "Highlight selection"
+                )
+        elif span is not None and annotate_ok:
             actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
         if link is not None:  # markup follows links — offer it explicitly
             if not menu.isEmpty():
                 menu.addSeparator()
             actions["open_link"] = menu.addAction(icons.icon("open_link"), "Open link")
-        if comment is None:  # adding a comment ON a comment would stack them
+        if comment is None and annotate_ok:  # a comment ON a comment would stack
             if not menu.isEmpty():
                 menu.addSeparator()
             actions["add_comment"] = menu.addAction(
@@ -2907,6 +2975,8 @@ class DocumentView(QWidget):
         (edit mode — the group in one step). A single paragraph is deleted
         through its editor / context menu instead."""
         if self._edit_mode and self._selected_members():
+            if not self.can_edit_content:
+                return  # restricted: the group's boxes are content
             self._delete_selected_paragraphs()  # the whole box group
             return
         if self._selection is None:
@@ -2915,10 +2985,12 @@ class DocumentView(QWidget):
         if n != self._current_page:
             return
         if kind == "comment":
+            if not self.can_annotate:
+                return  # deleting markup is an annotation op
             self._delete_comment_at(n, payload.xref)
-        elif kind == "image" and self._edit_mode:
+        elif kind == "image" and self._edit_mode and self.can_edit_content:
             self._delete_image_at(n, payload)
-        elif kind == "link" and self._edit_mode:
+        elif kind == "link" and self._edit_mode and self.can_edit_content:
             self._delete_link_at(n, payload.xref)
 
     def _delete_comment_at(self, page_index: int, xref: int) -> None:
@@ -3149,6 +3221,11 @@ class DocumentView(QWidget):
         span = page_coords.span_at(geometry.spans, px, py)
         image = self._doc.image_at(n, px, py)
         link = self._link_at(n, px, py)
+        if not self.can_edit_content:
+            # Restricted document (e.g. assemble-only in edit mode): the menu
+            # must not offer content mutations the permissions deny — the
+            # toolbar gating alone was bypassed here (review finding).
+            para = span = image = link = None
         if not self.isVisible():
             return  # offscreen tests call the dispatch methods directly
         from PySide6.QtGui import QCursor
@@ -3157,7 +3234,7 @@ class DocumentView(QWidget):
         menu = QMenu(self)
         actions: dict[str, object] = {}
         comment = self._doc.comment_at(n, px, py)
-        if comment is not None:  # markup floats on top: its menu comes first
+        if comment is not None and self.can_annotate:  # markup floats on top
             actions["edit_comment"] = menu.addAction(
                 icons.icon("insert_comment"), "Edit comment\tDouble-click"
             )
@@ -3170,7 +3247,7 @@ class DocumentView(QWidget):
             )
             menu.addSeparator()
         multi_count = sum(1 for pn, _pp in self._multi_paragraphs if pn == n)
-        if multi_count >= 2:
+        if multi_count >= 2 and self.can_edit_content:
             actions["merge"] = menu.addAction(
                 icons.icon("edit_paragraph"), f"Merge {multi_count} text boxes into one"
             )
@@ -3210,7 +3287,7 @@ class DocumentView(QWidget):
             )
             actions["edit_para"].setEnabled(para is not None)
             actions["highlight"] = menu.addAction(icons.icon("highlight"), "Highlight this text")
-            actions["highlight"].setEnabled(span is not None)
+            actions["highlight"].setEnabled(span is not None and self.can_annotate)
             actions["duplicate_text_box"] = menu.addAction(
                 icons.icon("duplicate_text"), "Duplicate text box"
             )
@@ -3243,12 +3320,12 @@ class DocumentView(QWidget):
                 icons.icon("insert_link"), "Redefine clickable area…"
             )
             actions["remove_link"] = menu.addAction(icons.icon("remove_link"), "Remove link")
-        if menu.isEmpty():  # page background
+        if menu.isEmpty() and self.can_edit_content:  # page background
             actions["insert_text"] = menu.addAction(icons.icon("insert_text"), "Insert text here")
             actions["insert_image"] = menu.addAction(
                 icons.icon("insert_image"), "Insert image here…"
             )
-        if comment is None:  # adding a comment ON a comment would stack them
+        if comment is None and self.can_annotate:  # a comment ON a comment would stack
             actions["add_comment"] = menu.addAction(
                 icons.icon("insert_comment"), "Add comment here"
             )
@@ -3591,6 +3668,9 @@ class DocumentView(QWidget):
             QMessageBox.critical(self, "Save failed", _save_failure_text(self._doc.source, exc))
             return False
         self._undo_stack.setClean()
+        self._protection_dirty = False  # the pending protection just landed
+        # Signature checks read the on-disk file with this password.
+        self.open_password = self._doc.auth_password
         self.stateChanged.emit()
         return True
 
@@ -3598,6 +3678,12 @@ class DocumentView(QWidget):
         source = self._doc.source
         if source is not None and out.resolve() == source.resolve():
             return self.save()  # same file -> atomic in-place
+        # Captured BEFORE the doc closes: the reopen below must authenticate
+        # the NEW file (which may carry newly applied or kept protection),
+        # and the protection CHOICE continues into the new session — undo
+        # past this save must not launder it away.
+        reopen_pw = self._doc.reopen_password
+        pending = self._doc.pending_protection
         try:
             self._doc.save(out)
         except Exception as exc:  # noqa: BLE001 - surface any save error
@@ -3607,9 +3693,13 @@ class DocumentView(QWidget):
         # stack is kept: snapshots are full states, so undoing past this point
         # restores pre-edit content (a later save writes it to the NEW path).
         self._doc.close()
-        self._doc = PdfDocument.open(out)
+        self._doc = PdfDocument.open(out, password=reopen_pw)
+        if pending is not protect.KEEP:
+            self._doc.set_protection(pending)  # the choice survives save-as
+        self.open_password = reopen_pw
         self._current_page = min(self._current_page, self._doc.page_count - 1)
         self._undo_stack.setClean()
+        self._protection_dirty = False  # the pending protection just landed
         self._invalidate_render_cache()
         self._populate_thumbnails()
         self._show_page(self._current_page)

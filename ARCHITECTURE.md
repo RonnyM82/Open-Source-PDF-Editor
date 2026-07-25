@@ -69,8 +69,8 @@ Two rules make caching safe:
 2. **Clear-on-mutation.** Any structural change (delete, reorder, insert, merge,
    save-as) and *every* undo/redo restore clears the whole cache; page-scoped ops
    (rotate, a text edit) may evict just the affected page. A stale render showing
-   the wrong page is the bug this prevents. Three per-page caches (render,
-   geometry, OCR words) all ride the same invalidation funnel.
+   the wrong page is the bug this prevents. Four per-page caches (render,
+   geometry, OCR words, links) all ride the same invalidation funnel.
 
 ## Undo — snapshot-based
 
@@ -127,6 +127,48 @@ the in-place editors float over the page with deliberately light chrome so a dar
 app theme doesn't bleed a dark box over the white page. Every affordance ships a
 read-only inertness test.
 
+## Digital signing — terminal by design
+
+Cryptographic signing (`pdfcore/signing.py`, **pyHanko**) is the one operation
+that deliberately does *not* take a document object: it is **bytes in, bytes
+out**. All PyMuPDF edits happen first, the document is flattened to final
+bytes, and pyHanko appends the signature as an *incremental update* — the
+original bytes survive verbatim at the front of the file. Any PyMuPDF rewrite
+of signed bytes re-serialises the file and invalidates the signature, so the
+two libraries never share a document object; they hand bytes across the
+boundary.
+
+Consequences that shape the UI: signing writes a signed **copy** (the open
+document stays unsigned); re-signing an already-signed clean file appends to
+its own file bytes (signatures compose); saving an *edited* signed document
+**removes** its signatures with consent (Word's model — a broken signature
+reads as tampering, which is worse than no signature). The read side
+(`verify_pdf_signatures`) powers an Acrobat-style status surface: signed
+documents are announced on open, a tampered file gets a permanent banner, and
+verification always reads the on-disk file bytes — never a flatten, which
+would break the very signatures being measured. The `Signer` parameter is the
+swap point if PKCS#11/smartcard support is ever wanted.
+
+## Password protection
+
+Standard two-password PDF security (`pdfcore/protect.py` + document-held
+state): a **user (open) password** — real AES-256 — and an **owner
+(permissions) password** whose restriction flags mirror Acrobat's options.
+Protection is a *document property*: chosen in one dialog, held as pending
+state on the tab, applied at **every** save; saving a file that already has
+encryption preserves it (`PDF_ENCRYPT_KEEP` — including inside undo snapshots,
+which would otherwise silently launder protection away after the first undo).
+
+The app also *honours* permission flags on files it opens — restricted actions
+disable, and entering Edit mode prompts for the permissions password. Two
+engine subtleties worth knowing: MuPDF applies the auth level of the password
+it last saw (so a stray user-password authentication after an owner unlock
+would downgrade the session — only `unlock()` may authenticate after open),
+and owner-only files auto-authenticate so `needs_pass` cannot be trusted as
+"is this file protected" (the metadata encryption entry is the reliable
+indicator). Permission flags bind compliant readers only; the open password is
+the sole cryptographic protection, and the UI words that honestly.
+
 ## Printing
 
 The engine exposes one method — `render_page_at_dpi(n, dpi, gray=False)`,
@@ -167,9 +209,11 @@ wraps the bundle into a per-user installer. Resource lookups use the
 
 pytest, src-layout, `--import-mode=importlib`. `conftest.py` generates every
 fixture programmatically with PyMuPDF (text pages, images, multi-page, encrypted,
-a gridline-table "quote" page, an embedded-font page, and no-text-layer OCR
-pages). Engine ops are covered by round-trip tests (open → operate → save →
-reopen → assert). A boundary guard test fails if `pdfcore` imports Qt. Tests that
+permissions-restricted, a gridline-table "quote" page, an embedded-font page, and
+no-text-layer OCR pages); the signing tests generate their self-signed test
+certificate at run time, so no key material is ever committed. Engine ops are
+covered by round-trip tests (open → operate → save → reopen → assert). A boundary
+guard test fails if `pdfcore` imports Qt. Tests that
 need Tesseract skip cleanly when the binary is absent. Sample PDFs under
 `samples/` are sanitised, fabricated documents used by a few gate tests; the
 directory is otherwise gitignored so no real document is ever committed.

@@ -759,3 +759,28 @@ def encrypted_pdf(tmp_path) -> EncryptedPDF:
     )
     doc.close()
     return EncryptedPDF(path=path, user_pw=ENCRYPT_USER_PW, owner_pw=ENCRYPT_OWNER_PW)
+
+
+# A permissions-locked (owner-password-only) PDF: opens WITHOUT a prompt but
+# with restricted permissions — read+print only. MuPDF auto-authenticates
+# these with the empty user password, so needs_pass/is_encrypted both read
+# False; is_protected (metadata) is the honest indicator.
+RESTRICTED_OWNER_PW = "restrict-owner"
+RestrictedPDF = namedtuple("RestrictedPDF", ["path", "owner_pw", "mask"])
+
+
+@pytest.fixture
+def restricted_pdf(tmp_path) -> RestrictedPDF:
+    mask = pymupdf.PDF_PERM_ACCESSIBILITY | pymupdf.PDF_PERM_PRINT | pymupdf.PDF_PERM_PRINT_HQ
+    doc = pymupdf.open()
+    _add_text_page(doc, "Restricted document", body_lines=3)
+    path = tmp_path / "restricted.pdf"
+    doc.save(
+        str(path),
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        owner_pw=RESTRICTED_OWNER_PW,
+        user_pw="",
+        permissions=mask,
+    )
+    doc.close()
+    return RestrictedPDF(path=path, owner_pw=RESTRICTED_OWNER_PW, mask=mask)

@@ -53,6 +53,7 @@ from pdfapp import diagnostics, highlight_colors, icons, portable, theme
 from pdfapp.document_view import DocumentView
 from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
+from pdfapp.protect_dialog import ProtectDialog
 from pdfapp.recent_files import RecentFiles
 from pdfapp.settings import Settings
 from pdfapp.sign_dialog import SignDialog
@@ -182,6 +183,10 @@ class MainWindow(QMainWindow):
         self._build_annotate_toolbar()
         self._assign_icons()
         # Permanent read-only/editing indicator for the ACTIVE tab (U0).
+        # Protection indicator ("Protected" / "Restricted" / pending) sits
+        # beside the mode label; tooltip lists what's denied.
+        self._protection_label = QLabel("", self)
+        self.statusBar().addPermanentWidget(self._protection_label)
         self._mode_label = QLabel("", self)
         self.statusBar().addPermanentWidget(self._mode_label)
         self._sync_chrome()
@@ -228,6 +233,11 @@ class MainWindow(QMainWindow):
         self._save_as_action = QAction("Save &As…", self)
         self._save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         self._save_as_action.triggered.connect(self.save_as)
+
+        # Protection is a DOCUMENT PROPERTY applied at every save (Acrobat's
+        # model) — changing or removing it is owner-gated.
+        self._protect_action = QAction("Pro&tect document…", self)
+        self._protect_action.triggered.connect(self.protect_document)
 
         self._print_action = QAction("&Print…", self)
         self._print_action.setShortcut(QKeySequence.StandardKey.Print)
@@ -481,6 +491,7 @@ class MainWindow(QMainWindow):
             self._highlight_action: "highlight",
             self._insert_comment_action: "insert_comment",
             self._insert_callout_action: "insert_callout",
+            self._protect_action: "protect_document",
             self._place_signature_action: "place_signature",
             self._sign_invisible_action: "sign_invisible",
             self._place_initials_action: "place_initials",
@@ -555,6 +566,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self._save_action)
         file_menu.addAction(self._save_as_action)
+        file_menu.addAction(self._protect_action)
         file_menu.addSeparator()
         file_menu.addAction(self._print_action)
         file_menu.addSeparator()
@@ -1766,6 +1778,21 @@ class MainWindow(QMainWindow):
         """
         if not self.isVisible():
             return
+        if view.document.is_protected:
+            # Decision (2026-07-25): signing flattens to DECRYPTED bytes, and
+            # re-encrypting afterwards would break the signature — the signed
+            # copy is honestly unprotected. Full encrypt-then-sign compose is
+            # a later milestone.
+            answer = QMessageBox.question(
+                self,
+                "Signed copy will not be protected",
+                "This document is password-protected, but the SIGNED COPY "
+                "will NOT be: signing works on the decrypted content, and "
+                "protection cannot be re-applied without breaking the "
+                "signature.\n\nContinue?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         default_value = self._settings.get(DEFAULT_P12_KEY)
         default_p12 = (
             Path(default_value) if isinstance(default_value, str) and default_value else None
@@ -1970,6 +1997,17 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 self._sync_chrome()  # un-toggle the action
                 return
+        # Restricted document (permission flags deny modification AND page
+        # assembly): entering Edit mode needs the permissions password —
+        # honoring the flags is what makes us a compliant reader.
+        if checked and v.document.is_protected:
+            perms = v.document.permissions
+            if not (perms.can_modify or perms.can_assemble):
+                if not self.isVisible() or not self._prompt_owner_password(
+                    v, "This document's permissions restrict editing."
+                ):
+                    self._sync_chrome()  # un-toggle the action
+                    return
         v.set_edit_mode(checked)
 
     def _on_show_areas_toggled(self, checked: bool) -> None:
@@ -2102,6 +2140,97 @@ class MainWindow(QMainWindow):
             view.set_thumbnails_visible(checked)
 
     # --- save -----------------------------------------------------------
+    # --- password protection ---------------------------------------------
+    def _update_protection_label(self, view: DocumentView | None) -> None:
+        """The permanent status-bar indicator beside the mode label."""
+        if view is None:
+            self._protection_label.setText("")
+            self._protection_label.setToolTip("")
+            return
+        state = view.protection_state
+        if state == "none":
+            self._protection_label.setText("")
+            self._protection_label.setToolTip("")
+        elif state == "pending":
+            self._protection_label.setText("Protection pending save")
+            self._protection_label.setToolTip("The protection change is applied when you save.")
+        elif state == "protected":
+            self._protection_label.setText("Protected")
+            self._protection_label.setToolTip(
+                "This document is encrypted. No restrictions at your access level."
+            )
+        else:  # restricted
+            perms = view.document.permissions
+            denied = [
+                label
+                for label, allowed in (
+                    ("editing", perms.can_modify),
+                    ("page changes", perms.can_assemble),
+                    ("commenting", perms.can_annotate),
+                    ("form filling", perms.can_fill_forms),
+                    ("copying", perms.can_copy),
+                    ("printing", perms.can_print),
+                )
+                if not allowed
+            ]
+            self._protection_label.setText("Restricted")
+            self._protection_label.setToolTip(
+                "This document's permissions deny: "
+                + ", ".join(denied)
+                + ". Entering Edit mode asks for the permissions password."
+            )
+
+    def _prompt_owner_password(self, view: DocumentView, why: str) -> bool:
+        """Prompt-until-unlocked (or cancel) for the PERMISSIONS password.
+
+        The open password is politely rejected with an explanation —
+        ``unlock`` only accepts owner-level authentication.
+        """
+        while True:
+            pw, ok = QInputDialog.getText(
+                self,
+                "Permissions password required",
+                f"{why}\nEnter the permissions password:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return False
+            if view.document.unlock(pw):
+                self._sync_chrome()  # restrictions just lifted live
+                return True
+            QMessageBox.warning(
+                self,
+                "Wrong password",
+                "That password did not unlock the document — note the OPEN "
+                "password is not the permissions password.",
+            )
+
+    def protect_document(self):
+        """File → Protect document…: set/change/remove protection (owner-gated).
+
+        Returns the dialog (exec'd only when actually on screen — offscreen
+        tests drive ``set_pending_protection`` and the core methods directly).
+        """
+        view = self.active_view
+        if view is None:
+            return None
+        doc = view.document
+        if doc.is_protected and not doc.is_owner:
+            if not self.isVisible():
+                return None  # offscreen: tests unlock explicitly
+            if not self._prompt_owner_password(
+                view, "Changing this document's protection needs the permissions password."
+            ):
+                return None
+        dialog = ProtectDialog(self, currently_protected=doc.is_protected)
+        if self.isVisible():
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return dialog
+            view.set_pending_protection(dialog.spec())
+            self.statusBar().showMessage("Protection will be applied when you save.", 8000)
+            self._sync_chrome()
+        return dialog
+
     def _signed_save_choice(self, view: DocumentView) -> str:
         """``"save"`` / ``"save_as"`` / ``"cancel"`` for saving a SIGNED doc.
 
@@ -2262,17 +2391,30 @@ class MainWindow(QMainWindow):
 
         for action in self._zoom_actions:
             action.setEnabled(has)
-        # CONTENT-edit actions require edit mode (U0).
+        # Permission flags of the OPEN document (honor-the-standard: we're a
+        # compliant reader now; all-allowed for unprotected docs, lifted live
+        # by an owner unlock).
+        perms = view.document.permissions if has else None
+        can_modify = perms.can_modify if perms is not None else False
+        can_pages = (perms.can_assemble or perms.can_modify) if perms is not None else False
+        # CONTENT-edit actions require edit mode (U0) + the modify permission.
         for action in self._page_edit_actions:
-            action.setEnabled(has and edit_on)
+            action.setEnabled(has and edit_on and can_modify)
+        # Page ops honor the ASSEMBLE bit (Acrobat's page-layout level) — an
+        # assemble-only document gets page ops in edit mode, nothing else.
+        self._rotate_cw_action.setEnabled(has and edit_on and can_pages)
+        self._rotate_ccw_action.setEnabled(has and edit_on and can_pages)
+        self._insert_action.setEnabled(has and edit_on and can_pages)
         # A PDF must keep at least one page.
-        self._delete_action.setEnabled(has and edit_on and count > 1)
-        self._move_up_action.setEnabled(has and edit_on and not at_start)
-        self._move_down_action.setEnabled(has and edit_on and not at_end)
+        self._delete_action.setEnabled(has and edit_on and count > 1 and can_pages)
+        self._move_up_action.setEnabled(has and edit_on and not at_start and can_pages)
+        self._move_down_action.setEnabled(has and edit_on and not at_end and can_pages)
         # Annotation actions are available in BOTH modes (highlight/comment/
-        # callout are markup, not content) — enabled on `has` alone.
+        # callout are markup, not content) — enabled on `has` alone, but they
+        # DO honor the annotation permission.
+        can_annotate = perms.can_annotate if perms is not None else False
         for action in self._annotate_actions:
-            action.setEnabled(has)
+            action.setEnabled(has and can_annotate)
         # Undo/redo follow the stack in EITHER mode: annotations now mutate in
         # Markup mode, so a restore must be reachable there too (undo is
         # document-wide — it may also reverse an earlier content edit).
@@ -2307,19 +2449,26 @@ class MainWindow(QMainWindow):
         self._dblclick_para_action.setChecked(bool(has and view.dblclick_paragraph))
         self._dblclick_para_action.blockSignals(False)
         self._mode_label.setText(("Editing" if edit_on else "Markup") if has else "")
+        self._update_protection_label(view if has else None)
         self._save_action.setEnabled(has)
         self._save_as_action.setEnabled(has)
-        self._print_action.setEnabled(has)
+        self._protect_action.setEnabled(has)
+        self._print_action.setEnabled(has and (perms.can_print if perms is not None else False))
         # Read features (X1/SR2): available whenever a document is open, even
-        # read-only — deliberately NOT in _page_edit_actions.
-        self._extract_text_action.setEnabled(has)
+        # read-only — deliberately NOT in _page_edit_actions. Extract honors
+        # the COPY permission (extraction IS the copy bit; accessibility
+        # extraction is the reader's business, not our extract tool's).
+        self._extract_text_action.setEnabled(
+            has and (perms.can_copy if perms is not None else False)
+        )
         self._find_action.setEnabled(has)
-        self._detect_links_action.setEnabled(has and edit_on)  # a content op
+        self._detect_links_action.setEnabled(has and edit_on and can_modify)  # a content op
         # Signing writes a signed COPY (terminal op, never mutates the open
-        # document) — enabled on `has` alone, like save/print. Initials ride
+        # document) — but the copy is a MODIFIED derivative, so signing
+        # honors the modify permission on restricted files. Initials ride
         # _page_edit_actions (a content stamp); Manage is app-level.
-        self._place_signature_action.setEnabled(has)
-        self._sign_invisible_action.setEnabled(has)
+        self._place_signature_action.setEnabled(has and can_modify)
+        self._sign_invisible_action.setEnabled(has and can_modify)
         self._signature_status_action.setEnabled(has)
 
         self._thumbs_action.setEnabled(has)
