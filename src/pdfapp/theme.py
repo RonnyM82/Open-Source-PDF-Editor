@@ -15,8 +15,9 @@ page stays true white in every mode. What this module does control:
   grip colour folds into this accent at restyle S2);
 - ``canvas_brush()`` — the backdrop behind the rendered page.
 
-The theme choice is not persisted (no settings mechanism exists); every
-launch starts dark.
+This module does not persist the choice itself — MainWindow writes the mode
+to settings.json on every change and app.main reads it back at startup, so
+each launch starts in the last-used mode (dark on first run).
 """
 
 from __future__ import annotations
