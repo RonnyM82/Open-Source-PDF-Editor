@@ -133,9 +133,34 @@ Goal: start a list from scratch; Enter continues it.
   editor opens seeded with the first marker (from the sticky marker-style
   dropdown). Enter starts the next item with the next marker/number as literal
   text; an empty item ends the list.
-- Uses `insert_new_runs` with the marker + hanging-indent layout.
 - Numbering the freshly typed items is a convenience only (still literal text —
   no ongoing management).
+
+> **L3 KICKOFF NOTE (2026-07-26 — L1/L2/L4 shipped, L3 is the last piece).**
+> Start here; it's self-contained. What already exists to build on:
+> - `textedit.set_list_style(doc, n, para, kind, ordinal=)` CREATES a list item
+>   from a paragraph (draw-marker path when there's no kept bullet) with the
+>   hanging indent. `list_item_kind(para)` classifies an existing item. These
+>   are the creation primitives — L3 is mostly a UI gesture on top.
+> - **Engine gap:** `insert_new_runs` (the free-text insert path) has NO hang
+>   support — only `replace_paragraph_runs` does. So the cleanest L3 insertion
+>   is: insert a normal paragraph at the click (`insert_new_text`/runs), then
+>   immediately `set_list_style(..., "bullet"/"number")` on it — reuse, don't
+>   add a parallel hang path to `insert_new_runs`.
+> - **The armed gesture** mirrors Edit → "Insert text…" (`arm_insert_point` +
+>   `theme.armed_chip_qss()` chip; `_on_insert_point`). Seed the marker from the
+>   sticky marker-style dropdown (build it with `MainWindow._make_dropdown_
+>   button`, same as the alignment control — see §6.1).
+> - **Enter-continuation is the real work** and the only hard part: on a plain
+>   Enter (not Ctrl+Enter) commit the current item AND re-arm an insert one
+>   pitch below with the next marker; an empty item ends the list. The paragraph
+>   editor currently treats Enter as a line break and Ctrl+Enter as commit
+>   (`_para_editor`), so continuation needs a list-mode branch in the editor's
+>   key handling — scope this carefully or ship insert-one-item first and add
+>   continuation second.
+> - **Testing:** offscreen, drive the dispatch (`_on_insert_point`-style) like
+>   the other UI tests; assert the inserted item folds (`hang_indent > 0`) and
+>   round-trips. A synthetic doc is enough; no new fixture needed.
 
 ### L4 — Incremental indentation (much reduced under Option B)
 
