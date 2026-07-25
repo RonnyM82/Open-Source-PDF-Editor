@@ -60,61 +60,90 @@ existing geometry — it does not change extraction.
 Each phase is independently shippable and testable. **L1 is the fix for the
 reported grouping complaint**; L2+ are the "create/format" ask.
 
+> **DECISION (2026-07-26): the marker is EDITABLE TEXT, not a managed property
+> (scope Q7 → Option B).** Rationale: a numbered list that flows across a page
+> break would, under the managed-property model, need a cross-page
+> list-identity + continuation + renumber subsystem — which this per-page,
+> no-reflow engine deliberately doesn't have. Treating the marker as ordinary
+> leading text sidesteps all of it. **Consequences baked into the phases
+> below:** a "list" is just *a leading marker + a hanging indent* (a formatting
+> style, not a data structure); numbered creation writes `1. 2. 3.` as literal
+> text once; **no auto-renumber** (scope Q2 → manual); L4 collapses to
+> incremental indent via Tab/Shift+Tab (no drag, no renumber).
+>
+> **Dependency: L1 needs paragraph editing to REFLOW.** The paragraph editor
+> currently bakes a hard break between every wrapped visual line, so a re-layout
+> can't re-wrap (this is the same root cause as the "change the font → grows
+> into occupied space" bug, fixed separately first). List items are just
+> hanging-indent paragraphs, so they inherit that fix.
+
 ### L1 — Recognition & clean editing (the grouping fix)
 
-Goal: a list item edits as ONE unit — marker stays, hanging indent preserved.
+Goal: a list item edits as ONE unit — marker + hanging-indent body — and the
+marker rides along as the first token of the item's text (Option B).
 
 - `pdfcore/lists.py`: `ListMarker(kind, text, bbox, ordinal)`,
   `ListItem(marker, body_spans, marker_indent, text_indent, bbox)`,
-  `detect_lists(doc, n) -> list[ListItem]` (pure).
+  `detect_lists(doc, n) -> list[ListItem]` (pure). Detection is READ-ONLY — it
+  drives grouping, the toolbar toggle state, and "unlist"; it never owns the
+  marker.
+- **Two marker encodings to handle** (from the samples): a *bullet* is a
+  SEPARATE dict span (SymbolMT `•` at `x_m`) sharing the first body line's
+  baseline; a *number* is INLINE — `"1. "` is the leading text of the body span
+  itself. Detection normalises both to "a leading marker + hanging body".
 - Integrate with the **box/paragraph model**: `paragraph_at` / `paragraphs`
-  treat a detected item's marker+body as ONE `Paragraph` whose first line's
-  "text indent" is the hanging indent and whose marker is carried alongside
-  (so a re-layout re-emits the marker at `x_m` and the text at `x_t`). This
-  reuses the existing `_partition_lines` / box-region machinery — a list item
-  becomes a first-class region, the same way a registered box does.
-- Editing the item text (`replace_paragraph_runs`) re-lays the body at the
-  hanging indent and re-draws the marker at the marker indent; deleting the
-  text can optionally drop the marker (open question 6).
-- No creation, no renumber. Markers are preserved verbatim (numbered items keep
-  their literal number — we do not renumber yet).
+  treat a detected item's marker+body as ONE `Paragraph` with a **hanging
+  indent** (first line at `x_m`, wrapped continuation at `x_t`). The marker is
+  part of the paragraph's text, so editing shows and can retype it. Reuses the
+  existing `_partition_lines` / box-region machinery.
+- Editing re-lays the item through `replace_paragraph_runs` with the hanging
+  indent; the marker is just text at the front, so nothing special re-draws it.
+  This is the actual Acrobat-style grouping the report asked for.
 
-Tests: detection on `document_with_hyperlink.pdf` (3 bullet items grouped),
-synthetic numbered-list fixture, round-trip edit keeps marker + hanging indent.
+Tests: detection on `document_with_hyperlink.pdf` + `sample_lists.pdf` (bullets,
+inline numbers, hanging-indent numbers), round-trip edit keeps the marker +
+hanging indent, reflow works after a font change.
 
 ### L2 — Format existing paragraphs as a list / unlist
 
 Goal: select paragraphs → "Bulleted list" / "Numbered list" toggle.
 
-- Engine `make_list(doc, n, paragraphs, kind, start=1)`: prepend a marker to
-  each paragraph (bullet glyph, or `1.` `2.` … for numbered), set the hanging
-  indent (shift body to `x_t`, marker at `x_m`). Uses the runs engine — additive
-  markers + re-laid body; one undoable command.
-- Engine `clear_list(doc, n, items)`: remove markers, restore the flat indent.
+- Engine `make_list(doc, n, paragraphs, kind, start=1)`: prepend a marker as
+  TEXT to each paragraph (`"•\t"`-style, or literal `"1. " "2. " …` in
+  selection order) and set the hanging indent. One undoable command via the runs
+  engine.
+- Engine `clear_list(doc, n, items)`: strip the leading marker text + flatten
+  the indent.
 - UI: two toolbar toggles on the Text style toolbar (icons
   `format-list-bulleted` / `format-list-numbered`), enabled on a multi-select or
-  an open paragraph editor. Numbered lists number in selection order.
-- Manual renumber only (editing an item does not renumber siblings yet).
+  an open paragraph editor; checked when the caret's paragraph is already a list
+  item. Toggling off unlists.
+- **Numbered creation is a one-shot** — the numbers are literal text. Inserting
+  or reordering items later does NOT renumber; the user fixes numbers by editing
+  the text (Option B).
 
-Tests: format 3 paragraphs → 3 items with correct markers/indent; unlist
+Tests: format 3 paragraphs → 3 items with correct marker text + indent; unlist
 restores; round-trip.
 
 ### L3 — Creation & continuation
 
 Goal: start a list from scratch; Enter continues it.
 
-- Insert-list armed mode (like insert-text): click to place, type items, Enter
-  starts the next item with the next marker/number, empty item ends the list.
-- Uses `insert_new_runs` with marker + hanging-indent layout.
-- Auto-number within the newly created list (renumber-on-edit for EXISTING lists
-  stays out — see L4).
+- Insert-list armed mode (like insert-text): click to place, the paragraph
+  editor opens seeded with the first marker (from the sticky marker-style
+  dropdown). Enter starts the next item with the next marker/number as literal
+  text; an empty item ends the list.
+- Uses `insert_new_runs` with the marker + hanging-indent layout.
+- Numbering the freshly typed items is a convenience only (still literal text —
+  no ongoing management).
 
-### L4 — Live list behaviour (explicitly bounded — needs a scope decision)
+### L4 — Incremental indentation (much reduced under Option B)
 
-Auto-renumber on item add/remove/reorder, Tab/Shift+Tab nesting, marker style
-picker (`a.` vs `1.` vs `•` vs `◦`). This is the part that edges toward a reflow
-word processor (renumber ripples down; nesting recomputes indents). Recommend
-deferring and deciding per-capability rather than committing up front.
+Just **Tab / Shift+Tab (and toolbar Increase/Decrease-indent) step the hanging
+indent by one unit** (§6.4). No drag, no auto-renumber, no nesting data model —
+"nesting" is simply a deeper hanging indent, and because markers are literal
+text there is nothing to renumber. This is now a small geometry step, not a
+word-processor subsystem.
 
 ## 4. Engine API sketch (`pdfcore/lists.py`)
 
@@ -161,8 +190,9 @@ All mutating ops go through the existing SnapshotCommand/undo funnel and the
 ## 6. UI & interaction design
 
 Grounded in patterns the app already has — nothing here invents a new widget
-kind. **The load-bearing decision is Q7 below: the marker is a PROPERTY of the
-item, not editable text.** Everything else follows from that.
+kind. **Per the §3 decision, the marker is EDITABLE TEXT (Option B)** — the app
+does not own it. That simplifies the whole interaction: a list item is just a
+paragraph with a leading marker and a hanging indent.
 
 ### 6.1 Toolbar
 
@@ -195,21 +225,23 @@ spans (same refusal the paragraph editor already makes).
 
 ### 6.2 Editing an existing list item
 
-The marker is a property, so **the paragraph editor overlay opens over the item
-BODY only** — the `•`/`1.` is never in the QTextEdit. Concretely:
+The marker is editable text (Option B), so **the paragraph editor opens over the
+whole item, marker included** — the item is one hanging-indent paragraph.
+Concretely:
 
 - Double-click (or Ctrl+double-click) an item → `paragraph_at` returns the
-  list-aware `Paragraph` whose first line's origin is the **text indent** `x_t`;
-  the overlay is positioned there, and the marker renders on the page to its
-  left, untouched. This reuses the existing overlay verbatim — it already opens
-  at a paragraph's own box and grows to fit.
-- **Enter stays a line break** within the item (unchanged paragraph-editor
-  behaviour); Ctrl+Enter commits. Committing re-lays marker + body via
-  `replace_paragraph_runs`, marker pinned at `x_m`, body wrapped at `x_t` — the
-  hanging indent is preserved for free because it is the paragraph's box.
+  list-aware `Paragraph` (hanging indent: first line at `x_m`, wraps at `x_t`).
+  The overlay opens with the marker as the first characters of the text; the
+  user can retype or delete it like any text. Reuses the existing overlay.
+- The bullet case needs one adaptation: on the page the `•` is a separate span
+  at `x_m`; detection stitches it onto the front of the body text so the editor
+  shows `• text…`. Committing re-emits it at the hanging indent.
+- **Enter stays a line break** within the item; Ctrl+Enter commits. Commit
+  re-lays through `replace_paragraph_runs` with the hanging indent.
 - The style toolbar's list toggles reflect "this is a bulleted/numbered item"
-  while the editor is open, and the marker-style dropdown shows its marker.
-- **Emptying the body** → Q6 decides (drop the marker, or keep an empty item).
+  (from read-only re-detection of the leading marker) while the editor is open.
+- **Emptying the item** deletes it like any emptied paragraph — no special
+  marker bookkeeping, because the marker was just text (Q6 resolved by Option B).
 
 ### 6.3 Creating a list
 
@@ -227,50 +259,45 @@ Two paths, both reusing existing machinery:
   pressing Enter-for-next is the L3 continuation behaviour; an empty item ends
   the list. (Continuation detail is the main L3 design work.)
 
-### 6.4 Indentation
+### 6.4 Indentation (Tab / Shift+Tab, no drag)
 
-- **One indent unit = 18 pt** (the marker→text gap in the sample; also a sane
-  default step). Increase/Decrease shift the item's `x_m` and `x_t` together by
-  one unit and re-lay via `replace_paragraph_runs` with an `offset`/indent
-  parameter — a pure geometry change, one undoable command, no text change.
-- **Tab / Shift+Tab at the START of an item** mirror the buttons (word-processor
-  convention). Guarded so they only fire at the item's start caret — elsewhere
-  in the editor Tab keeps its normal meaning; this needs a small key handler on
-  the paragraph editor, gated to list items.
-- For a **flat** list this simply moves the item; **nesting** (recomputing
-  levels, indent-drives-marker-style) is L4 and out of the first cut.
-- Optional (defer): a drag affordance on the hanging indent, like the paragraph
-  editor's wrap-width grip. Not needed for L1–L3.
+- **One indent unit = 18 pt** (the marker→text gap in the samples; a sane step).
+  Increase/Decrease-indent shift the item's `x_m` and `x_t` together by one unit
+  and re-lay via `replace_paragraph_runs` — a pure geometry change, one undoable
+  command, no text change.
+- **Tab / Shift+Tab step the indent** (word-processor convention), via a small
+  key handler on the paragraph editor gated to list items. This is the whole of
+  "nesting" under Option B: a deeper hanging indent, nothing renumbered.
+- **No drag** (decided) — Tab/Shift+Tab and the toolbar buttons are the only
+  indent controls. No ruler, no tab stops.
 
 ### 6.5 What this does NOT add
 
 No ruler, no tab stops, no list-continuation across page breaks, no bullet
 image/picture markers. Those are word-processor scope and stay out.
 
-## 7. Open scope questions (for the user)
+## 7. Scope decisions
 
+**Resolved (2026-07-26):**
+- **Q2 Renumbering → manual only.** No auto-renumber (follows from Option B).
+- **Q6 Deleting an item → no special handling.** The marker is text; emptying
+  the item deletes it like any paragraph.
+- **Q7 Marker model → editable text (Option B).** See the §3 decision.
+- **Q8 Indent → Tab/Shift+Tab + buttons, NO drag.**
+- **Numbered-list sample provided** → `sample_lists.pdf` (bullets, inline
+  numbers, and hanging-indent numbers), so detection is grounded on real data.
+
+**Still open:**
 1. **How far to go?** L1 (grouping fix) only, L1+L2 (format existing), or through
-   L3 (create)? L4 (auto-renumber/nesting) recommended deferred.
-2. **Renumbering**: manual only, or auto-renumber when items are added/removed?
-   Auto-renumber is the biggest complexity jump.
-3. **Nesting** (multi-level lists): in scope or deferred?
-4. **Numbered-marker styles**: just `1.`, or also `1)`, `a.`, `i.`, `(1)`?
-5. **A real sample with a NUMBERED list** would de-risk detection — the current
-   samples are bullets only. Can one be provided?
-6. **Deleting an item's text**: drop the marker too, or leave an empty bullet?
-7. **Marker as property vs. editable text** (§6.2) — the plan assumes the marker
-   is a PROPERTY (never in the editor, re-drawn by the engine). The alternative
-   (marker is literal editable text the user can retype) is simpler to build but
-   lets the user corrupt the sequence and fights auto-numbering. Confirm the
-   property model.
-8. **Indent step & drag** (§6.4) — is an 18 pt button/Tab step enough, or do you
-   want a drag-adjustable hanging indent (ruler-like) too? The latter is more
-   work and edges toward word-processor territory.
+   L3 (create)? L4 is now trivial (Tab/Shift+Tab indent) and folds into L2/L3.
+2. **Numbered-marker styles** to RECOGNISE/OFFER: just `1.`, or also `1)`, `a.`,
+   `i.`, `(1)`? (Detection should read all; creation needs a chosen default.)
 
 ## 8. Test strategy
 
-- Pure detection tests on `document_with_hyperlink.pdf` (bullets) + a synthetic
-  numbered-list fixture built in conftest (embed a marker + hanging text).
+- Pure detection tests on `document_with_hyperlink.pdf` (bullets) and
+  `sample_lists.pdf` (bullets + inline numbers + hanging-indent numbers), both
+  skip-if-absent; plus a synthetic fixture in conftest for CI portability.
 - Round-trip tests for every mutating op (make/clear/insert), per rule 10.
-- A skip-if-absent test on any real numbered-list sample once provided.
+- Reflow test: a font change on a wrapped list item re-wraps within its box.
 - Boundary guard: `pdfcore/lists.py` imports no Qt.
