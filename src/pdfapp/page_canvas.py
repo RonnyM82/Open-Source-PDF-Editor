@@ -89,6 +89,10 @@ class PageCanvas(QGraphicsView):
     # rubber band; fires with the press -> release scene positions. One-shot
     # (mirrors arm_insert_point), unlike the sticky highlighter region.
     linkRectSelected = Signal(float, float, float, float)
+    # Armed signature-rectangle draw (place a digital signature): the same
+    # one-shot press-drag-release rubber band as linkRectSelected, its own
+    # signal so the sign flow never collides with link creation.
+    signRectSelected = Signal(float, float, float, float)
     # The merged Hyperlink tool. On press the view hit-tests and accepts either
     # a TEXT-FLOW drag (begin_link_flow) or a RECTANGLE drag (begin_link_rect),
     # the same synchronous accept protocol as moveDragStarted. While a flow drag
@@ -177,6 +181,8 @@ class PageCanvas(QGraphicsView):
         self._region_sticky = False  # highlight tool STAYS armed after each mark
         self._linkrect_armed = False  # one-shot draw-a-rectangle for a new link
         self._linkrect_press = None  # scene QPointF while a link-rect drag is live
+        self._signrect_armed = False  # one-shot draw-a-rectangle for a signature
+        self._signrect_press = None  # scene QPointF while a sign-rect drag is live
         self._link_hover = False  # read-only pointing-hand cursor over a link
         # The merged Hyperlink tool: STICKY (a click sequence must be able to
         # reach 2 and 3 clicks — a one-shot disarm on the first release is what
@@ -439,6 +445,10 @@ class PageCanvas(QGraphicsView):
         return self._linkrect_armed
 
     @property
+    def sign_rect_armed(self) -> bool:
+        return self._signrect_armed
+
+    @property
     def link_armed(self) -> bool:
         return self._link_armed
 
@@ -449,7 +459,13 @@ class PageCanvas(QGraphicsView):
 
     @property
     def is_armed(self) -> bool:
-        return self._insert_armed or self._region_armed or self._linkrect_armed or self._link_armed
+        return (
+            self._insert_armed
+            or self._region_armed
+            or self._linkrect_armed
+            or self._signrect_armed
+            or self._link_armed
+        )
 
     def arm_link(self, chip_text: str = "") -> None:
         """Arm the merged Hyperlink tool. STAYS armed (so a double/triple click
@@ -459,6 +475,8 @@ class PageCanvas(QGraphicsView):
         self._region_armed = False
         self._region_press = None
         self._linkrect_armed = False
+        self._signrect_armed = False
+        self._signrect_press = None
         self._link_armed = True
         self._link_press = None
         self._link_clicks = 0
@@ -520,6 +538,8 @@ class PageCanvas(QGraphicsView):
         self._region_armed = False  # modes are mutually exclusive
         self._region_press = None
         self._linkrect_armed = False
+        self._signrect_armed = False
+        self._signrect_press = None
         self._link_armed = False
         self._insert_armed = True
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
@@ -535,6 +555,8 @@ class PageCanvas(QGraphicsView):
         self._region_armed = False
         self._region_press = None
         self._link_armed = False
+        self._signrect_armed = False
+        self._signrect_press = None
         self._linkrect_press = None
         self._linkrect_armed = True
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
@@ -543,9 +565,45 @@ class PageCanvas(QGraphicsView):
 
     def disarm_link_rect(self) -> None:
         was = self._linkrect_armed
+        drag_live = self._linkrect_press is not None
         self._linkrect_armed = False
         self._linkrect_press = None
         self.viewport().unsetCursor()
+        # Esc mid-drag: the release branch (the usual band-hider) will skip —
+        # its press field is already None — so hide the band here.
+        if drag_live and self._move_band is not None:
+            self._move_band.hide()
+        if was:
+            self._armed_chip.hide()
+            self.armedChanged.emit()
+
+    def arm_sign_rect(self, chip_text: str = "") -> None:
+        """One-shot mode: press-drag-release draws the signature's rectangle,
+        reported via ``signRectSelected`` (the sign flow's twin of
+        arm_link_rect). Disarms on release."""
+        self.clear_hover()  # armed modes own the cursor
+        self._insert_armed = False  # modes are mutually exclusive
+        self._region_armed = False
+        self._region_press = None
+        self._link_armed = False
+        self._linkrect_armed = False
+        self._linkrect_press = None
+        self._signrect_press = None
+        self._signrect_armed = True
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        self._show_chip(chip_text)
+        self.armedChanged.emit()
+
+    def disarm_sign_rect(self) -> None:
+        was = self._signrect_armed
+        drag_live = self._signrect_press is not None
+        self._signrect_armed = False
+        self._signrect_press = None
+        self.viewport().unsetCursor()
+        # Esc mid-drag: the release branch will skip its band-hide (press is
+        # already None), so hide it here.
+        if drag_live and self._move_band is not None:
+            self._move_band.hide()
         if was:
             self._armed_chip.hide()
             self.armedChanged.emit()
@@ -566,6 +624,8 @@ class PageCanvas(QGraphicsView):
         self.clear_hover()  # armed modes own the cursor
         self._insert_armed = False  # modes are mutually exclusive
         self._linkrect_armed = False
+        self._signrect_armed = False
+        self._signrect_press = None
         self._link_armed = False
         self._region_armed = True
         self._region_sticky = sticky
@@ -577,12 +637,17 @@ class PageCanvas(QGraphicsView):
 
     def disarm_region_select(self) -> None:
         was = self._region_armed
+        drag_live = self._region_press is not None
         self._region_armed = False
         self._region_sticky = False
         self._region_press = None
         self._region_click_count = 0
         self._region_click_scene = None
         self.viewport().unsetCursor()
+        # Esc mid-drag: the release branch will skip its band-hide (press is
+        # already None), so hide it here.
+        if drag_live and self._move_band is not None:
+            self._move_band.hide()
         if was:
             self._armed_chip.hide()
             self.armedChanged.emit()
@@ -777,6 +842,7 @@ class PageCanvas(QGraphicsView):
             or self._insert_armed
             or self._region_armed
             or self._linkrect_armed
+            or self._signrect_armed
             or self._move_press is not None
             or self._link_press is not None
         ):
@@ -963,6 +1029,22 @@ class PageCanvas(QGraphicsView):
                 return
             self.disarm_link_rect()  # clicked off the page — cancel
         if (
+            self._signrect_armed
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._item is not None
+        ):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self._item.boundingRect().contains(scene_pos):
+                self._signrect_press = scene_pos
+                if self._move_band is None:
+                    self._move_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+                anchor = self.mapFromScene(scene_pos)
+                self._move_band.setGeometry(QRect(anchor, anchor))
+                self._move_band.show()
+                event.accept()
+                return
+            self.disarm_sign_rect()  # clicked off the page — cancel
+        if (
             self._insert_armed
             and event.button() == Qt.MouseButton.LeftButton
             and self._item is not None
@@ -1032,6 +1114,14 @@ class PageCanvas(QGraphicsView):
         if self._linkrect_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
             current = self.mapToScene(event.position().toPoint())
             top_left = self.mapFromScene(self._linkrect_press)
+            bottom_right = self.mapFromScene(current)
+            if self._move_band is not None:
+                self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
+            event.accept()
+            return
+        if self._signrect_press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            current = self.mapToScene(event.position().toPoint())
+            top_left = self.mapFromScene(self._signrect_press)
             bottom_right = self.mapFromScene(current)
             if self._move_band is not None:
                 self._move_band.setGeometry(QRect(top_left, bottom_right).normalized())
@@ -1152,6 +1242,17 @@ class PageCanvas(QGraphicsView):
             current = self.mapToScene(event.position().toPoint())
             self._suppress_dblclick = True  # eat a dblclick right after release
             self.linkRectSelected.emit(press.x(), press.y(), current.x(), current.y())
+            event.accept()
+            return
+        if self._signrect_press is not None and event.button() == Qt.MouseButton.LeftButton:
+            press = self._signrect_press
+            self._signrect_press = None
+            self.disarm_sign_rect()  # one-shot: done after this rectangle
+            if self._move_band is not None:
+                self._move_band.hide()
+            current = self.mapToScene(event.position().toPoint())
+            self._suppress_dblclick = True  # eat a dblclick right after release
+            self.signRectSelected.emit(press.x(), press.y(), current.x(), current.y())
             event.accept()
             return
         if (

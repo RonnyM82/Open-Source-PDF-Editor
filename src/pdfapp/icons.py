@@ -101,6 +101,11 @@ _NAMES = {
     # Tools
     "extract_text": "mdi6.text-box-search-outline",
     "detect_links": "mdi6.web",
+    # Sign (digital signatures)
+    "place_signature": "mdi6.signature-freehand",
+    "sign_invisible": "mdi6.file-sign",
+    "place_initials": "mdi6.signature-text",
+    "manage_signatures": "mdi6.card-account-details-outline",
     # Search (SR2)
     "search": "mdi6.magnify",
     "search_prev": "mdi6.chevron-up",

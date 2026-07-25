@@ -20,6 +20,7 @@ directly.
 from __future__ import annotations
 
 import io
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,12 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 from pyhanko.pdf_utils.images import PdfImage
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+from pyhanko.pdf_utils.misc import PdfError
 from pyhanko.sign.fields import SigFieldSpec
+
+# Re-exported so the UI can catch a signer-level failure without importing
+# pyhanko itself (pdfapp talks to pdfcore only).
+from pyhanko.sign.general import SigningError  # noqa: F401
 from pyhanko.sign.signers import PdfSignatureMetadata, PdfSigner, Signer, SimpleSigner
 from pyhanko.stamp import StaticStampStyle
 
@@ -144,6 +150,88 @@ def generate_self_signed_p12(
     return dest
 
 
+def signature_field_names(doc: pymupdf.Document) -> list[str]:
+    """Names of all signature form fields in the document (filled or empty).
+
+    Auto-naming input ONLY (:func:`next_field_name`) — empty placeholder
+    fields (unsigned contract templates) are included, so a fresh field never
+    collides with one. For "is this document actually signed" use
+    :func:`has_signatures`, never this list's truthiness.
+    """
+    names: list[str] = []
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_type == pymupdf.PDF_WIDGET_TYPE_SIGNATURE and widget.field_name:
+                names.append(widget.field_name)
+    return names
+
+
+def has_signatures(doc: pymupdf.Document) -> bool:
+    """True when any signature field actually HOLDS a signature.
+
+    A mere signature FIELD is not a signature: unsigned forms commonly ship
+    empty placeholders (``widget.is_signed`` False, no ``/V``) — treating
+    those as "already signed" refused signing on plain templates
+    (adversarial-review finding).
+    """
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_type == pymupdf.PDF_WIDGET_TYPE_SIGNATURE and widget.is_signed:
+                return True
+    return False
+
+
+def signatures_cover_file(pdf_bytes: bytes) -> bool:
+    """Layout-level plausibility of the file's signatures — NOT cryptographic
+    validation.
+
+    A signature's ``/ByteRange`` must reach the end of the exact bytes it
+    signed; after ANY rewrite (e.g. PyMuPDF save) the offsets point into a
+    layout that no longer exists, so the most-covering signature no longer
+    ends at EOF. That catches the laundering case — a signed file edited and
+    re-saved has a clean undo stack but already-broken signatures, and
+    appending to it would produce output readers flag as invalid
+    (adversarial-review finding). Earlier signatures of a legit multi-sign
+    file cover only their own revision, hence the MAX. Unreadable structure
+    counts as not covering (conservative). True when no signed field exists.
+    """
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except (RuntimeError, ValueError):
+        return False
+    try:
+        ends: list[int] = []
+        for page in doc:
+            for widget in page.widgets():
+                if widget.field_type != pymupdf.PDF_WIDGET_TYPE_SIGNATURE or not widget.is_signed:
+                    continue
+                vtype, vval = doc.xref_get_key(widget.xref, "V")
+                if vtype != "xref":
+                    return False
+                rtype, rval = doc.xref_get_key(int(vval.split()[0]), "ByteRange")
+                if rtype != "array":
+                    return False
+                try:
+                    parts = [int(tok) for tok in rval.strip("[]").split()]
+                except ValueError:
+                    return False
+                if len(parts) < 4:
+                    return False
+                ends.append(parts[-2] + parts[-1])
+        return not ends or max(ends) == len(pdf_bytes)
+    finally:
+        doc.close()
+
+
+def next_field_name(existing: Iterable[str]) -> str:
+    """The first ``SignatureN`` name not already present in ``existing``."""
+    taken = set(existing)
+    n = 1
+    while f"Signature{n}" in taken:
+        n += 1
+    return f"Signature{n}"
+
+
 def sign_pdf_bytes(
     pdf_bytes: bytes,
     signer: Signer,
@@ -223,8 +311,19 @@ def sign_pdf_bytes(
         if image_path is not None:
             style = StaticStampStyle(background=PdfImage(str(image_path)), border_width=0)
 
-    writer = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
-    out = PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(writer)
+    try:
+        writer = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
+        out = PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(
+            writer
+        )
+    except SigningError:
+        raise  # signer-level failure — propagated as-is for the UI to name
+    except PdfError as exc:
+        # pyHanko's strict parser rejects layout quirks MuPDF silently
+        # repairs, so the pymupdf probe above can pass on bytes pyHanko
+        # refuses — surface that as the input error it is (PdfError is NOT a
+        # ValueError; unwrapped it escaped the UI's except clause).
+        raise ValueError(f"pyHanko could not process this PDF: {exc}") from exc
     signed = out.getvalue()
 
     cert = getattr(signer, "signing_cert", None)

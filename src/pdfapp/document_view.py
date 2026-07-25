@@ -129,6 +129,10 @@ class DocumentView(QWidget):
     editorClosed = Signal()
     # Persistent point-of-need hint for the hovered element (U2b); "" clears.
     hoverHintChanged = Signal(str)
+    # A signature rectangle was drawn (page_index, page-space rect tuple) —
+    # the WINDOW runs the sign flow (it owns the signature store, settings,
+    # password prompt and save-as dialog).
+    signatureRectSelected = Signal(int, object)
 
     def __init__(self, doc: PdfDocument, parent=None) -> None:
         super().__init__(parent)
@@ -187,6 +191,7 @@ class DocumentView(QWidget):
         self._canvas.backgroundPressed.connect(self._commit_open_editor)
         self._canvas.regionSelected.connect(self._on_region_selected)
         self._canvas.linkRectSelected.connect(self._on_link_rect_selected)
+        self._canvas.signRectSelected.connect(self._on_sign_rect_selected)
         self._canvas.linkDragStarted.connect(self._on_link_drag_started)
         self._canvas.linkDragMoved.connect(self._on_link_drag_moved)
         self._canvas.linkDragFinished.connect(self._on_link_drag_finished)
@@ -1317,6 +1322,31 @@ class DocumentView(QWidget):
         self._pending_redefine = None
         self._canvas.arm_link_rect("Drag a rectangle over the area to link · Esc cancels")
 
+    def begin_place_signature(self) -> None:
+        """Arm the draw-a-rectangle gesture for a VISIBLE digital signature.
+
+        NOT edit-gated: signing never mutates the open document — it writes a
+        signed COPY (terminal operation), so it is available in both modes,
+        like save/print. The window runs the sign flow on release
+        (``signatureRectSelected``)."""
+        if not self._canvas.has_page:
+            return
+        # A stale redefine target would hijack the NEXT link-rect drag into
+        # silently resizing an old link (begin_insert_link clears it too).
+        self._pending_redefine = None
+        self._canvas.arm_sign_rect("Drag where the signature should appear · Esc cancels")
+
+    def begin_place_initials(self, image_path: Path) -> None:
+        """Arm click-to-place for a profile's INITIALS image (edit mode).
+
+        Initials are decorative content stamps (the existing insert-image op,
+        undoable) applied BEFORE signing so the one cryptographic signature
+        covers them — placed smaller than a regular image insert."""
+        if not self._edit_mode or not self._canvas.has_page:
+            return
+        self._click_action = ("initials", Path(image_path))
+        self._canvas.arm_insert_point("Click where the initials should go · Esc cancels")
+
     def begin_hyperlink(self) -> None:
         """Arm the ONE Hyperlink tool (edit mode, Ctrl+K).
 
@@ -1364,10 +1394,12 @@ class DocumentView(QWidget):
 
     @property
     def armed_action(self) -> str | None:
-        """The armed mode: "text"|"image"|"highlight"|"hyperlink"|"link"|None.
+        """The armed mode: "text"|"image"|"initials"|"highlight"|"hyperlink"|
+        "link"|"sign"|None.
 
         "hyperlink" is the merged tool; "link" is the bare rectangle draw that
-        only "Redefine clickable area" still arms.
+        only "Redefine clickable area" still arms; "sign" is the signature
+        placement rectangle.
         """
         if self._canvas.link_armed:
             return "hyperlink"
@@ -1375,6 +1407,8 @@ class DocumentView(QWidget):
             return "highlight"
         if self._canvas.link_rect_armed:
             return "link"
+        if self._canvas.sign_rect_armed:
+            return "sign"
         if self._canvas.insert_armed and self._click_action is not None:
             return self._click_action[0]
         return None
@@ -1388,6 +1422,7 @@ class DocumentView(QWidget):
         self._canvas.disarm_insert_point()
         self._canvas.disarm_region_select()
         self._canvas.disarm_link_rect()
+        self._canvas.disarm_sign_rect()
         self._canvas.disarm_link()
 
     def _on_region_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
@@ -1510,6 +1545,20 @@ class DocumentView(QWidget):
             self._push_command("Redefine link area", op, ("page", n))
             return
         self._create_link_dialog(n, (x0, y0, x1, y1))
+
+    def _on_sign_rect_selected(self, sx0: float, sy0: float, sx1: float, sy1: float) -> None:
+        """Finish a signature-placement drag: convert + normalize in page
+        space, refuse a too-small area, then hand off to the window's sign
+        flow via ``signatureRectSelected``."""
+        n = self._current_page
+        ax, ay = self._scene_point_to_page(sx0, sy0, n)
+        bx, by = self._scene_point_to_page(sx1, sy1, n)
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        if (x1 - x0) < 12.0 or (y1 - y0) < 12.0:
+            self.editWarning.emit("Drag a rectangle where the signature should appear.")
+            return
+        self.signatureRectSelected.emit(n, (x0, y0, x1, y1))
 
     def _create_link_dialog(self, n: int, rect: tuple[float, float, float, float]) -> None:
         if not self.isVisible():
@@ -1893,6 +1942,10 @@ class DocumentView(QWidget):
         if action == "image":
             self._place_image(n, px, py, payload)
             return
+        if action == "initials":
+            # Initials stamp small — a full-size image insert dwarfs them.
+            self._place_image(n, px, py, payload, max_width=64.0)
+            return
         if action == "callout_target":
             # First click of the two-click callout: remember the target and
             # re-arm for the box position.
@@ -2081,7 +2134,9 @@ class DocumentView(QWidget):
         if result.resized:
             self.editWarning.emit("The text box grew to fit the new text.")
 
-    def _place_image(self, page_index: int, px: float, py: float, path: Path) -> None:
+    def _place_image(
+        self, page_index: int, px: float, py: float, path: Path, *, max_width: float = 200.0
+    ) -> None:
         image = QImage(str(path))
         if image.isNull() or image.width() < 1:
             self.editWarning.emit(f"Could not read image: {path.name}")
@@ -2089,7 +2144,7 @@ class DocumentView(QWidget):
         page_w, page_h = self._doc.page_size(page_index)
         if self._doc.page_rotation(page_index) % 180 == 90:
             page_w, page_h = page_h, page_w  # engine rect is unrotated space
-        width = min(200.0, max(12.0, page_w - px - 2))
+        width = min(max_width, max(12.0, page_w - px - 2))
         height = width * image.height() / image.width()
         if py + height > page_h - 1:
             height = max(12.0, page_h - py - 1)

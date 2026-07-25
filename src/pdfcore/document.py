@@ -313,6 +313,16 @@ class PdfDocument:
         dest.write_bytes(result.pdf_bytes)
         return result
 
+    def signature_field_names(self) -> list[str]:
+        """Names of all signature form fields — filled AND empty placeholders
+        (auto-naming input only; use :meth:`has_signatures` for "is signed")."""
+        return signing.signature_field_names(self._doc)
+
+    def has_signatures(self) -> bool:
+        """True when any signature field actually HOLDS a signature (an empty
+        placeholder field is NOT a signature)."""
+        return signing.has_signatures(self._doc)
+
     def replace_text_runs(
         self,
         n: int,

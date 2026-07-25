@@ -74,17 +74,23 @@ gestures" lists every interaction.
 | Zoom in / out | Ctrl+= / Ctrl+- | Print | Ctrl+P |
 | Undo / Redo | Ctrl+Z / Ctrl+Y | Edit mode | Ctrl+E |
 
-**Digital signing (engine):** real cryptographic signatures via
-[pyHanko](https://github.com/MatthiasValvekens/pyHanko) — sign with your own
-PKCS#12 (.p12/.pfx) certificate, visibly (your signature image becomes the
-stamp over a real signature) or invisibly, or generate a self-signed
-certificate for tamper-evidence. Signing is the **final** step: the signature
-is appended to the finished file, and any further edit invalidates it (that's
-how PDF signatures work — tamper-evidence is the point). Self-signed
-signatures show as "unknown/untrusted" in readers until the recipient trusts
-the certificate — they prove the document hasn't changed, not who you are.
-The signing UI is still in progress; today this is an engine API
-(`pdfcore.signing`, `PdfDocument.save_signed`).
+**Digital signing:** real cryptographic signatures via
+[pyHanko](https://github.com/MatthiasValvekens/pyHanko), from the **Sign**
+menu — drag where the signature should appear (your signature image becomes
+the stamp over a real signature) or sign without a visible stamp; sign with
+your own PKCS#12 (.p12/.pfx) certificate, or generate a self-signed one for
+tamper-evidence. A signature library stores the people you're authorised to
+sign for (signature + initials images, optional per-person certificate —
+passwords are never stored), and "Place initials…" stamps their initials on
+pages before you sign. The signed copy is saved as a **new** file and opened
+in its own tab. Signing is the **final** step: the signature is appended to
+the finished file, and any further edit invalidates it (that's how PDF
+signatures work — tamper-evidence is the point). Signing an already-signed
+document appends — every earlier signature stays valid — and signing *edited*
+signed content is refused rather than silently breaking the signatures.
+Self-signed signatures show as "unknown/untrusted" in readers until the
+recipient trusts the certificate — they prove the document hasn't changed,
+not who you are.
 
 Full text reflow and form filling are out of scope.
 
@@ -145,8 +151,8 @@ See [Set PDF Editor as your default PDF viewer](#set-pdf-editor-as-your-default-
 
 **Is it a replacement for Adobe Acrobat?**
 It covers everyday viewing, editing, page organisation, printing, OCR, and
-cryptographic digital signing (engine API today; UI in progress). It does
-**not** do AcroForm filling or full document reflow.
+cryptographic digital signing (Sign menu). It does **not** do AcroForm
+filling or full document reflow.
 
 ## Setup (Windows, PowerShell)
 

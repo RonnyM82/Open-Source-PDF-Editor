@@ -55,7 +55,10 @@ from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
 from pdfapp.recent_files import RecentFiles
 from pdfapp.settings import Settings
-from pdfcore import pages
+from pdfapp.sign_dialog import SignDialog
+from pdfapp.signature_manager_dialog import DEFAULT_P12_KEY, SignatureManagerDialog
+from pdfapp.signature_store import STORE_FILENAME, SignatureStore
+from pdfcore import pages, signing
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
     ALIGNMENTS,
@@ -153,6 +156,9 @@ class MainWindow(QMainWindow):
         self._highlight_color = QColor(self._startup_highlight_hex())
         # Recent-files list (File → Open Recent), persisted across launches.
         self._recent_files = RecentFiles(portable.data_dir() / "recent_files.json")
+        # Signature library: stored signing identities (Sign menu). Passwords
+        # are NEVER stored — the sign dialog prompts at signing time.
+        self._signatures = SignatureStore(portable.data_dir() / STORE_FILENAME)
         # One stack per document (owned by its DocumentView); the group routes
         # Undo/Redo to the active tab's stack.
         self._undo_group = QUndoGroup(self)
@@ -389,6 +395,24 @@ class MainWindow(QMainWindow):
         self._insert_callout_action.setCheckable(True)
         self._insert_callout_action.triggered.connect(self.insert_callout)
 
+        # Sign menu. Placing/signing writes a signed COPY (terminal operation,
+        # never mutates the open document) — available in BOTH modes like
+        # save/print. Placing INITIALS is a content stamp (insert_image), so
+        # it rides _page_edit_actions.
+        self._place_signature_action = QAction("&Place signature…", self)
+        self._place_signature_action.setCheckable(True)
+        self._place_signature_action.triggered.connect(self.place_signature)
+
+        self._sign_invisible_action = QAction("Sign &without a visible stamp…", self)
+        self._sign_invisible_action.triggered.connect(self.sign_invisible)
+
+        self._place_initials_action = QAction("Place &initials…", self)
+        self._place_initials_action.setCheckable(True)
+        self._place_initials_action.triggered.connect(self.place_initials)
+
+        self._manage_signatures_action = QAction("&Manage signatures…", self)
+        self._manage_signatures_action.triggered.connect(self.manage_signatures)
+
         # CONTENT edits — enabled only in edit mode (U0). Annotation actions
         # deliberately are NOT here: highlight/comment/callout are available in
         # Markup mode too (see _annotate_actions).
@@ -402,6 +426,7 @@ class MainWindow(QMainWindow):
             self._insert_text_action,
             self._insert_image_action,
             self._hyperlink_action,
+            self._place_initials_action,
         )
         # ANNOTATIONS — markup, available whenever a document is open (Markup
         # mode AND edit mode), like the read features. Enabled on `has` alone.
@@ -453,6 +478,10 @@ class MainWindow(QMainWindow):
             self._highlight_action: "highlight",
             self._insert_comment_action: "insert_comment",
             self._insert_callout_action: "insert_callout",
+            self._place_signature_action: "place_signature",
+            self._sign_invisible_action: "sign_invisible",
+            self._place_initials_action: "place_initials",
+            self._manage_signatures_action: "manage_signatures",
         }
         tooltips = {
             self._open_action: "Open a PDF (Ctrl+O)",
@@ -574,6 +603,14 @@ class MainWindow(QMainWindow):
         self._tools_menu = self.menuBar().addMenu("&Tools")
         self._tools_menu.addAction(self._extract_text_action)
         self._tools_menu.addAction(self._detect_links_action)
+
+        self._sign_menu = self.menuBar().addMenu("&Sign")
+        self._sign_menu.addAction(self._place_signature_action)
+        self._sign_menu.addAction(self._sign_invisible_action)
+        self._sign_menu.addSeparator()
+        self._sign_menu.addAction(self._place_initials_action)
+        self._sign_menu.addSeparator()
+        self._sign_menu.addAction(self._manage_signatures_action)
 
         # Lists the open document TABS of THIS window (populated by
         # _rebuild_window_menu). Named "Documents", not "Window": with File →
@@ -1358,6 +1395,9 @@ class MainWindow(QMainWindow):
         view.set_highlight_color(self._highlight_color_rgb())  # current picker colour
         view.stateChanged.connect(lambda v=view: self._on_view_state_changed(v))
         view.editWarning.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
+        view.signatureRectSelected.connect(
+            lambda n, rect, v=view: self._run_sign_flow(v, page_index=n, rect=rect)
+        )
         view.hoverHintChanged.connect(self._show_hover_hint)
         view.styleContextChanged.connect(self._populate_style_from)
         view.selectionFormatChanged.connect(self._on_selection_format_changed)
@@ -1526,6 +1566,220 @@ class MainWindow(QMainWindow):
             else:
                 v.begin_hyperlink()
             self._sync_chrome()
+
+    # --- digital signing (Sign menu) -------------------------------------
+    def place_signature(self) -> None:
+        """Arm the draw-a-rectangle gesture for a VISIBLE signature."""
+        if (v := self.active_view) is not None:
+            if v.armed_action == "sign":
+                v.cancel_armed_mode()  # clicking the checked action cancels
+            else:
+                v.begin_place_signature()
+            self._sync_chrome()
+
+    def sign_invisible(self) -> None:
+        """Sign without a visible stamp — straight to the sign dialog."""
+        if (v := self.active_view) is not None:
+            self._run_sign_flow(v, page_index=None, rect=None)
+
+    def place_initials(self) -> None:
+        """Arm click-to-place for a stored profile's initials image.
+
+        Initials are decorative content stamps (undoable) applied BEFORE
+        signing so the one cryptographic signature covers them.
+        """
+        view = self.active_view
+        if view is None:
+            return
+        if view.armed_action == "initials":
+            view.cancel_armed_mode()
+            self._sync_chrome()
+            return
+        candidates = [p for p in self._signatures.profiles() if p.initials_image is not None]
+        if not candidates:
+            self.statusBar().showMessage(
+                "No stored signature has an initials image — add one via Sign → Manage signatures…",
+                8000,
+            )
+            # A checkable action toggles BEFORE triggered fires — un-toggle
+            # (skipping this left a stale checkmark; adversarial-review find).
+            self._sync_chrome()
+            return
+        profile = candidates[0]
+        if len(candidates) > 1 and self.isVisible():
+            names = [p.name for p in candidates]
+            last = self._settings.get("last_sign_profile")
+            start = names.index(last) if last in names else 0
+            name, ok = QInputDialog.getItem(
+                self, "Whose initials?", "Place initials for:", names, start, False
+            )
+            if not ok:
+                self._sync_chrome()  # a cancelled picker must not leave a check
+                return
+            profile = candidates[names.index(name)]
+        view.begin_place_initials(profile.initials_image)
+        self._sync_chrome()
+
+    def manage_signatures(self):
+        """Open the signature-library manager; returns the dialog (exec'd only
+        when actually on screen — offscreen tests drive its core methods)."""
+        dialog = SignatureManagerDialog(self, self._signatures, self._settings)
+        if self.isVisible():
+            dialog.exec()
+        return dialog
+
+    def _run_sign_flow(self, view: DocumentView, *, page_index: int | None, rect) -> None:
+        """Interactive signing: sign dialog → save-as picker → _execute_signing.
+
+        ``rect`` None = invisible signature. Offscreen tests drive
+        ``_execute_signing`` directly — the modal dialogs would block them.
+        """
+        if not self.isVisible():
+            return
+        default_value = self._settings.get(DEFAULT_P12_KEY)
+        default_p12 = (
+            Path(default_value) if isinstance(default_value, str) and default_value else None
+        )
+        dlg = SignDialog(
+            self,
+            self._signatures.profiles(),
+            default_p12=default_p12,
+            visible_signature=rect is not None,
+            last_profile=self._settings.get("last_sign_profile"),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.signer is None:
+            return
+        spec = dlg.spec()
+        if spec["save_default"] and spec["cert_path"] is not None:
+            self._settings.set(DEFAULT_P12_KEY, str(spec["cert_path"]))
+        if spec["profile_name"]:
+            self._settings.set("last_sign_profile", spec["profile_name"])
+        source = view.path
+        suggested = (
+            str(source.with_name(source.stem + "-signed.pdf"))
+            if source is not None
+            else "signed.pdf"
+        )
+        out_str, _ = QFileDialog.getSaveFileName(
+            self, "Save signed copy as", suggested, "PDF files (*.pdf)"
+        )
+        if not out_str:
+            return
+        self._execute_signing(
+            view,
+            Path(out_str),
+            dlg.signer,
+            page_index=page_index if page_index is not None else 0,
+            rect=rect,
+            image_path=spec["image_path"],
+            reason=spec["reason"],
+            location=spec["location"],
+        )
+
+    def _execute_signing(
+        self,
+        view: DocumentView,
+        out_path: Path,
+        signer,
+        *,
+        page_index: int = 0,
+        rect: tuple[float, float, float, float] | None = None,
+        image_path: Path | None = None,
+        reason: str | None = None,
+        location: str | None = None,
+    ):
+        """Sign the view's CURRENT state into ``out_path``; open the signed copy.
+
+        Returns the engine ``SignResult`` or None on failure. TERMINAL: the
+        open document stays unsigned — the signed artifact is the new file,
+        opened in its own tab. An ALREADY-SIGNED clean document is signed by
+        appending to its own file bytes (save_signed's flatten is a PyMuPDF
+        rewrite, which would destroy the existing signatures); a signed
+        document with UNSAVED EDITS is refused honestly — the edits
+        themselves would break the signatures.
+        """
+        # "Already signed" means a field actually HOLDS a signature — an empty
+        # placeholder field (unsigned contract template) is NOT a signature
+        # and signs via the normal flatten path (adversarial-review finding);
+        # field NAMES (empty ones included) only feed the auto-naming.
+        already_signed = view.document.has_signatures()
+        field_name = signing.next_field_name(view.document.signature_field_names())
+        try:
+            target_tab = self._find_tab(out_path)
+            if target_tab is view:
+                raise ValueError("choose a new file name for the signed copy")
+            if target_tab is not None:
+                # Overwriting a file another tab holds open would leave that
+                # STALE tab focused as if it were the fresh copy.
+                raise ValueError(
+                    f"“{out_path.name}” is already open in another tab — close "
+                    "it first, or pick a different name"
+                )
+            if already_signed and view.path is not None and not view.dirty:
+                data = view.path.read_bytes()
+                if not signing.signatures_cover_file(data):
+                    # A signed file that was edited and RE-SAVED has a clean
+                    # stack but already-broken signatures (the rewrite killed
+                    # them) — appending would produce output readers flag as
+                    # invalid while we claim the opposite.
+                    raise ValueError(
+                        "this file's existing signatures are already broken — "
+                        "it was re-saved after signing, and any rewrite "
+                        "invalidates them. Sign a fresh copy of the original "
+                        "document instead"
+                    )
+                # Add a signature WITHOUT re-serialising: incremental updates
+                # compose, so every prior signature stays valid.
+                result = signing.sign_pdf_bytes(
+                    data,
+                    signer,
+                    field_name=field_name,
+                    reason=reason,
+                    location=location,
+                    page_index=page_index,
+                    rect=rect,
+                    image_path=image_path,
+                )
+                out_path.write_bytes(result.pdf_bytes)
+            elif already_signed:
+                raise ValueError(
+                    "this document already holds digital signatures, and signing "
+                    "edited content would invalidate them — save your edits as a "
+                    "new file and sign that, or sign the unedited original"
+                )
+            else:
+                result = view.document.save_signed(
+                    out_path,
+                    signer,
+                    field_name=field_name,
+                    reason=reason,
+                    location=location,
+                    page_index=page_index,
+                    rect=rect,
+                    image_path=image_path,
+                )
+        except (ValueError, OSError, signing.SigningError) as exc:
+            diagnostics.log_event(f"signing failed: {exc}")
+            if self.isVisible():
+                QMessageBox.critical(self, "Signing failed", f"Could not sign:\n\n{exc}")
+            self.statusBar().showMessage(f"Signing failed: {exc}", 8000)
+            return None
+        diagnostics.log_event(f"signed {out_path.name} as {result.signer_name}")
+        self.open_path(out_path)
+        self.statusBar().showMessage(
+            f"Signed: {out_path.name} (opened in a new tab; the original stays unsigned).", 8000
+        )
+        if result.self_signed and self.isVisible():
+            QMessageBox.information(
+                self,
+                "Signed with a self-signed certificate",
+                f"{out_path.name} is signed and tamper-evident.\n\n"
+                "The certificate is SELF-SIGNED: PDF readers will show the "
+                "signature as unknown/untrusted until the recipient chooses to "
+                "trust the certificate. It proves the document hasn't changed "
+                "— not who signed it.",
+            )
+        return result
 
     def insert_comment(self) -> None:
         if (v := self.active_view) is not None:
@@ -1697,14 +1951,34 @@ class MainWindow(QMainWindow):
             view.set_thumbnails_visible(checked)
 
     # --- save -----------------------------------------------------------
+    def _confirm_breaking_signatures(self, view: DocumentView) -> bool:
+        """True to proceed with a save that would REWRITE a SIGNED document.
+
+        Any save re-serialises the file, which invalidates its digital
+        signatures — silently doing so is how a user launders a signed file
+        into one readers flag as broken (adversarial-review finding). Warn
+        when actually on screen; offscreen (tests) proceeds.
+        """
+        if not view.document.has_signatures() or not self.isVisible():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Document is digitally signed",
+            "Saving re-writes the file, which INVALIDATES its digital "
+            "signatures — readers will flag them as broken.\n\nSave anyway?",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def save(self) -> None:
         view = self.active_view
-        if view is not None and view.save():
+        if view is None or not self._confirm_breaking_signatures(view):
+            return
+        if view.save():
             self.statusBar().showMessage(f"Saved {view.path}")
 
     def save_as(self) -> None:
         view = self.active_view
-        if view is None:
+        if view is None or not self._confirm_breaking_signatures(view):
             return
         out_str, _ = QFileDialog.getSaveFileName(self, "Save PDF as", "", "PDF files (*.pdf)")
         if out_str and view.save_as_path(Path(out_str)):
@@ -1817,6 +2091,8 @@ class MainWindow(QMainWindow):
         armed = view.armed_action if view is not None else None
         self._insert_text_action.setChecked(armed == "text")
         self._insert_image_action.setChecked(armed == "image")
+        self._place_signature_action.setChecked(armed == "sign")
+        self._place_initials_action.setChecked(armed == "initials")
         self._hyperlink_action.setChecked(armed in ("hyperlink", "link"))
         # Works on PAGE text, so it can't act on a selection inside an open
         # in-place editor — disabled rather than inert (user report).
@@ -1844,6 +2120,11 @@ class MainWindow(QMainWindow):
         self._extract_text_action.setEnabled(has)
         self._find_action.setEnabled(has)
         self._detect_links_action.setEnabled(has and edit_on)  # a content op
+        # Signing writes a signed COPY (terminal op, never mutates the open
+        # document) — enabled on `has` alone, like save/print. Initials ride
+        # _page_edit_actions (a content stamp); Manage is app-level.
+        self._place_signature_action.setEnabled(has)
+        self._sign_invisible_action.setEnabled(has)
 
         self._thumbs_action.setEnabled(has)
         self._thumbs_action.blockSignals(True)

@@ -20,7 +20,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
+from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
+from pyhanko.sign.fields import SigFieldSpec, append_signature_field
 from pyhanko.sign.general import SigningError
 from pyhanko.sign.validation import validate_pdf_signature
 from pyhanko_certvalidator import ValidationContext
@@ -265,6 +267,73 @@ def test_second_signature_preserves_first(text_pdf, signer):
     # Signing only ever APPENDS, so the first signature stays intact under the
     # second one's incremental update.
     assert all(st.intact and st.valid for st in statuses)
+
+
+def test_signature_field_names_and_next_name(text_pdf, signer, tmp_path):
+    """The UI's auto-naming: enumerate signature fields, pick the next free."""
+    assert signing.next_field_name([]) == "Signature1"
+    assert signing.next_field_name(["Signature1", "Signature2"]) == "Signature3"
+    assert signing.next_field_name(["Signature2"]) == "Signature1"
+
+    first = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer)
+    signed_path = tmp_path / "signed.pdf"
+    signed_path.write_bytes(first.pdf_bytes)
+    with PdfDocument.open(signed_path) as doc:
+        names = doc.signature_field_names()
+        assert names == ["Signature1"]
+        assert signing.next_field_name(names) == "Signature2"
+    with PdfDocument.open(text_pdf) as doc:
+        assert doc.signature_field_names() == []
+
+
+def _with_placeholder_field(pdf_bytes: bytes, name: str = "Placeholder") -> bytes:
+    """The input bytes plus one EMPTY signature form field (a template)."""
+    writer = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
+    append_signature_field(writer, SigFieldSpec(name, box=(100, 100, 300, 160)))
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def test_empty_signature_field_is_not_a_signature(text_pdf, signer, tmp_path):
+    """A placeholder FIELD (unsigned contract template) is not a signature —
+    conflating them refused signing on plain templates (review finding)."""
+    templated = tmp_path / "template.pdf"
+    templated.write_bytes(_with_placeholder_field(text_pdf.read_bytes()))
+    with PdfDocument.open(templated) as doc:
+        assert doc.signature_field_names() == ["Placeholder"]  # naming input
+        assert doc.has_signatures() is False  # but NOT signed
+
+    signed = signing.sign_pdf_bytes(templated.read_bytes(), signer)
+    signed_path = tmp_path / "template-signed.pdf"
+    signed_path.write_bytes(signed.pdf_bytes)
+    with PdfDocument.open(signed_path) as doc:
+        assert doc.has_signatures() is True
+        assert sorted(doc.signature_field_names()) == ["Placeholder", "Signature1"]
+
+
+def test_signatures_cover_file_detects_rewrite(text_pdf, signer):
+    """The layout check that catches a signed-then-resaved (laundered) file."""
+    src = text_pdf.read_bytes()
+    assert signing.signatures_cover_file(src) is True  # nothing signed yet
+    first = signing.sign_pdf_bytes(src, signer)
+    assert signing.signatures_cover_file(first.pdf_bytes) is True
+    second = signing.sign_pdf_bytes(first.pdf_bytes, signer, field_name="Signature2")
+    assert signing.signatures_cover_file(second.pdf_bytes) is True  # multi-sig legit
+
+    with pymupdf.open(stream=first.pdf_bytes, filetype="pdf") as doc:
+        laundered = doc.tobytes(garbage=4, deflate=True)
+    assert signing.signatures_cover_file(laundered) is False
+
+
+def test_pyhanko_unparseable_input_raises_valueerror(text_pdf, signer):
+    """Bytes MuPDF repairs silently but pyHanko's strict parser refuses must
+    surface as the contractual ValueError, not a raw pyHanko PdfError."""
+    mangled = text_pdf.read_bytes().replace(b"startxref", b"startxrEf")
+    with pymupdf.open(stream=mangled, filetype="pdf") as probe:
+        assert probe.page_count > 0  # precondition: the engine's probe passes
+    with pytest.raises(ValueError, match="could not process"):
+        signing.sign_pdf_bytes(mangled, signer)
 
 
 def test_resign_same_field_name_raises_signing_error(text_pdf, signer):
