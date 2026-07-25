@@ -1415,6 +1415,7 @@ class MainWindow(QMainWindow):
         view.signatureRectSelected.connect(
             lambda n, rect, v=view: self._run_sign_flow(v, page_index=n, rect=rect)
         )
+        view.signatureDetailsRequested.connect(self.show_signature_status)
         view.hoverHintChanged.connect(self._show_hover_hint)
         view.styleContextChanged.connect(self._populate_style_from)
         view.selectionFormatChanged.connect(self._on_selection_format_changed)
@@ -1647,13 +1648,16 @@ class MainWindow(QMainWindow):
             dialog.exec()
         return dialog
 
-    def _announce_signatures(self, view: DocumentView) -> None:
-        """On open: surface a signed document's status — Acrobat's banner.
+    def _announce_signatures(self, view: DocumentView, *, dialog: bool = True) -> None:
+        """Surface a signed document's status: the BANNER + status message.
 
         A tampered signed file must be FLAGGED the moment it opens (user
-        report: Acrobat flags it, we showed nothing). Verification runs on
+        report: Acrobat flags it, we showed nothing) — and STAY flagged (the
+        banner; a status-bar message fades in seconds). Verification runs on
         the FILE bytes as read from disk — never a flatten, which would
-        break the very signatures being measured.
+        break the very signatures being measured. ``dialog=False`` skips the
+        one-time warning modal (the after-save refresh — the user just
+        answered the save warning; only the banner should update).
         """
         path = view.path
         if path is None or not view.document.has_signatures():
@@ -1666,19 +1670,20 @@ class MainWindow(QMainWindow):
         broken = [c for c in checks if not (c.intact and c.valid)]
         if checks and not broken:
             names = ", ".join(sorted({c.signer_name or "an unknown signer" for c in checks}))
-            self.statusBar().showMessage(
-                f"Digitally signed by {names} — signature intact (identity not verified).",
-                8000,
-            )
+            message = f"Digitally signed by {names} — signature intact (identity not verified)."
+            # The BANNER is the real flag (a status-bar blip fades in seconds
+            # — user report); intact is dismissable, a problem is permanent.
+            view.set_signature_banner("intact", message)
+            self.statusBar().showMessage(message, 8000)
             return
         # Widgets say signed but nothing verifiable (checks == []), or a
         # broken check. Only claim MODIFICATION when it was positively
         # determined — an unverifiable signature gets honest wording, never
         # a tamper accusation the engine did not make.
         if checks and any(c.tampered for c in broken):
-            status_msg = (
+            banner_msg = (
                 "⚠ SIGNATURE PROBLEM: this document was modified after it was "
-                "signed (Sign → Signature status… for details)."
+                "signed — the content may not be what the signer approved."
             )
             dialog_msg = (
                 "This document's digital signature is BROKEN — the file was "
@@ -1687,9 +1692,9 @@ class MainWindow(QMainWindow):
                 "Sign → Signature status… has the details."
             )
         else:
-            status_msg = (
+            banner_msg = (
                 "⚠ SIGNATURE PROBLEM: this document displays a signature that "
-                "cannot be verified (Sign → Signature status… for details)."
+                "cannot be verified. Treat it as unsigned."
             )
             dialog_msg = (
                 "This document displays a digital signature that CANNOT be "
@@ -1697,8 +1702,9 @@ class MainWindow(QMainWindow):
                 "Treat it as unsigned — the content is not vouched for. "
                 "Sign → Signature status… has the details."
             )
-        self.statusBar().showMessage(status_msg, 8000)
-        if self.isVisible():
+        view.set_signature_banner("problem", banner_msg)
+        self.statusBar().showMessage(banner_msg, 8000)
+        if dialog and self.isVisible():
             QMessageBox.warning(self, "Signature problem", dialog_msg)
 
     def signature_status_text(self, view: DocumentView) -> str:
@@ -2113,6 +2119,10 @@ class MainWindow(QMainWindow):
             return
         if view.save():
             self.statusBar().showMessage(f"Saved {view.path}")
+            # A save REWRITES the file — a signed document's banner must flip
+            # from intact to broken, not keep vouching for dead signatures
+            # (banner only: the user just answered the save warning).
+            self._announce_signatures(view, dialog=False)
 
     def save_as(self) -> None:
         view = self.active_view
@@ -2121,6 +2131,7 @@ class MainWindow(QMainWindow):
         out_str, _ = QFileDialog.getSaveFileName(self, "Save PDF as", "", "PDF files (*.pdf)")
         if out_str and view.save_as_path(Path(out_str)):
             self.statusBar().showMessage(f"Saved {out_str}")
+            self._announce_signatures(view, dialog=False)
 
     def print_current(self) -> None:
         view = self.active_view

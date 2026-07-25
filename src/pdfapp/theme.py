@@ -295,6 +295,32 @@ def armed_chip_qss() -> str:
     )
 
 
+def signature_banner_qss(problem: bool) -> str:
+    """Widget-local style for the per-document signature banner.
+
+    ``problem`` = the red non-dismissable variant (broken/unverifiable
+    signature); False = the informational intact variant. Built with the
+    CURRENT mode; DocumentView.refresh_theme re-applies on a theme switch.
+    """
+    dark = _mode == DARK
+    if problem:
+        bg = "#5c1f1f" if dark else "#f8d7da"
+        fg = "#ffd7d7" if dark else "#721c24"
+        border = "#a94442"
+    else:
+        bg = "#1f3d24" if dark else "#d4edda"
+        fg = "#c9e8cf" if dark else "#155724"
+        border = "#3e8e50"
+    return (
+        f"QFrame#signature_banner {{ background-color: {bg};"
+        f" border: none; border-bottom: 1px solid {border}; }}"
+        f" QFrame#signature_banner QLabel {{ color: {fg}; background: transparent; }}"
+        f" QFrame#signature_banner QPushButton {{ color: {fg}; background: transparent;"
+        f" border: 1px solid {border}; border-radius: 4px; padding: 2px 10px; }}"
+        f" QFrame#signature_banner QPushButton:hover {{ background-color: {border}; }}"
+    )
+
+
 def on_change(callback: Callable[[str], None]) -> None:
     """Register ``callback(mode)`` to run after every apply_theme()."""
     _callbacks.append(callback)

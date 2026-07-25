@@ -492,6 +492,99 @@ def test_edit_mode_warning_on_signed_document(qapp, text_pdf, signer, tmp_path, 
         window.close()
 
 
+def test_banner_problem_is_permanent(qapp, text_pdf, signer, tmp_path):
+    """A broken signature shows the RED banner with no dismiss control."""
+    signed = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes
+    tampered = bytearray(signed)
+    tampered[signed.find(b"stream") + 16] ^= 0xFF
+    bad = tmp_path / "banner-bad.pdf"
+    bad.write_bytes(bytes(tampered))
+
+    window = MainWindow()
+    try:
+        window.open_path(bad)
+        banner = window.active_view._sig_banner
+        assert not banner.isHidden()
+        assert banner.problem is True
+        assert banner._dismiss.isHidden()  # non-dismissable
+        assert "modified" in banner.message().lower()
+    finally:
+        window.close()
+
+
+def test_banner_intact_is_dismissable_once(qapp, text_pdf, signer, tmp_path):
+    """The intact banner carries Dismiss; a re-announce must not re-nag."""
+    good = tmp_path / "banner-good.pdf"
+    good.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+
+    window = MainWindow()
+    try:
+        window.open_path(good)
+        view = window.active_view
+        banner = view._sig_banner
+        assert not banner.isHidden()
+        assert banner.problem is False
+        assert not banner._dismiss.isHidden()
+        assert "signature intact" in banner.message().lower()
+
+        banner._dismiss.click()
+        assert banner.isHidden()
+        window._announce_signatures(view)  # refocus/re-open path
+        assert banner.isHidden(), "a dismissed intact banner must stay dismissed"
+    finally:
+        window.close()
+
+
+def test_banner_absent_on_unsigned_documents(qapp, text_pdf):
+    window = MainWindow()
+    try:
+        window.open_path(text_pdf)
+        assert window.active_view._sig_banner.isHidden()
+    finally:
+        window.close()
+
+
+def test_banner_flips_to_problem_after_saving_edited_signed(
+    qapp, text_pdf, signer, sample_png, tmp_path
+):
+    """Saving an edited signed doc rewrites the file — the banner must stop
+    vouching for the now-dead signature (and a dismissed intact banner must
+    not suppress the problem variant)."""
+    out = tmp_path / "flip.pdf"
+    out.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+
+    window = MainWindow()
+    try:
+        window.open_path(out)
+        view = window.active_view
+        view._sig_banner._dismiss.click()  # user closed the intact banner
+        view.set_edit_mode(True)
+        view._place_image(0, 100.0, 100.0, sample_png)
+        window.save()  # offscreen: warnings auto-proceed
+
+        banner = view._sig_banner
+        assert not banner.isHidden()
+        assert banner.problem is True
+        assert banner._dismiss.isHidden()
+    finally:
+        window.close()
+
+
+def test_banner_details_opens_signature_status(qapp, text_pdf, signer, tmp_path):
+    good = tmp_path / "details.pdf"
+    good.write_bytes(signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes)
+
+    window = MainWindow()
+    try:
+        window.open_path(good)
+        window.active_view._sig_banner._details.click()
+        # Offscreen show_signature_status routes the first line to the status
+        # bar — enough to prove the wiring reaches the composer.
+        assert "signed by" in window.statusBar().currentMessage().lower()
+    finally:
+        window.close()
+
+
 def test_signature_status_text(qapp, text_pdf, signer, signer_p12, tmp_path):
     signed = tmp_path / "status.pdf"
     signed_bytes = signing.sign_pdf_bytes(text_pdf.read_bytes(), signer).pdf_bytes

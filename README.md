@@ -90,10 +90,11 @@ document appends — every earlier signature stays valid — and signing *edited
 signed content is refused rather than silently breaking the signatures.
 Self-signed signatures show as "unknown/untrusted" in readers until the
 recipient trusts the certificate — they prove the document hasn't changed,
-not who you are. Opening a signed document shows its status (Sign →
-Signature status… for details) — and a **tampered** signed file is flagged
-the moment it opens, just like Acrobat. Entering Edit mode on a signed
-document warns you first, since any saved change breaks its signatures.
+not who you are. Opening a signed document shows its status in a banner across the top of
+the view (Sign → Signature status… for details) — intact is dismissable, but
+a **tampered** signed file gets a permanent red banner that stays for the
+life of the tab, just like Acrobat. Entering Edit mode on a signed document
+warns you first, since any saved change breaks its signatures.
 
 Full text reflow and form filling are out of scope.
 

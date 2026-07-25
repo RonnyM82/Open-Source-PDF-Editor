@@ -44,6 +44,7 @@ from pdfapp.page_geometry import (
 from pdfapp.qt_image import rendered_page_to_qpixmap
 from pdfapp.render_cache import RenderCache
 from pdfapp.search_bar import SearchBar
+from pdfapp.signature_banner import SignatureBanner
 from pdfapp.text_editor_overlay import PT_PROPERTY, ParagraphEditorOverlay, TextEditorOverlay
 from pdfapp.thumbnail_panel import ThumbnailPanel
 from pdfapp.undo import SnapshotCommand, undo_limit_for
@@ -133,6 +134,9 @@ class DocumentView(QWidget):
     # the WINDOW runs the sign flow (it owns the signature store, settings,
     # password prompt and save-as dialog).
     signatureRectSelected = Signal(int, object)
+    # The signature banner's Details… button — the window opens Signature
+    # status… (it owns the dialog and the verification composer).
+    signatureDetailsRequested = Signal()
 
     def __init__(self, doc: PdfDocument, parent=None) -> None:
         super().__init__(parent)
@@ -333,6 +337,13 @@ class DocumentView(QWidget):
         self._search_timer.setInterval(250)
         self._search_timer.timeout.connect(self.run_search)
 
+        # The persistent signature verdict strip (top of the view): a broken
+        # signature must stay ON SCREEN, not fade from the status bar.
+        self._sig_banner = SignatureBanner(self)
+        self._sig_banner.detailsRequested.connect(self.signatureDetailsRequested)
+        self._sig_banner.dismissed.connect(self._on_sig_banner_dismissed)
+        self._sig_banner_dismissed = False
+
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self._thumbnails)
         splitter.addWidget(self._canvas)
@@ -347,11 +358,29 @@ class DocumentView(QWidget):
         # the same as the bar, so without this the layout split the height
         # 50/50 whenever the search bar was visible (giant bar, half-size
         # page — latent since SR2, reported 2026-07-18).
+        layout.addWidget(self._sig_banner, 0)
         layout.addWidget(self._search_bar, 0)
         layout.addWidget(splitter, 1)
 
         self._populate_thumbnails()
         self._show_page(0)
+
+    def set_signature_banner(self, severity: str, message: str = "") -> None:
+        """The persistent signature flag for this document.
+
+        ``"problem"`` = permanent and non-dismissable (broken/unverifiable
+        signature); ``"intact"`` = dismissable once per document (a refocus
+        re-announce must not nag someone who closed it); ``"none"`` hides.
+        """
+        if severity == "none":
+            self._sig_banner.hide()
+            return
+        if severity == "intact" and self._sig_banner_dismissed:
+            return
+        self._sig_banner.present(severity, message)
+
+    def _on_sig_banner_dismissed(self) -> None:
+        self._sig_banner_dismissed = True
 
     # --- read-only state ------------------------------------------------
     @property
@@ -795,6 +824,7 @@ class DocumentView(QWidget):
         self._canvas.setBackgroundBrush(theme.canvas_brush())
         self._canvas.refresh_chip_theme()
         self._search_bar.refresh_theme()
+        self._sig_banner.refresh_theme()
 
     # --- zoom (delegate to the canvas) ----------------------------------
     def zoom_in(self) -> None:
