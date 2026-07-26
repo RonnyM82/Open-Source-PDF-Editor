@@ -204,6 +204,21 @@ python -m pdfapp
 
 ## Package (standalone Windows build)
 
+The one-command path — runs the CI gates (ruff + pytest), packages the bundle,
+then smoke-tests the packaged `.exe` (render, print pipeline, bundled OCR):
+
+```powershell
+.\scripts\build.ps1              # gates + package + smoke -> dist\pdf-editor\ (+ .zip)
+.\scripts\build.ps1 -Installer   # ...and compile dist\pdf-editor-setup-<version>.exe
+```
+
+Useful switches: `-SkipTests` (package/smoke only, for a quick rebuild),
+`-SkipSmoke`, `-InnoSetupPath <path to ISCC.exe>`. The build refuses to start
+while `pdf-editor.exe` is running — PyInstaller cannot overwrite its locked
+DLLs, and the smoke would then pass from the *stale* exe.
+
+Or run the individual steps directly:
+
 ```powershell
 .\scripts\package.ps1   # PyInstaller one-folder build -> dist\pdf-editor\ (+ .zip)
 ```
