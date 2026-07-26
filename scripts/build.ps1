@@ -29,8 +29,22 @@ function Fail($msg) { Write-Host "BUILD FAILED: $msg" -ForegroundColor Red; exit
 # The bundle is built console=False (GUI subsystem), so `& $exe` does NOT wait
 # and leaves $LASTEXITCODE meaningless. Start-Process -Wait is the only way to
 # get a real exit code out of a smoke run. Env vars are inherited from here.
+#
+# stdout is redirected to a file rather than left to the console: a windowed exe
+# has no console of its own, so its "OK" / "OCR OK: N words" verdict does not
+# reliably reach the host terminal. Echoing the captured text is what makes a
+# passing smoke VISIBLE - a silent pass and a skipped step look identical, and
+# this project has been bitten by false greens twice.
 function Invoke-Smoke($exePath) {
-    (Start-Process -FilePath $exePath -Wait -PassThru -NoNewWindow).ExitCode
+    $outFile = Join-Path $env:TEMP "pdf-editor-smoke-stdout.txt"
+    $proc = Start-Process -FilePath $exePath -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $outFile
+    if (Test-Path $outFile) {
+        $text = (Get-Content $outFile -Raw)
+        if ($text -and $text.Trim()) { Write-Host "  $($text.Trim())" }
+        Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+    }
+    return $proc.ExitCode
 }
 
 $started = Get-Date
