@@ -201,6 +201,13 @@ class _Fragment:
 
 _TOKEN_RE = re.compile(r"\S+|[^\S\n]+")
 
+# Everything that means "start a new line" in run text. U+2028 LINE SEPARATOR
+# and U+2029 PARAGRAPH SEPARATOR are what a Qt editor's Shift+Enter — and some
+# pastes — produce; untranslated they stay INSIDE a token, so the whole logical
+# line lays out as one overlong run that runs off the box (caught in review:
+# a two-line list item came out as one 283 pt line).
+_LINE_SEPARATORS = ("\r\n", "\r", " ", " ")
+
 
 def _layout_runs(runs: list[StyledRun], wrap_width: float | None) -> list[list[_Fragment]]:
     """Break runs into visual lines of fragments (greedy word wrap).
@@ -213,7 +220,9 @@ def _layout_runs(runs: list[StyledRun], wrap_width: float | None) -> list[list[_
     # Logical lines: sequences of (token, is_space, style) split on hard \n.
     logical: list[list[tuple[str, bool, TextStyle]]] = [[]]
     for run in runs:
-        text = run.text.replace("\r\n", "\n").replace("\r", "\n")
+        text = run.text
+        for separator in _LINE_SEPARATORS:
+            text = text.replace(separator, "\n")
         parts = text.split("\n")
         for i, part in enumerate(parts):
             if i > 0:
@@ -2193,6 +2202,7 @@ def set_list_style(
     *,
     ordinal: int = 1,
     indent: float = 0.0,
+    align: str | None = None,
 ) -> ParagraphReplaceResult:
     """Convert a paragraph to/from a list item (L2, user request).
 
@@ -2201,6 +2211,8 @@ def set_list_style(
     edits as a grouped item); ``"number"`` prepends ``f"{ordinal}. "`` INLINE
     (no hanging indent yet); ``None`` strips any leading marker back to a plain
     paragraph. An existing marker is replaced (bullet→number, renumber, …).
+    ``align`` overrides the justification (``None`` keeps the detected one) —
+    L3 passes the toolbar's choice through to a freshly created item.
 
     Per the plan's Option B the marker is ordinary editable TEXT — this is a
     formatting convenience, not a managed list structure."""
@@ -2211,12 +2223,14 @@ def set_list_style(
     # own width. None (clear) keeps the paragraph's own width.
     para_width = para.bbox[2] - para.bbox[0]
     if kind is None:
-        return replace_paragraph_runs(doc, page_index, para, body_runs, hang=0.0, indent=indent)
+        return replace_paragraph_runs(
+            doc, page_index, para, body_runs, hang=0.0, indent=indent, align=align
+        )
     if kind == "bullet":
         runs = [StyledRun("• ", marker_style), *body_runs]
         width = para_width + _LIST_HANG
         return replace_paragraph_runs(
-            doc, page_index, para, runs, hang=_LIST_HANG, width=width, indent=indent
+            doc, page_index, para, runs, hang=_LIST_HANG, width=width, indent=indent, align=align
         )
     if kind == "number":
         marker = f"{ordinal}. "
@@ -2224,9 +2238,239 @@ def set_list_style(
         runs = [StyledRun(marker, marker_style), *body_runs]
         width = para_width + marker_w + 2.0
         return replace_paragraph_runs(
-            doc, page_index, para, runs, hang=0.0, width=width, indent=indent
+            doc, page_index, para, runs, hang=0.0, width=width, indent=indent, align=align
         )
     raise ValueError(f"list kind must be one of {LIST_KINDS} or None, not {kind!r}")
+
+
+_ORIGIN_TOL = 0.75  # pt, matching a re-extracted line back to a drawn one
+
+
+def lines_in_box(
+    doc: pymupdf.Document,
+    page_index: int,
+    rect: tuple[float, float, float, float],
+    origins: Sequence[tuple[float, float]] = (),
+) -> tuple[str, ...]:
+    """The page's OWN text for the lines a caller drew inside ``rect``.
+
+    A box-registry fingerprint AS IT WILL RE-EXTRACT — which is not what the op
+    that wrote the text can REPORT. A bulleted list item is the case in point:
+    the layout draws ``"• "`` as its own span and knows only the BODY lines,
+    but MuPDF folds that marker span onto the front of the first body line and
+    helv renders U+2022 as U+00B7, so the extracted line reads ``"·Item text"``.
+    A fingerprint built from the laid-out text therefore fails whole-line
+    membership, ``_line_region`` returns -1, and the box stops owning its own
+    content — measured: three bullet items one pitch apart collapsed into ONE
+    hanging item with the 2nd and 3rd re-laid as its continuation lines.
+
+    ``origins`` — the ``(x, baseline)`` of each line the caller actually drew —
+    restricts the hit set to those lines. Geometry alone does NOT: a
+    marker-widened rect reaches into the next column, and a neighbour sharing a
+    baseline sits inside it, so a purely positional read would put FOREIGN text
+    in the fingerprint and the box would then own it (a later edit physically
+    relocates such a line into the box — caught in review). Passing no origins
+    keeps the positional read, which is only safe on a rect known to be alone.
+    """
+    page = doc[page_index]
+    keep = _comment_line_filter(doc, page_index)
+    hits: list[dict] = []
+    for lines in _folded_page_blocks(page, keep):
+        for line in lines:
+            bx0, by0, bx1, by1 = line["bbox"]
+            cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+            if not (rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]):
+                continue
+            if origins:
+                ox, oy = line["spans"][0]["origin"]
+                if not any(
+                    abs(ox - x) <= _ORIGIN_TOL and abs(oy - y) <= _ORIGIN_TOL for x, y in origins
+                ):
+                    continue  # a neighbour's line, not one of ours
+            hits.append(line)
+    hits.sort(key=_line_baseline)
+    return tuple(text for line in hits if (text := _line_text(line)))
+
+
+# Slack (pt) kept between a created list item's right edge and the page edge.
+_LIST_INSERT_MARGIN = 2.0
+
+
+@dataclass(frozen=True)
+class ListInsertResult:
+    """A list item created FROM SCRATCH (L3).
+
+    - ``bbox``: the laid-out item's box — the registry rect.
+    - ``visual_lines``: the item's lines AS EXTRACTED (marker included), i.e.
+      the registry fingerprint (see :func:`lines_in_box`).
+    - ``next_point``: the baseline the NEXT item of this list should start at —
+      one line pitch below the item's last line, at this item's own left edge
+      so a continued list's markers line up.
+    - ``next_bbox``: the rect that next item's FIRST line would occupy. The app
+      picks the continuation position (the user picked only the first one), so
+      it must not auto-place an item on top of existing content — this is what
+      :func:`slot_is_occupied` is asked about.
+    """
+
+    bbox: tuple[float, float, float, float]
+    visual_lines: tuple[str, ...]
+    next_point: tuple[float, float]
+    next_bbox: tuple[float, float, float, float]
+    kind: str
+    ordinal: int
+    exact_font: bool
+    font_fallback: bool
+
+
+def slot_is_occupied(
+    doc: pymupdf.Document,
+    page_index: int,
+    rect: tuple[float, float, float, float],
+    ignore: Sequence[tuple[float, float, float, float]] = (),
+) -> bool:
+    """True when page text OTHER than ``ignore`` overlaps ``rect``.
+
+    ``ignore`` is the caller's own content — a continued list item's slot
+    overlaps its predecessor's box by a couple of points (box height is
+    1.45x the font size against a 1.2x pitch), so without it every
+    continuation would read as blocked.
+    """
+    for span in extract_spans(doc, page_index):
+        if not span.text.strip():
+            continue
+        if any(_covered_by(span.bbox, own) for own in ignore):
+            continue
+        if (
+            span.bbox[0] < rect[2]
+            and span.bbox[2] > rect[0]
+            and span.bbox[1] < rect[3]
+            and span.bbox[3] > rect[1]
+        ):
+            return True
+    return False
+
+
+def insert_list_item(
+    doc: pymupdf.Document,
+    page_index: int,
+    point: tuple[float, float],
+    runs: list[StyledRun],
+    kind: str,
+    *,
+    ordinal: int = 1,
+    align: str = "left",
+    pitch: float | None = None,
+    width: float | None = None,
+) -> ListInsertResult:
+    """Create ONE list item from scratch at a baseline point (L3).
+
+    Lays the item out DIRECTLY with the shared layout primitives
+    (``_layout_runs`` / ``_insert_line`` / ``_align_shift``) — the same ones
+    :func:`replace_paragraph_runs` uses — rather than inserting plain text and
+    converting it with :func:`set_list_style`. That two-step read the text back
+    off the page between halves, and review proved every failure mode that
+    round trip carries:
+
+    - the hit-test resolved OVERLAPPING lines by dict-block order, so text
+      landing near existing content styled the EXISTING paragraph instead
+      (bullet prepended, body shoved 18 pt right) and left the typed item plain;
+    - the isolation fingerprint was built from the laid-out text, which does not
+      round-trip for any character the base-14 encoding lacks (a typed U+2022,
+      an em dash, a curly quote, CJK all extract as U+00B7), so isolation
+      silently lapsed and the new item merged with its neighbour;
+    - it was not atomic: the plain text was already on the page when the second
+      half raised.
+
+    Laying out directly also lets the body WRAP (``width``, default: to the page
+    margin), so an ordinary prose-length item no longer has to be refused.
+
+    Everything is validated BEFORE the page is touched. The caller must register
+    the returned ``bbox``/``visual_lines`` as a box: a continued list's items sit
+    one line pitch apart, well inside MuPDF's dict-block split threshold
+    (~1.5x the font size), so only that isolation keeps them separately editable.
+    """
+    if kind not in LIST_KINDS:
+        raise ValueError(f"list kind must be one of {LIST_KINDS}, not {kind!r}")
+    _check_align(align)
+    if not _runs_have_text(runs):
+        raise ValueError("no text to insert")
+    runs, font_fallback = _resolve_embed_runs(doc, page_index, runs)
+    page = doc[page_index]
+    page_w, page_h = page.rect.width, page.rect.height
+    if page.rotation % 180 == 90:  # unrotated bounds (the space we insert in)
+        page_w, page_h = page_h, page_w
+    x, y = point
+    if not (0 <= x < page_w and 0 < y <= page_h):
+        raise ValueError("insertion point is outside the page")
+
+    # The marker: DRAWN by us, at the box left. Unlike set_list_style (which
+    # re-formats text already on the page) a leading marker in freshly TYPED
+    # text is content the user just wrote — stripping it here silently deleted
+    # "a) " from "a) see appendix", so the runs are laid out as given.
+    base = next((run.style for run in runs if run.text.strip()), TextStyle())
+    marker_style = TextStyle(code=base.code, size=base.size, color=base.color)
+    if kind == "bullet":
+        marker_runs = [StyledRun("• ", marker_style)]
+        hang = _LIST_HANG
+    else:  # a numbered marker stays INLINE (no hanging indent — an L-series
+        marker_runs = [StyledRun(f"{ordinal}. ", marker_style)]  # refinement)
+        hang = _style_text_width(marker_style, f"{ordinal}. ")
+    marker_line = _layout_runs(marker_runs, None)[0]
+
+    body_x = x + hang
+    wrap = width if width is not None else (page_w - _LIST_INSERT_MARGIN - body_x)
+    if wrap < 20.0:
+        raise ValueError("There is no room for a list item here — start the list further left.")
+    lines = _layout_runs(runs, wrap)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        raise ValueError("no text to insert")
+    sizes = [
+        max((f.style.size for f in line if f.text.strip()), default=base.size) for line in lines
+    ]
+    max_size = max(sizes)
+    pitch_val = pitch if pitch is not None else 1.2 * base.size
+    if pitch_val <= 0:
+        raise ValueError("pitch must be positive")
+    # Pre-flight the page fit: nothing is mutated until this passes.
+    if y - 1.1 * max_size < 0 or y + (len(lines) - 1) * pitch_val + 0.35 * max_size > page_h:
+        raise ValueError("The list item does not fit on the page — shorten it or start higher.")
+
+    widths = [(line[-1].x + line[-1].width) if line else 0.0 for line in lines]
+    shifts = [_align_shift(align, wrap, w) for w in widths]
+    _insert_line(page, x, y, marker_line)
+    origins = [(x, y)]
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        _insert_line(page, body_x + shifts[i], y + i * pitch_val, line)
+        if i:  # line 0's dict line is the MARKER's (the fold puts it first)
+            origins.append((body_x + shifts[i], y + i * pitch_val))
+    marker_w = marker_line[-1].x + marker_line[-1].width if marker_line else 0.0
+    right = max(x + marker_w, max((body_x + s + w) for s, w in zip(shifts, widths, strict=True)))
+    bbox = (x, y - 1.1 * max_size, right, y + (len(lines) - 1) * pitch_val + 0.35 * max_size)
+    next_y = y + len(lines) * pitch_val
+    return ListInsertResult(
+        bbox=bbox,
+        # The fingerprint the page will RE-extract, restricted to the lines we
+        # just drew (a neighbour sharing a baseline sits inside the rect too).
+        visual_lines=lines_in_box(doc, page_index, bbox, origins),
+        next_point=(x, next_y),
+        next_bbox=(x, next_y - 1.1 * base.size, right, next_y + 0.35 * base.size),
+        kind=kind,
+        ordinal=ordinal,
+        exact_font=True,
+        font_fallback=font_fallback,
+    )
+
+
+def next_item_fits(doc: pymupdf.Document, page_index: int, point: tuple[float, float]) -> bool:
+    """Whether a continued list item's baseline still sits on the page — the
+    caller's cue to stop continuing rather than let the insert refuse."""
+    page = doc[page_index]
+    height = page.rect.height if page.rotation % 180 != 90 else page.rect.width
+    return 0 < point[1] <= height - _LIST_INSERT_MARGIN
 
 
 def list_item_kind(para: Paragraph) -> tuple[str | None, int]:

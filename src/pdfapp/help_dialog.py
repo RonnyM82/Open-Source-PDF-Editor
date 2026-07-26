@@ -87,6 +87,16 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Arms click-to-place — a chip shows what to do next; Esc cancels",
             ),
             (
+                "Insert list",
+                "Click to start it, then Enter begins the next item — Shift+Enter "
+                "breaks a line, an empty item (or Esc) ends the list",
+            ),
+            (
+                "Format as list",
+                "Right-click a paragraph (or a multi-selection) — bulleted, "
+                "numbered, or increase / decrease indent",
+            ),
+            (
                 "Highlight text (Ctrl+Shift+H)",
                 "Highlights the current text selection, or arms a window drag across text",
             ),

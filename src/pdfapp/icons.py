@@ -63,6 +63,7 @@ _NAMES = {
     "new_window": "mdi6.open-in-new",
     "insert_pages": "mdi6.file-plus-outline",
     "insert_text": "mdi6.text-box-plus-outline",
+    "insert_list": "mdi6.playlist-plus",
     "insert_image": "mdi6.image-plus-outline",
     "insert_comment": "mdi6.comment-plus-outline",
     "insert_callout": "mdi6.comment-arrow-left-outline",

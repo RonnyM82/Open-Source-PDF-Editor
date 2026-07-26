@@ -55,6 +55,7 @@ from pdfcore.textedit import (
     FLAG_BOLD,
     FLAG_ITALIC,
     LIST_INDENT_STEP,
+    LIST_KINDS,
     SCRIPT_NORMAL,
     SCRIPT_SUB,
     SCRIPT_SUPER,
@@ -239,7 +240,7 @@ class DocumentView(QWidget):
         # Connected AFTER the main handlers (Qt delivers in connection order):
         # the toolbar restores its global defaults once the session is DONE.
         for overlay in (self._editor, self._para_editor):
-            overlay.committed.connect(lambda _text: self.editorClosed.emit())
+            overlay.committed.connect(lambda _text: self._emit_editor_closed())
             overlay.cancelled.connect(self.editorClosed)
             # Chrome re-syncs when an editor closes: the Hyperlink command is
             # disabled while one is open (signal-to-signal — a lambda calling
@@ -308,16 +309,24 @@ class DocumentView(QWidget):
         self._text_sel_anchor_pt: tuple[float, float] | None = None
         self._text_lines: list | None = None
         self._text_lines_page = -1
-        # Armed one-shot click action: ("text", None) | ("image", Path).
-        # The canvas' insertPointSelected feeds it. (Highlighting uses the
-        # canvas' region-select mode instead — a dragged window.)
+        # Armed one-shot click action: ("text", None) | ("image", Path) |
+        # ("list", kind) | … The canvas' insertPointSelected feeds it.
+        # (Highlighting uses the canvas' region-select mode instead — a
+        # dragged window.)
         self._click_action: tuple[str, object] | None = None
+        # The list being typed (L3): (kind, ordinal) while an insert editor is
+        # open in list mode, else None. Enter commits the item and re-seeds
+        # this with the next ordinal one pitch down.
+        self._pending_list: tuple[str, int] | None = None
         # Set by MainWindow: () -> (TextStyle, QFont preview). None = match
         # the original style (headless/tests without a style toolbar).
         self.style_provider = None
         # Set by MainWindow: () -> "left" | "center" | "right" (the alignment
         # toolbar button). None = the engine default / detected justification.
         self.align_provider = None
+        # Set by MainWindow: () -> "bullet" | "number" (the sticky list-style
+        # dropdown). None = bullets (headless/tests without the toolbar).
+        self.list_kind_provider = None
         # State captured when an editor opens: the toolbar style (fallback
         # no-op detection), the rich-content signature (rich no-op detection)
         # and the zoom (pixel-size -> pt conversion at commit).
@@ -1482,6 +1491,20 @@ class DocumentView(QWidget):
         self._click_action = ("text", None)
         self._canvas.arm_insert_point("Click where the new text should start · Esc cancels")
 
+    def begin_insert_list(self, kind: str | None = None) -> None:
+        """Arm click-to-place for a NEW list (L3): the click opens an empty
+        editor in LIST mode, where Enter commits the item and starts the next.
+
+        ``kind`` defaults to the toolbar's sticky list style.
+        """
+        if not self._edit_mode or not self._canvas.has_page:
+            return
+        kind = kind or self._current_list_kind()
+        if kind not in LIST_KINDS:
+            return
+        self._click_action = ("list", kind)
+        self._canvas.arm_insert_point("Click where the list should start · Esc cancels")
+
     def begin_insert_image(self) -> None:
         """Pick an image file, then click where it should be placed."""
         if not self._edit_mode or not self._canvas.has_page:
@@ -1581,8 +1604,8 @@ class DocumentView(QWidget):
 
     @property
     def armed_action(self) -> str | None:
-        """The armed mode: "text"|"image"|"initials"|"highlight"|"hyperlink"|
-        "link"|"sign"|None.
+        """The armed mode: "text"|"list"|"image"|"initials"|"highlight"|
+        "hyperlink"|"link"|"sign"|None.
 
         "hyperlink" is the merged tool; "link" is the bare rectangle draw that
         only "Redefine clickable area" still arms; "sign" is the signature
@@ -1603,6 +1626,7 @@ class DocumentView(QWidget):
     def cancel_armed_mode(self) -> None:
         """Drop any armed one-shot mode (Esc, mode exit, toolbar re-click)."""
         self._click_action = None
+        self._pending_list = None
         self._region_action = "highlight"
         self._pending_redefine = None
         self._clear_link_selection()
@@ -2124,6 +2148,12 @@ class DocumentView(QWidget):
     def _on_insert_point(self, sx: float, sy: float) -> None:
         action, payload = self._click_action or ("text", None)
         self._click_action = None
+        # Arming ANY click-to-place mode ends a list being typed: this click
+        # decides what the editor opens as. Without the reset a plain "Insert
+        # text" started mid-list inherited the stale (kind, ordinal) and came
+        # out as the list's next item. (The continuation re-seeds it AFTER
+        # this point — it calls _open_insert_editor directly.)
+        self._pending_list = None
         n = self._current_page
         px, py = self._scene_point_to_page(sx, sy, n)
         if action == "image":
@@ -2155,6 +2185,18 @@ class DocumentView(QWidget):
         if action in ("comment", "callout_box"):
             self._open_comment_editor(n, px, py, payload)
             return
+        if action == "list":
+            # The click starts a LIST: the same insert editor, in list mode.
+            self._pending_list = (str(payload), 1)
+        self._open_insert_editor(n, px, py, sx, sy)
+
+    def _open_insert_editor(self, n: int, px: float, py: float, sx: float, sy: float) -> None:
+        """Open the empty insert editor over the page point ``(px, py)``.
+
+        ``(sx, sy)`` is the same point in SCENE px — the editor is positioned
+        in widget coordinates, so a caller with only page points (the list
+        continuation) converts through the seam first.
+        """
         self._pending_insert = (n, (px, py))
         if self.style_provider is not None:
             style, font = self.style_provider()
@@ -2184,7 +2226,18 @@ class DocumentView(QWidget):
         self._edit_open_align = self._current_align()
         if self._edit_open_align is not None:
             self.apply_alignment_to_editor(self._edit_open_align)
-        self.editWarning.emit("Type the new text — Ctrl+Enter inserts, Esc cancels.")
+        if self._pending_list is not None:
+            self._para_editor.set_list_mode(True)  # AFTER open_at (it clears it)
+            kind, ordinal = self._pending_list
+            # Names the item, not the glyph: a base-14 marker draws as a middot,
+            # so promising "•" here would not match what lands on the page.
+            what = "Bulleted list item" if kind == "bullet" else f"List item {ordinal}."
+            self.editWarning.emit(
+                f"{what} — Enter starts the next one, Shift+Enter breaks the "
+                "line, Esc ends the list."
+            )
+        else:
+            self.editWarning.emit("Type the new text — Ctrl+Enter inserts, Esc cancels.")
 
     def _on_paragraph_committed(self, text: str) -> None:
         if self._pending_comment is not None:
@@ -2220,10 +2273,19 @@ class DocumentView(QWidget):
         if self._pending_insert is not None:
             page_index, point = self._pending_insert
             self._pending_insert = None
-            if not text.strip():
-                return
+            list_spec = self._pending_list
+            self._pending_list = None
             pieces = self._para_editor.committed_pieces_for(text)
             align = self._current_align() or "left"
+            if list_spec is not None:
+                # An empty item ends the list (Option B: the marker is just
+                # text, so there is nothing to clean up) — same as an empty
+                # plain insert, which also does nothing.
+                if text.strip():
+                    self._commit_list_item(page_index, point, text, pieces, align, list_spec)
+                return
+            if not text.strip():
+                return
             if pieces is not None:  # rich path: styles typed/applied in the editor
                 runs, _resolved = self._runs_from_pieces(pieces)
 
@@ -2325,6 +2387,91 @@ class DocumentView(QWidget):
         if result.resized:
             self.editWarning.emit("The text box grew to fit the new text.")
 
+    def _emit_editor_closed(self) -> None:
+        """Tell the toolbar to restore its global defaults — but NOT while a
+        list continuation has already re-opened the editor (L3).
+
+        This runs after ``_on_paragraph_committed``, which is where an Enter
+        starts the next item, so the session is not over: firing here snapped
+        the style toolbar back to the global alignment/weight/size while the
+        user was still typing the list, and the next item then committed with
+        the global alignment instead of the one they had picked.
+        """
+        if self._para_editor.is_editing:
+            return
+        self.editorClosed.emit()
+
+    def _commit_list_item(
+        self,
+        page_index: int,
+        point: tuple[float, float],
+        text: str,
+        pieces,
+        align: str,
+        list_spec: tuple[str, int],
+    ) -> None:
+        """Insert ONE typed list item, then continue the list if Enter asked.
+
+        The engine op registers the item's box INSIDE the command (E10
+        atomicity), using the fingerprint the page will actually re-extract —
+        a bulleted item's marker folds onto its first line, so a fingerprint
+        built from the reported body lines would leave the box owning nothing
+        and the next item would merge into this one.
+        """
+        kind, ordinal = list_spec
+        keep_going = self._para_editor.continue_requested
+        if pieces is not None:  # rich path: styles typed/applied in the editor
+            runs, _resolved = self._runs_from_pieces(pieces)
+        else:  # direct-call fallback (tests): one uniform toolbar style
+            runs = [StyledRun(text, self._current_style() or TextStyle())]
+        results: list = []
+
+        def op(doc: PdfDocument) -> None:
+            result = doc.insert_list_item(
+                page_index, point, runs, kind, ordinal=ordinal, align=align
+            )
+            results.append(result)
+            doc.add_box(page_index, result.bbox, text="\n".join(result.visual_lines))
+
+        if not self._push_command("Insert list item", op, ("page", page_index)):
+            return
+        result = results[0]
+        if result.font_fallback:
+            self.editWarning.emit(
+                "Some characters aren't in the document's font — a standard font was used."
+            )
+        elif not result.exact_font:
+            self.editWarning.emit("Font can't be matched exactly — closest standard font used.")
+        if keep_going:
+            self._continue_list(page_index, kind, ordinal + 1, result)
+
+    def _continue_list(self, page_index: int, kind: str, ordinal: int, previous) -> None:
+        """Re-open the insert editor for the NEXT item of a list (L3).
+
+        The APP picks this position (the user picked only the first one), so it
+        stops rather than auto-placing an item on top of existing content or
+        off the bottom of the page.
+        """
+        if page_index != self._current_page:
+            return  # the page moved under us — don't type into another page
+        point = previous.next_point
+        if not self._doc.next_list_item_fits(page_index, point):
+            self.editWarning.emit("The list reached the bottom of the page.")
+            return
+        if self._doc.slot_is_occupied(page_index, previous.next_bbox, (previous.bbox,)):
+            self.editWarning.emit(
+                "The list stopped here — the next line is already occupied by other text."
+            )
+            return
+        self._pending_list = (kind, ordinal)
+        sx, sy = self._page_point_to_scene(point[0], point[1], page_index)
+        # The app chose this spot, so make sure the user can see it: a list
+        # typed at any zoom above fit-page otherwise walks below the viewport
+        # and they keep typing into a focused box that is off screen.
+        self._canvas.ensureVisible(QRectF(sx - 4, sy - 4, 8, 8), 40, 40)
+        sx, sy = self._page_point_to_scene(point[0], point[1], page_index)
+        self._open_insert_editor(page_index, point[0], point[1], sx, sy)
+
     def _place_image(
         self, page_index: int, px: float, py: float, path: Path, *, max_width: float = 200.0
     ) -> None:
@@ -2362,6 +2509,15 @@ class DocumentView(QWidget):
         return page_coords.scene_to_page(
             sx,
             sy,
+            render_zoom=self._canvas.render_zoom,
+            rotation=self._doc.page_rotation(n),
+            page_size_pts=self._doc.page_size(n),
+        )
+
+    def _page_point_to_scene(self, px: float, py: float, n: int) -> tuple[float, float]:
+        return page_coords.page_to_scene(
+            px,
+            py,
             render_zoom=self._canvas.render_zoom,
             rotation=self._doc.page_rotation(n),
             page_size_pts=self._doc.page_size(n),
@@ -3762,10 +3918,16 @@ class DocumentView(QWidget):
         without the toolbar — the engine then keeps what it detected)."""
         return self.align_provider() if self.align_provider is not None else None
 
+    def _current_list_kind(self) -> str:
+        """The list-style toolbar's kind, or bullets (headless/tests)."""
+        kind = self.list_kind_provider() if self.list_kind_provider is not None else None
+        return kind if kind in LIST_KINDS else "bullet"
+
     def _on_edit_cancelled(self) -> None:
         self._pending_edit = None
         self._pending_paragraph = None
         self._pending_insert = None
+        self._pending_list = None  # Esc ends the list being typed (L3)
         self._pending_comment = None
         self._pending_comment_edit = None
 

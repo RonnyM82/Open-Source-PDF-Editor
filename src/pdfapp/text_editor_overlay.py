@@ -10,7 +10,8 @@ get a single-style fallback when no matching pieces exist.
 
 ``TextEditorOverlay`` is single-line-ish (Enter commits, text selected on
 open so a value is retyped); ``ParagraphEditorOverlay`` commits on Ctrl+Enter
-(Enter = line break) and opens with the cursor at the END so typing APPENDS.
+(Enter = line break, or — in LIST mode, L3 — commit-and-continue) and opens
+with the cursor at the END so typing APPENDS.
 Escape cancels. Focus-out does NOT dismiss (the style toolbar needs clicks);
 DocumentView commits an open editor on click-away or when a new edit begins.
 Both editors carry a visible bottom-right resize grip.
@@ -135,6 +136,10 @@ class _RichOverlayBase(QTextEdit):
         self._line_height_px: float | None = None
         self._base_size_pt: float | None = None  # true pt the pin was built for
         self._fit_anchor = "left"  # which edge stays put when the box widens
+        # List mode (L3): only the paragraph editor ACTS on it, but the flag and
+        # the commit-time answer live here because _commit() is what reports it.
+        self._list_mode = False
+        self._continue_requested = False
         # Grow downward while typing/formatting so content stays visible —
         # BOTH editors (a tall word clipped in the single-line editor too).
         self.textChanged.connect(self._auto_grow)
@@ -157,6 +162,26 @@ class _RichOverlayBase(QTextEdit):
 
     def mark_user_sized(self) -> None:
         self._user_sized = True
+
+    # --- list mode (L3) ----------------------------------------------------
+    def set_list_mode(self, on: bool) -> None:
+        """Type a LIST here: plain Enter commits this item and asks for the
+        next one (``continue_requested``), Shift+Enter stays a line break
+        within the item, Ctrl+Enter commits and ends the list. Set AFTER
+        opening — ``open_pieces`` clears it, so a mode never leaks into the
+        next edit. Only ``ParagraphEditorOverlay`` acts on it."""
+        self._list_mode = on
+
+    @property
+    def list_mode(self) -> bool:
+        return self._list_mode
+
+    @property
+    def continue_requested(self) -> bool:
+        """True when the last commit came from a plain Enter in list mode —
+        the caller should start the next item. Read inside the ``committed``
+        handler (the signal is emitted synchronously from ``_commit``)."""
+        return self._continue_requested
 
     # --- open/commit/cancel -------------------------------------------------
     def open_pieces(
@@ -186,6 +211,8 @@ class _RichOverlayBase(QTextEdit):
         self._user_sized = False
         self._committed_text = None
         self._committed_pieces = []
+        self._list_mode = False  # callers opt in AFTER opening (L3)
+        self._continue_requested = False
         self._line_height_px = line_height_px
         self._base_size_pt = base_size_pt
         self.setGeometry(rect)
@@ -322,6 +349,7 @@ class _RichOverlayBase(QTextEdit):
         if not self._active:
             return
         self._active = False
+        self._continue_requested = False  # Esc ends a list, never continues it
         self.hide()
         self.cancelled.emit()
 
@@ -532,6 +560,12 @@ class ParagraphEditorOverlay(_RichOverlayBase):
     (select-all wiped the paragraph on a stray keystroke). The corner grip
     (and an invisible right-edge band) set the box width → the paragraph's
     wrap width on commit; height is visual editing room.
+
+    In LIST mode (``set_list_mode``, L3) plain Enter takes on its
+    word-processor meaning — commit this item and start the next — while
+    Shift+Enter keeps the line break and Ctrl+Enter still commits (ending the
+    list). Enter on an empty item ends it too: the commit carries no text, so
+    the caller inserts nothing.
     """
 
     _EDGE_PX = 7  # right-edge width-drag band
@@ -585,10 +619,28 @@ class ParagraphEditorOverlay(_RichOverlayBase):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (
-            event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            self._commit()
-            event.accept()
-            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            mods = event.modifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self._commit()  # apply (and, in list mode, end the list)
+                event.accept()
+                return
+            # List mode only: plain Enter finishes this item and asks for the
+            # next. Shift+Enter stays a line break — that is how a list item
+            # gets a second line now that Enter means something else.
+            if mods & Qt.KeyboardModifier.ShiftModifier:
+                # Explicitly a BLOCK break. QTextEdit's own Shift+Enter inserts
+                # U+2028 (a soft break inside the block), which `_pieces` hands
+                # to the engine INSIDE a fragment — the engine then laid the
+                # whole thing out as one overlong line (the engine now also
+                # translates it, but producing a real break here keeps the
+                # editor's two line-break keys identical).
+                self.textCursor().insertBlock()
+                event.accept()
+                return
+            if self._list_mode:
+                self._continue_requested = True
+                self._commit()
+                event.accept()
+                return
         super().keyPressEvent(event)

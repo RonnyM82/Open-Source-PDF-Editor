@@ -125,42 +125,115 @@ Goal: select paragraphs → "Bulleted list" / "Numbered list" toggle.
 Tests: format 3 paragraphs → 3 items with correct marker text + indent; unlist
 restores; round-trip.
 
-### L3 — Creation & continuation
+### L3 — Creation & continuation — **DONE (2026-07-26)**
 
-Goal: start a list from scratch; Enter continues it.
+Goal: start a list from scratch; Enter continues it. Shipped as designed; the
+current-state reference now lives in CLAUDE.md's "List recognition" section.
+What was built, and the decisions taken along the way:
 
-- Insert-list armed mode (like insert-text): click to place, the paragraph
-  editor opens seeded with the first marker (from the sticky marker-style
-  dropdown). Enter starts the next item with the next marker/number as literal
-  text; an empty item ends the list.
-- Numbering the freshly typed items is a convenience only (still literal text —
-  no ongoing management).
+- **Engine `textedit.insert_list_item(doc, n, point, runs, kind, *, ordinal,
+  align, pitch, width) -> ListInsertResult`** — lays the item out DIRECTLY with
+  the shared primitives (`_layout_runs` / `_insert_line` / `_align_shift`, the
+  ones `replace_paragraph_runs` uses): marker at the point, body wrapped and
+  hung at `point + hang`, everything validated before the page is touched.
+  `ListInsertResult` carries `bbox`, `visual_lines`, `next_point` (the next
+  item's baseline, at this item's left edge so markers line up) and
+  `next_bbox` (the slot that item would occupy).
+- **The kickoff note's two-step was built first and then REJECTED** (see the
+  review section below). It composed `insert_new_runs` + `set_list_style`,
+  which meant reading the text back off the page between the halves — and that
+  round trip carried three separate failures. Direct layout also lets the body
+  WRAP, so an ordinary prose-length item no longer has to be refused.
+- **`next_point` is one line pitch (1.2 em) below the item's last line.** That
+  is normal list spacing and it is BELOW MuPDF's dict-block split threshold
+  (~1.50–1.53 × font size, measured), so consecutive items land in ONE block
+  and read as one paragraph unless something isolates them. The box registry
+  does: each item registers its own box inside the undoable command, and every
+  UI read goes through `page_geometry`, which passes those boundaries.
+  A 5-item run at 13.2 pt spacing stays 5 clean items.
+- **The bullet fingerprint bug (found here, fixed here).** A bullet is drawn as
+  its OWN span; MuPDF folds it onto the front of the first body line and helv
+  renders U+2022 as U+00B7, so the page reads `"·Item"` while the layout knows
+  `"Item"`. A fingerprint built from the laid-out text therefore never matched
+  its own line, `_line_region` returned −1, and the box owned nothing — with 3+
+  items the 2nd and 3rd were re-laid as continuation lines of the 1st. Fix:
+  `textedit.lines_in_box(doc, n, rect, origins)` re-reads the page, restricted
+  to the lines actually drawn.
+- **`origins` is load-bearing in the other direction.** The first version
+  selected by geometry alone; because the item's box is marker-widened, a value
+  in the next column sharing a baseline landed inside it, so the box owned that
+  foreign line and a later edit physically RELOCATED it into the box. Review
+  caught it by A/B-ing against HEAD. The same geometry-only helper had been
+  applied to the shipped L2/L4 registry updates as a fix for the fingerprint
+  bug there; that was **reverted** — it turned a mild latent defect (a
+  formatted bullet box owning nothing) into a corrupting one. See §7.
+- **Keys (the continuation contract).** In list mode the paragraph editor reads
+  plain **Enter** as commit-this-item-and-start-the-next, **Shift+Enter** as
+  the line break within an item (Enter's old job needed a home), **Ctrl+Enter**
+  as commit-and-end (its app-wide "apply" meaning is preserved), and **Esc** as
+  end-the-list. An empty item ends the list too — nothing to clean up, because
+  the marker is just text (Option B). Each item is its own undo step.
+- **The marker is NOT seeded into the editor.** The engine draws it, so what the
+  user types is exactly the item's body; the status hint names the item
+  instead, and deliberately does NOT show a "•" — a base-14 marker draws as a
+  middot, so promising the glyph would not match what lands on the page.
+  Conversely a marker-shaped token in freshly TYPED text is KEPT: unlike
+  `set_list_style` (which re-formats text already on the page) there is nothing
+  to re-format here, and stripping silently deleted the "a) " from "a) see
+  appendix".
+- **The dropdown is a KIND chooser, not a glyph palette** (deviation from §6.1):
+  creation writes only `•` / `1.`, and reproducing `◦ ▪ –` faithfully needs an
+  EMBEDDED symbol font. Probed both ways: with `TextStyle(fontfile=…)` (Arial,
+  Segoe UI Symbol) `• ◦ ▪ – ‣ ●` all write and re-extract as themselves; with
+  every base-14 code (helv/tiro/cour/symb/zadb) they collapse to U+00B7. So a
+  glyph palette is *possible*, just a bigger choice than L3 needed — see open
+  question 2.
 
-> **L3 KICKOFF NOTE (2026-07-26 — L1/L2/L4 shipped, L3 is the last piece).**
-> Start here; it's self-contained. What already exists to build on:
-> - `textedit.set_list_style(doc, n, para, kind, ordinal=)` CREATES a list item
->   from a paragraph (draw-marker path when there's no kept bullet) with the
->   hanging indent. `list_item_kind(para)` classifies an existing item. These
->   are the creation primitives — L3 is mostly a UI gesture on top.
-> - **Engine gap:** `insert_new_runs` (the free-text insert path) has NO hang
->   support — only `replace_paragraph_runs` does. So the cleanest L3 insertion
->   is: insert a normal paragraph at the click (`insert_new_text`/runs), then
->   immediately `set_list_style(..., "bullet"/"number")` on it — reuse, don't
->   add a parallel hang path to `insert_new_runs`.
-> - **The armed gesture** mirrors Edit → "Insert text…" (`arm_insert_point` +
->   `theme.armed_chip_qss()` chip; `_on_insert_point`). Seed the marker from the
->   sticky marker-style dropdown (build it with `MainWindow._make_dropdown_
->   button`, same as the alignment control — see §6.1).
-> - **Enter-continuation is the real work** and the only hard part: on a plain
->   Enter (not Ctrl+Enter) commit the current item AND re-arm an insert one
->   pitch below with the next marker; an empty item ends the list. The paragraph
->   editor currently treats Enter as a line break and Ctrl+Enter as commit
->   (`_para_editor`), so continuation needs a list-mode branch in the editor's
->   key handling — scope this carefully or ship insert-one-item first and add
->   continuation second.
-> - **Testing:** offscreen, drive the dispatch (`_on_insert_point`-style) like
->   the other UI tests; assert the inserted item folds (`hang_indent > 0`) and
->   round-trips. A synthetic doc is enough; no new fixture needed.
+**Known limitation (not fixed here).** A created item's registry box is
+INK-wide, and `replace_paragraph_runs` wraps to `para.bbox` — so re-editing an
+item to ADD a word can wrap it to two lines and hit the E9.4 "the space it
+would grow into is already occupied" refusal against the item below. The
+workaround is the paragraph editor's existing right-edge/corner drag (which
+sets the wrap width). Fixing it properly means changing how an inserted box's
+wrap width is derived, which is a separate change touching every inserted text
+box, not just lists. It is the sharpest remaining edge on the feature.
+
+### What adversarial review changed (2026-07-26, 4 lenses)
+
+Every one of these was reproduced before it was fixed; the first three are why
+the two-step insert-then-restyle shape is gone.
+
+1. **Styling the wrong paragraph.** `paragraph_at` resolves OVERLAPPING lines by
+   dict-block order, so an item landing near existing prose returned the
+   EXISTING paragraph: `set_list_style` then bulleted it and shoved its body
+   18 pt right, leaving the typed item plain. Reproduced on
+   `samples/document_with_hyperlink.pdf` by clicking a genuine gap — the
+   continuation walked items 2 and 3 onto real content.
+2. **Isolation lapsing on non-ASCII.** The boundary fingerprint used the
+   laid-out text, which does not round-trip for anything base-14 lacks (a typed
+   `•`, an em dash, a curly quote, CJK — all extract as U+00B7), so
+   `_line_region` missed, isolation silently lapsed, and the item merged with
+   its neighbour.
+3. **Not atomic.** The plain text was already on the page when the second half
+   raised (e.g. over a rotated line).
+4. **Baseline clamping.** `next_point` came from the REQUESTED baseline, but
+   `replace_paragraph_runs` clamps near the page top — three items started at
+   y=5 stacked two on one baseline. Direct layout refuses instead.
+5. **Auto-placing onto occupied space.** The user picks only the FIRST position,
+   so `slot_is_occupied` now ends the list rather than typing over content.
+6. **`_pending_list` hijacking a plain insert.** Starting "Insert text" mid-list
+   inherited the stale (kind, ordinal) and produced the list's next item.
+   `_on_insert_point` clears it.
+7. **`editorClosed` firing mid-list.** It runs after the commit handler, which
+   has already re-opened the editor for the next item — so the style toolbar
+   snapped back to its global defaults while the user was still typing, and the
+   next item committed with the global alignment instead of the picked one.
+8. **Shift+Enter produced U+2028**, a soft break the layout did not split on, so
+   a two-line item laid out as one 283 pt line. Fixed at both ends (the editor
+   inserts a real block; `_layout_runs` translates U+2028/U+2029) — this was a
+   latent bug in the paragraph editor generally, not just in lists.
+9. **The continuation editor could walk below the viewport** at any zoom above
+   fit-page. `_continue_list` scrolls it into view.
 
 ### L4 — Incremental indentation (much reduced under Option B)
 
@@ -312,11 +385,35 @@ image/picture markers. Those are word-processor scope and stay out.
 - **Numbered-list sample provided** → `sample_lists.pdf` (bullets, inline
   numbers, and hanging-indent numbers), so detection is grounded on real data.
 
+**Resolved since:**
+1. **How far to go? → all of it.** L1, L2 and L4 shipped 2026-07-26; L3 shipped
+   the same day. The whole plan is built.
+
 **Still open:**
-1. **How far to go?** L1 (grouping fix) only, L1+L2 (format existing), or through
-   L3 (create)? L4 is now trivial (Tab/Shift+Tab indent) and folds into L2/L3.
-2. **Numbered-marker styles** to RECOGNISE/OFFER: just `1.`, or also `1)`, `a.`,
-   `i.`, `(1)`? (Detection should read all; creation needs a chosen default.)
+2. **Marker styles to OFFER when creating.** Detection already READS them all
+   (`lists.leading_marker`: `1.` `1)` `(1)` `a.` `i.`, and every glyph in
+   `BULLET_GLYPHS`), but creation only writes `•` and `1.`. Offering more needs
+   a marker-text parameter on the creation ops — and for BULLET glyphs it means
+   EMBEDDING a symbol font (probe: `◦ ▪ – ‣ ●` round-trip via
+   `TextStyle(fontfile=…)`, and collapse to U+00B7 with every base-14 code).
+   That is a policy call — automatic font matching never embeds; an explicit
+   fontfile is documented as a deliberate user choice — so it needs asking
+   before building. The numbered variants (`1)`, `(1)`, `a.`, `i.`) have no such
+   obstacle and are the cheap half.
+3. **Numbered hanging indent.** A numbered marker is still INLINE, so a wrapped
+   numbered item's continuation lines start under the number rather than under
+   the text. Bullets hang correctly. Same refinement as it was at L1.
+4. **The ink-wide box.** The "known limitation" above — re-editing a created
+   item to add a word is refused when another item sits below it. Deriving an
+   inserted box's wrap width from its REGISTRY rect rather than its ink bbox
+   would fix it for every inserted text box, not just lists.
+5. **The L2/L4 bullet fingerprint** (pre-existing, unchanged): a paragraph
+   formatted as a bulleted list stores a fingerprint the page never matches, so
+   its registry box stops owning its line. Mild on its own (the item still reads
+   via normal dict-block grouping). The obvious fix — reuse L3's
+   `lines_in_box` — was tried and reverted: without the drawn-line `origins`
+   L3 has, it absorbs same-baseline neighbours and corrupts them. A proper fix
+   needs `replace_paragraph_runs` to report its per-line geometry.
 
 ## 8. Test strategy
 

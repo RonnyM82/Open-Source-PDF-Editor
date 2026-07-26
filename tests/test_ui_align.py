@@ -98,6 +98,7 @@ def test_dropdown_buttons_are_no_wider_than_a_plain_icon_button(qapp):
         bold_w = style_bar.widgetForAction(window._bold_action).width()
         assert window._align_button.width() == bold_w
         assert window._highlight_color_button.width() == bold_w
+        assert window._list_kind_button.width() == bold_w
     finally:
         window.close()
 

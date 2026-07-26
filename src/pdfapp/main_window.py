@@ -65,6 +65,7 @@ from pdfcore.textedit import (
     ALIGNMENTS,
     FLAG_BOLD,
     FLAG_ITALIC,
+    LIST_KINDS,
     SCRIPT_NORMAL,
     SCRIPT_SUB,
     SCRIPT_SUPER,
@@ -135,7 +136,8 @@ def _dropped_pdf_paths(mime: QMimeData) -> list[Path]:
 # state (restoreState) is cleanly ignored rather than hiding a new toolbar.
 # 3: added the "Insert link" toolbar button (hyperlink feature).
 # 4: added the "Link text" toolbar button (Word-style text links).
-_STATE_VERSION = 4
+# 5: added the "Insert list" toolbar button + the List style dropdown (L3).
+_STATE_VERSION = 5
 
 
 class MainWindow(QMainWindow):
@@ -399,6 +401,14 @@ class MainWindow(QMainWindow):
         self._insert_text_action.setCheckable(True)
         self._insert_text_action.triggered.connect(self.insert_text)
 
+        # Insert list (L3): arms click-to-place like Insert text, but the editor
+        # opens in list mode — Enter commits the item and starts the next, an
+        # empty item ends the list. The KIND comes from the sticky List style
+        # dropdown on the text-style toolbar.
+        self._insert_list_action = QAction("Insert &list…", self)
+        self._insert_list_action.setCheckable(True)
+        self._insert_list_action.triggered.connect(self.insert_list)
+
         self._insert_image_action = QAction("Insert i&mage…", self)
         self._insert_image_action.setCheckable(True)
         self._insert_image_action.triggered.connect(self.insert_image)
@@ -457,6 +467,7 @@ class MainWindow(QMainWindow):
             self._add_blank_page_action,
             self._insert_action,
             self._insert_text_action,
+            self._insert_list_action,
             self._insert_image_action,
             self._hyperlink_action,
             self._place_initials_action,
@@ -506,6 +517,7 @@ class MainWindow(QMainWindow):
             self._delete_action: "delete_page",
             self._insert_action: "insert_pages",
             self._insert_text_action: "insert_text",
+            self._insert_list_action: "insert_list",
             self._insert_image_action: "insert_image",
             self._hyperlink_action: "insert_link",
             self._highlight_action: "highlight",
@@ -561,6 +573,10 @@ class MainWindow(QMainWindow):
             ),
             self._find_action: "Find in document (Ctrl+F)",
             self._insert_text_action: "Insert text — then click the page to place it",
+            self._insert_list_action: (
+                "Insert a list — click the page, then Enter starts each next item "
+                "(an empty item ends the list)"
+            ),
             self._insert_image_action: "Insert an image — then click the page to place it",
             self._hyperlink_action: (
                 "Hyperlink (Ctrl+K) — drag over text to link a run (click a word, "
@@ -632,6 +648,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         for action in (
             self._insert_text_action,
+            self._insert_list_action,
             self._insert_image_action,
             self._hyperlink_action,
             self._place_initials_action,
@@ -718,9 +735,10 @@ class MainWindow(QMainWindow):
         """(Re-)bake themed icons for every action — build time + theme change."""
         for action, key in self._icon_keys.items():
             action.setIcon(icons.icon(key))
-        # The alignment button borrows the active option's freshly-baked icon
-        # (it is a QToolButton, so it isn't in the action map itself).
+        # The dropdown buttons borrow their active option's freshly-baked icon
+        # (they are QToolButtons, so they aren't in the action map themselves).
         self._update_align_button()
+        self._update_list_kind_button()
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
@@ -760,6 +778,7 @@ class MainWindow(QMainWindow):
         # the toolbar slots (E11.4, user request); the reveal-all and
         # double-click sub-mode TOGGLES moved to menu-only (less used).
         toolbar.addAction(self._insert_text_action)
+        toolbar.addAction(self._insert_list_action)
         toolbar.addAction(self._insert_image_action)
         toolbar.addAction(self._hyperlink_action)
         toolbar.addSeparator()
@@ -869,6 +888,29 @@ class MainWindow(QMainWindow):
             self._icon_keys[action] = f"align_{key}"
         self._align_button = self._make_dropdown_button(align_menu, "Text alignment")
         bar.addWidget(self._align_button)
+
+        # List style (L3): what "Insert list…" creates. The SAME sticky
+        # InstantPopup pattern as alignment. Deliberately a KIND chooser, not a
+        # marker-glyph palette: base-14 fonts have no U+2022 (helv renders it as
+        # a middot), so offering ◦ ▪ – would promise glyphs we cannot reproduce
+        # — the plan's open question 2 stays open.
+        self._list_kind = self._startup_list_kind()
+        self._list_kind_actions: dict[str, QAction] = {}
+        list_menu = QMenu(self)
+        list_group = QActionGroup(self)
+        list_group.setExclusive(True)
+        for key, label in (("bullet", "Bulleted list"), ("number", "Numbered list")):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(key == self._list_kind)
+            action.setToolTip(f"{label} (what Insert list creates)")
+            action.triggered.connect(lambda _checked=False, k=key: self._pick_list_kind(k))
+            list_group.addAction(action)
+            list_menu.addAction(action)
+            self._list_kind_actions[key] = action
+            self._icon_keys[action] = "list_bulleted" if key == "bullet" else "list_numbered"
+        self._list_kind_button = self._make_dropdown_button(list_menu, "List style")
+        bar.addWidget(self._list_kind_button)
 
         self._text_color = QColor(0, 0, 0)
         self._color_button = QToolButton(self)
@@ -1098,6 +1140,44 @@ class MainWindow(QMainWindow):
         action = self._align_actions[self._text_align]
         self._align_button.setIcon(action.icon())
         self._align_button.setToolTip(f"{action.text()} — click the arrow for other options")
+
+    # --- list style (L3) ---------------------------------------------------
+    def _startup_list_kind(self) -> str:
+        """The persisted last-used list kind (a hand-edited value falls back to
+        bullets — the do-no-harm default, and the only kind the samples use)."""
+        value = self._settings.get("last_list_kind", "bullet")
+        return value if value in LIST_KINDS else "bullet"
+
+    def current_list_kind(self) -> str:
+        """The toolbar's list kind — what Insert list creates (the view's
+        ``list_kind_provider``)."""
+        return self._list_kind
+
+    def _pick_list_kind(self, kind: str) -> None:
+        """A deliberate user pick: reflect it and persist it as the last-used
+        option. Unlike alignment this never touches an open editor — the kind
+        applies to the list the NEXT Insert list creates."""
+        if kind not in LIST_KINDS or self._populating_style:
+            return
+        self._reflect_list_kind(kind)
+        self._settings.set("last_list_kind", kind)
+
+    def _reflect_list_kind(self, kind: str) -> None:
+        """Show ``kind`` as the active option (state + button + checkmarks)."""
+        if kind not in LIST_KINDS:
+            return
+        self._list_kind = kind
+        for key, action in self._list_kind_actions.items():
+            action.setChecked(key == kind)
+        self._update_list_kind_button()
+
+    def _update_list_kind_button(self) -> None:
+        """The button wears the ACTIVE option's icon and name."""
+        if not hasattr(self, "_list_kind_button"):
+            return
+        action = self._list_kind_actions[self._list_kind]
+        self._list_kind_button.setIcon(action.icon())
+        self._list_kind_button.setToolTip(f"{action.text()} — click the arrow for the other option")
 
     # --- highlighter colour (A4) ------------------------------------------
     def _startup_highlight_hex(self) -> str:
@@ -1490,6 +1570,7 @@ class MainWindow(QMainWindow):
         view.editorClosed.connect(self._on_editor_closed)
         view.style_provider = self.current_text_style
         view.align_provider = self.current_text_align
+        view.list_kind_provider = self.current_list_kind
         self._undo_group.addStack(view.undo_stack)
         index = self._tabs.addTab(view, view.title)
         if view.path is not None:
@@ -1641,6 +1722,15 @@ class MainWindow(QMainWindow):
             else:
                 v.begin_insert_text()
             self._sync_chrome()  # a cancelled dialog must not leave a stale check
+
+    def insert_list(self) -> None:
+        """Arm click-to-place for a NEW list of the toolbar's current kind."""
+        if (v := self.active_view) is not None:
+            if v.armed_action == "list":
+                v.cancel_armed_mode()  # clicking the checked action cancels
+            else:
+                v.begin_insert_list(self._list_kind)
+            self._sync_chrome()
 
     def insert_image(self) -> None:
         if (v := self.active_view) is not None:
@@ -2575,6 +2665,7 @@ class MainWindow(QMainWindow):
         # Armed one-shot modes show as checked on their launching action (U4).
         armed = view.armed_action if view is not None else None
         self._insert_text_action.setChecked(armed == "text")
+        self._insert_list_action.setChecked(armed == "list")
         self._insert_image_action.setChecked(armed == "image")
         self._place_signature_action.setChecked(armed == "sign")
         self._place_initials_action.setChecked(armed == "initials")
