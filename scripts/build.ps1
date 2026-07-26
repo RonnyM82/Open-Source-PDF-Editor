@@ -35,15 +35,23 @@ function Fail($msg) { Write-Host "BUILD FAILED: $msg" -ForegroundColor Red; exit
 # reliably reach the host terminal. Echoing the captured text is what makes a
 # passing smoke VISIBLE - a silent pass and a skipped step look identical, and
 # this project has been bitten by false greens twice.
-function Invoke-Smoke($exePath) {
+# Each verdict is ALSO collected into $script:smokeLog and restated in the final
+# summary: the live line sits above a wall of PyInstaller logging, which is a
+# poor place to leave the only evidence that the bundle was actually verified.
+$script:smokeLog = @()
+
+function Invoke-Smoke($exePath, $label) {
     $outFile = Join-Path $env:TEMP "pdf-editor-smoke-stdout.txt"
     $proc = Start-Process -FilePath $exePath -Wait -PassThru -NoNewWindow `
         -RedirectStandardOutput $outFile
+    $verdict = "(no output)"
     if (Test-Path $outFile) {
         $text = (Get-Content $outFile -Raw)
-        if ($text -and $text.Trim()) { Write-Host "  $($text.Trim())" }
+        if ($text -and $text.Trim()) { $verdict = $text.Trim() }
         Remove-Item $outFile -Force -ErrorAction SilentlyContinue
     }
+    Write-Host "  $verdict"
+    $script:smokeLog += "{0,-22} {1}" -f $label, $verdict
     return $proc.ExitCode
 }
 
@@ -91,7 +99,7 @@ if (-not $SkipSmoke) {
         Step "Smoke: render + print pipeline"
         $env:PDF_EDITOR_SMOKE = $sample
         $env:PDF_EDITOR_PRINT_OUT = (Join-Path $tmp "print.pdf")
-        try { $rc = Invoke-Smoke $exe } finally {
+        try { $rc = Invoke-Smoke $exe "render + print" } finally {
             Remove-Item Env:\PDF_EDITOR_SMOKE, Env:\PDF_EDITOR_PRINT_OUT -ErrorAction SilentlyContinue
         }
         if ($rc -ne 0) { Fail "render/print smoke failed (exit $rc)." }
@@ -99,7 +107,7 @@ if (-not $SkipSmoke) {
 
         Step "Smoke: OCR (bundled tesseract)"
         $env:PDF_EDITOR_OCR_SMOKE = $sample
-        try { $rc = Invoke-Smoke $exe } finally {
+        try { $rc = Invoke-Smoke $exe "OCR" } finally {
             Remove-Item Env:\PDF_EDITOR_OCR_SMOKE -ErrorAction SilentlyContinue
         }
         if ($rc -ne 0) { Fail "OCR smoke failed (exit $rc)." }
@@ -109,7 +117,7 @@ if (-not $SkipSmoke) {
         Step "Smoke: TESSDATA_PREFIX hijack probe"
         $env:PDF_EDITOR_OCR_SMOKE = $sample
         $env:TESSDATA_PREFIX = (Join-Path $tmp "no-such-tessdata")
-        try { $rc = Invoke-Smoke $exe } finally {
+        try { $rc = Invoke-Smoke $exe "hijack probe" } finally {
             Remove-Item Env:\PDF_EDITOR_OCR_SMOKE, Env:\TESSDATA_PREFIX -ErrorAction SilentlyContinue
         }
         if ($rc -ne 0) { Fail "hijack probe failed - a global TESSDATA_PREFIX broke the bundled OCR." }
@@ -136,6 +144,13 @@ if ($Installer) {
 $version = Get-AppVersion
 $elapsed = [int]((Get-Date) - $started).TotalSeconds
 Write-Host "`n=== BUILD OK (v$version, ${elapsed}s) ===" -ForegroundColor Green
+if ($smokeLog.Count -gt 0) {
+    Write-Host "Frozen-exe smokes:"
+    $smokeLog | ForEach-Object { Write-Host "  $_" }
+} else {
+    Write-Host "Frozen-exe smokes: NOT RUN" -ForegroundColor Yellow
+}
+Write-Host "Artifacts:"
 Get-ChildItem -Path (Join-Path $root "dist") -File |
     Where-Object { $_.Name -like "pdf-editor-*" } |
     ForEach-Object { Write-Host ("  {0}  ({1:N1} MB)" -f $_.Name, ($_.Length / 1MB)) }
