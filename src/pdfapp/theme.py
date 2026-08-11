@@ -22,12 +22,18 @@ launch starts dark.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from collections.abc import Callable
+from pathlib import Path
 
+import qt_material
+import qt_material.resources.generate as qt_material_generate
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QApplication
 from qt_material import apply_stylesheet
+
+from pdfapp import portable
 
 DARK = "dark"
 LIGHT = "light"
@@ -217,6 +223,38 @@ _mode: str = DARK
 _callbacks: list[Callable[[str], None]] = []
 
 
+def _configure_material_cache() -> None:
+    """Put qt-material's generated SVG cache in the app's writable data dir.
+
+    qt-material defaults to ``~/.qt_material`` and treats a permission failure
+    there as fatal. Corporate Windows profiles can make that location
+    read-only, while :func:`portable.data_dir` is already the app's designated
+    writable location. qt-material copies the constant into two modules, so
+    keep both in sync before each theme build.
+    """
+    candidates = (
+        portable.data_dir() / "qt-material",
+        Path(tempfile.gettempdir()) / "PDF Editor" / "qt-material",
+    )
+    last_error: OSError | None = None
+    for cache in candidates:
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            # An existing directory can itself be read-only. Probe an actual
+            # file creation before handing the path to qt-material.
+            with tempfile.NamedTemporaryFile(dir=cache):
+                pass
+        except OSError as exc:
+            last_error = exc
+            continue
+        cache_str = str(cache)
+        qt_material.RESOURCES_PATH = cache_str
+        qt_material_generate.RESOURCES_PATH = cache_str
+        return
+    assert last_error is not None
+    raise last_error
+
+
 def _apply_stylesheet_resilient(app: QApplication, theme_file: str, invert: bool) -> None:
     """``apply_stylesheet`` with a small retry on the concurrent-cache race.
 
@@ -229,6 +267,7 @@ def _apply_stylesheet_resilient(app: QApplication, theme_file: str, invert: bool
     couple of retries let the racing rebuild finish. A genuinely broken bundle
     still fails: the retries exhaust and re-raise, and the empty-stylesheet
     check in the caller stays loud."""
+    _configure_material_cache()
     attempts = 3
     for i in range(attempts):
         try:
