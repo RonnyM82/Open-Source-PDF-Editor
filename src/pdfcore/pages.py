@@ -108,6 +108,49 @@ def insert_from(
         )
 
 
+def insert_blank(doc: pymupdf.Document, at: int, width: float, height: float) -> None:
+    """Insert one blank page at ``at`` with dimensions in PDF points."""
+    if not 0 <= at <= doc.page_count:
+        raise ValueError(f"insertion index {at} is outside this {doc.page_count}-page document")
+    if width <= 0 or height <= 0:
+        raise ValueError("page width and height must be positive")
+
+    old_count = doc.page_count
+    doc.new_page(pno=at, width=width, height=height)
+    boxregistry.remap_pages(doc, {i: (i + 1 if i >= at else i) for i in range(old_count)})
+
+
+def extract(doc: pymupdf.Document, page_nos: Iterable[int], out: str | Path) -> None:
+    """Export selected pages from the current in-memory document to a new PDF."""
+    selected = list(page_nos)
+    if not selected:
+        raise ValueError("extract requires at least one page")
+    if len(set(selected)) != len(selected):
+        raise ValueError("extract page indices must be unique")
+    if any(n < 0 or n >= doc.page_count for n in selected):
+        raise ValueError("extract page index is outside the document")
+
+    dst = pymupdf.open()
+    try:
+        for n in selected:
+            dst.insert_pdf(doc, from_page=n, to_page=n)
+
+        boxes_before = boxregistry.read_boxes(doc)
+        if boxes_before:
+            mapping = {old: new for new, old in enumerate(selected)}
+            boxregistry.write_boxes(
+                dst,
+                [
+                    boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text)
+                    for b in boxes_before
+                    if b.page in mapping
+                ],
+            )
+        dst.save(str(out), garbage=4, deflate=True)
+    finally:
+        dst.close()
+
+
 def merge(paths: Iterable[str | Path], out: str | Path) -> None:
     """Concatenate several PDFs into a new file ``out`` (in the given order)."""
     inputs = [Path(p) for p in paths]

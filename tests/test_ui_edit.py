@@ -124,3 +124,51 @@ def test_insert_from_path_inserts_after_current(qapp, multipage_pdf, tmp_path):
         assert view._thumbnails.count() == 6
     finally:
         window.close()
+
+
+def test_page_menu_exposes_basic_page_management(qapp):
+    window = MainWindow()
+    try:
+        actions = window._page_menu.actions()
+        assert window._add_blank_page_action in actions
+        assert window._insert_action in actions
+        assert window._extract_page_action in actions
+        assert window._delete_action in actions
+    finally:
+        window.close()
+
+
+def test_add_blank_page_is_undoable(qapp, multipage_pdf):
+    window = MainWindow()
+    try:
+        window.open_path(multipage_pdf)
+        view = window.active_view
+        view.set_edit_mode(True)
+        window.go_to_page(1)
+        window.add_blank_page()
+        assert view.page_count == 6
+        assert view.current_page == 2
+        assert view.document._doc[2].get_text().strip() == ""
+        view.undo_stack.undo()
+        assert view.page_count == 5
+    finally:
+        window.close()
+
+
+def test_extract_current_page_includes_unsaved_edits(qapp, multipage_pdf, tmp_path):
+    window = MainWindow()
+    try:
+        window.open_path(multipage_pdf)
+        view = window.active_view
+        window.go_to_page(2)
+        window.rotate_clockwise()
+        out = tmp_path / "extracted.pdf"
+        assert view.extract_current_page(out)
+        doc = pymupdf.open(out)
+        try:
+            assert doc.page_count == 1
+            assert doc[0].rotation == 90
+        finally:
+            doc.close()
+    finally:
+        window.close()

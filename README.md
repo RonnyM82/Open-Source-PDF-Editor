@@ -44,8 +44,9 @@ zoom (fit-page / fit-width / ±, Ctrl+wheel), a thumbnail sidebar, and print
 (colour/BW, paper size, per-page orientation, preview). Note: saving a
 password-protected file writes the output unencrypted.
 
-**Page manipulation:** rotate, delete, reorder (move up/down), insert pages from
-another file, merge several PDFs, split into ranges — plus Save / Save As with an
+**Page manipulation:** add blank pages, extract a page to its own PDF, rotate,
+delete, reorder (move up/down), insert pages from another file, merge several PDFs,
+split into ranges — plus Save / Save As with an
 atomic save-over-the-open-file.
 
 **Content editing:** documents open **read-only** — flip the Edit mode toggle

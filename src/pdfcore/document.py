@@ -220,6 +220,14 @@ class PdfDocument:
         """Insert pages from another PDF file at index ``at``."""
         pages.insert_from(self._doc, src_path, at, from_page, to_page)
 
+    def insert_blank(self, at: int, width: float, height: float) -> None:
+        """Insert a blank page with dimensions in PDF points at ``at``."""
+        pages.insert_blank(self._doc, at, width, height)
+
+    def extract_pages(self, page_nos: Iterable[int], out: str | Path) -> None:
+        """Export pages from the current in-memory state to a new PDF."""
+        pages.extract(self._doc, page_nos, out)
+
     # --- persistence ----------------------------------------------------
     def save(self, path: str | Path) -> None:
         """Save a cleaned, compressed copy to a NEW path.

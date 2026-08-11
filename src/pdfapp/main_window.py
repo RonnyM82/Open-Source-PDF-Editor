@@ -335,8 +335,15 @@ class MainWindow(QMainWindow):
         self._delete_action.setShortcut("Ctrl+Delete")
         self._delete_action.triggered.connect(self.delete_current_page)
 
+        self._add_blank_page_action = QAction("Add &blank page", self)
+        self._add_blank_page_action.setShortcut("Ctrl+Shift+Insert")
+        self._add_blank_page_action.triggered.connect(self.add_blank_page)
+
         self._insert_action = QAction("&Insert pages from file…", self)
         self._insert_action.triggered.connect(self.insert_pages_from_file)
+
+        self._extract_page_action = QAction("&Extract current page as PDF…", self)
+        self._extract_page_action.triggered.connect(self.extract_current_page)
 
         # Help → the U7 gestures cheat sheet. Never gated — read-only users
         # need it to learn that Edit mode exists.
@@ -425,6 +432,7 @@ class MainWindow(QMainWindow):
             self._move_up_action,
             self._move_down_action,
             self._delete_action,
+            self._add_blank_page_action,
             self._insert_action,
             self._insert_text_action,
             self._insert_image_action,
@@ -517,7 +525,11 @@ class MainWindow(QMainWindow):
             self._move_up_action: "Move page up (Ctrl+Shift+Up)",
             self._move_down_action: "Move page down (Ctrl+Shift+Down)",
             self._delete_action: "Delete page (Ctrl+Delete)",
+            self._add_blank_page_action: (
+                "Add a blank page after the current page (Ctrl+Shift+Insert)"
+            ),
             self._insert_action: "Insert pages from another PDF",
+            self._extract_page_action: "Save the current page as a separate PDF",
             self._gestures_action: "Every editing gesture on one page",
             self._extract_text_action: "Extract the document's text (OCR for scanned pages)",
             self._detect_links_action: (
@@ -588,8 +600,26 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._undo_action)
         edit_menu.addAction(self._redo_action)
         edit_menu.addSeparator()
-        for action in self._page_edit_actions:
+        for action in (
+            self._insert_text_action,
+            self._insert_image_action,
+            self._hyperlink_action,
+            self._place_initials_action,
+        ):
             edit_menu.addAction(action)
+
+        self._page_menu = self.menuBar().addMenu("&Page")
+        self._page_menu.addAction(self._add_blank_page_action)
+        self._page_menu.addAction(self._insert_action)
+        self._page_menu.addAction(self._extract_page_action)
+        self._page_menu.addSeparator()
+        self._page_menu.addAction(self._rotate_cw_action)
+        self._page_menu.addAction(self._rotate_ccw_action)
+        self._page_menu.addSeparator()
+        self._page_menu.addAction(self._move_up_action)
+        self._page_menu.addAction(self._move_down_action)
+        self._page_menu.addSeparator()
+        self._page_menu.addAction(self._delete_action)
 
         # Annotations (markup) are their own menu — available in Markup mode,
         # not gated on edit mode. Kept as an attribute (shiboken invalidates
@@ -1562,6 +1592,10 @@ class MainWindow(QMainWindow):
         if (v := self.active_view) is not None:
             v.delete_current_page()
 
+    def add_blank_page(self) -> None:
+        if (v := self.active_view) is not None:
+            v.insert_blank_page(v.current_page + 1)
+
     def insert_text(self) -> None:
         if (v := self.active_view) is not None:
             if v.armed_action == "text":
@@ -1950,6 +1984,24 @@ class MainWindow(QMainWindow):
         if path_str:
             view.insert_from_path(Path(path_str), view.current_page + 1)
 
+    def extract_current_page(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        source = view.path
+        suggested = (
+            str(source.with_name(f"{source.stem}-page-{view.current_page + 1}.pdf"))
+            if source is not None
+            else f"document-page-{view.current_page + 1}.pdf"
+        )
+        out_str, _ = QFileDialog.getSaveFileName(
+            self, "Extract current page", suggested, "PDF files (*.pdf)"
+        )
+        if out_str and view.extract_current_page(Path(out_str)):
+            self.statusBar().showMessage(
+                f"Extracted page {view.current_page + 1} to {Path(out_str).name}", 5000
+            )
+
     def _on_edit_mode_toggled(self, checked: bool) -> None:
         if (v := self.active_view) is None or v.edit_mode == checked:
             return
@@ -2313,6 +2365,7 @@ class MainWindow(QMainWindow):
         # Read features (X1/SR2): available whenever a document is open, even
         # read-only — deliberately NOT in _page_edit_actions.
         self._extract_text_action.setEnabled(has)
+        self._extract_page_action.setEnabled(has)
         self._find_action.setEnabled(has)
         self._detect_links_action.setEnabled(has and edit_on)  # a content op
         # Signing writes a signed COPY (terminal op, never mutates the open
