@@ -63,6 +63,39 @@ def test_apply_theme_retries_the_concurrent_cache_race(theme_app, monkeypatch):
     assert "pdf-editor-addendum" in app.styleSheet()
 
 
+def test_theme_cache_uses_the_app_writable_data_dir(theme_app, monkeypatch, tmp_path):
+    """A locked-down home folder must not prevent the application from starting."""
+    import qt_material
+    import qt_material.resources.generate as qt_material_generate
+
+    app, theme = theme_app
+    data_dir = tmp_path / "writable-app-data"
+    monkeypatch.setattr(theme.portable, "data_dir", lambda: data_dir)
+
+    theme.apply_theme(app)
+
+    expected = str(data_dir / "qt-material")
+    assert qt_material.RESOURCES_PATH == expected
+    assert qt_material_generate.RESOURCES_PATH == expected
+    assert (data_dir / "qt-material" / "theme" / "disabled" / "base.svg").exists()
+
+
+def test_theme_cache_falls_back_when_app_data_is_read_only(theme_app, monkeypatch, tmp_path):
+    import qt_material
+
+    app, theme = theme_app
+    not_a_directory = tmp_path / "blocked"
+    not_a_directory.write_text("file blocks mkdir", encoding="utf-8")
+    fallback = tmp_path / "temp"
+    monkeypatch.setattr(theme.portable, "data_dir", lambda: not_a_directory)
+    monkeypatch.setattr(theme.tempfile, "gettempdir", lambda: str(fallback))
+
+    theme.apply_theme(app)
+
+    assert qt_material.RESOURCES_PATH == str(fallback / "PDF Editor" / "qt-material")
+    assert "pdf-editor-addendum" in app.styleSheet()
+
+
 def test_apply_theme_reraises_a_persistent_error(theme_app, monkeypatch):
     """A genuinely broken bundle (not a transient race) still fails loudly after
     the retries exhaust — the frozen-build smoke must not be masked."""
