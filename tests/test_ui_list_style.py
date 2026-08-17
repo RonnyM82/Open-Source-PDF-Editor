@@ -1,138 +1,154 @@
-"""Offscreen tests for the List style control on the text-style toolbar (L3).
+"""Offscreen tests for the list controls on the Text style toolbar (list v2).
 
-The sticky dropdown that decides what "Insert list…" creates — the same
-InstantPopup pattern as the justification button and the highlighter swatch.
-The autouse `_isolate_app_data` fixture (conftest) keeps the persisted value
-out of the developer's real profile.
+Two mutually-exclusive Bulleted/Numbered TOGGLES plus Increase/Decrease
+indent — the Acrobat Format-panel model that replaced v1's Insert-list
+command and sticky List-style dropdown. The toggles track the caret's block
+through the selectionFormatChanged flow like B/I/U, act on the open editor,
+and fall back to a one-shot command on a selected text box.
 """
 
 from __future__ import annotations
 
+import pymupdf
 import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QToolBar, QToolButton  # noqa: E402
+from PySide6.QtWidgets import QToolBar  # noqa: E402
 
 from pdfapp.main_window import MainWindow  # noqa: E402
+from pdfcore.textedit import list_item_kind  # noqa: E402
 
 
-def _blank_pdf(tmp_path):
-    import pymupdf
-
-    path = tmp_path / "blank.pdf"
+def _para_pdf(tmp_path, text="A paragraph to format as a list"):
+    path = tmp_path / "p.pdf"
     doc = pymupdf.open()
-    doc.new_page(width=595, height=842)
+    page = doc.new_page()
+    page.insert_text((100, 100), text, fontname="helv", fontsize=11)
     doc.save(str(path))
     doc.close()
     return path
 
 
-def test_list_style_button_shows_the_active_kind_with_the_other_in_its_menu(qapp):
-    window = MainWindow()
-    try:
-        assert set(window._list_kind_actions) == {"bullet", "number"}
-        assert window.current_list_kind() == "bullet"  # first-launch default
-        assert window._list_kind_actions["bullet"].isChecked()
-        assert not window._list_kind_button.icon().isNull()
-        assert window._list_kind_button.toolTip()
-        # One flat InstantPopup button (never a MenuButtonPopup split button —
-        # Fusion draws that region as a raised pill and steals ~31px of width).
-        assert window._list_kind_button.popupMode() == QToolButton.ToolButtonPopupMode.InstantPopup
-        menu = window._list_kind_button.menu()
-        assert menu is not None
-        assert [a.text() for a in menu.actions()] == ["Bulleted list", "Numbered list"]
-        assert all(not a.icon().isNull() for a in menu.actions())
-    finally:
-        window.close()
+def _edit_view(window, tmp_path, **kw):
+    window.open_path(_para_pdf(tmp_path, **kw))
+    view = window.active_view
+    view.set_edit_mode(True)
+    view._canvas.resize(800, 600)
+    return view
 
 
-def test_list_style_button_lives_on_the_style_toolbar_and_never_takes_focus(qapp):
-    """No style control may steal the caret from an open in-place editor."""
+def _geom_para(view, needle):
+    return next(p for p in view.page_geometry(0).paragraphs if needle in p.text)
+
+
+def test_list_controls_live_on_the_style_toolbar(qapp):
     window = MainWindow()
     try:
         bar = window.findChild(QToolBar, "text_style_toolbar")
-        assert window._list_kind_button.parent() is bar
-        assert window._list_kind_button.focusPolicy() == Qt.FocusPolicy.NoFocus
+        names = [a.text() for a in bar.actions()]
+        assert "Bulleted list" in names and "Numbered list" in names
+        assert "Increase indent" in names and "Decrease indent" in names
+        assert window._list_bullet_action.isCheckable()
+        assert window._list_number_action.isCheckable()
+        assert not window._list_bullet_action.icon().isNull()
+        assert not window._indent_more_action.icon().isNull()
+        # The old v1 controls are gone: no Insert-list command, no dropdown.
+        assert not hasattr(window, "_insert_list_action")
+        assert not hasattr(window, "_list_kind_button")
     finally:
         window.close()
 
 
-def test_picking_a_list_kind_makes_it_the_active_button(qapp):
+def test_toggle_formats_the_open_editor(qapp, tmp_path):
     window = MainWindow()
     try:
-        window._pick_list_kind("number")
-        assert window.current_list_kind() == "number"
-        assert window._list_kind_actions["number"].isChecked()
-        assert not window._list_kind_actions["bullet"].isChecked()
-        icon = window._list_kind_button.icon().pixmap(20, 20).toImage()
-        assert icon == window._list_kind_actions["number"].icon().pixmap(20, 20).toImage()
+        view = _edit_view(window, tmp_path)
+        view._begin_paragraph_edit(0, _geom_para(view, "format as a list"))
+        window._toggle_list("bullet")
+        assert view._para_editor.caret_list_state() == ("bullet", 0)
+        assert window._list_bullet_action.isChecked()
+        assert not window._list_number_action.isChecked()
+        view._para_editor.commit()
+        assert view.undo_stack.count() == 1
     finally:
         window.close()
 
 
-def test_last_used_list_kind_persists_to_the_next_window(qapp):
-    w1 = MainWindow()
-    try:
-        w1._pick_list_kind("number")
-        assert w1._settings.get("last_list_kind") == "number"
-    finally:
-        w1.close()
-    w2 = MainWindow()
-    try:
-        assert w2.current_list_kind() == "number"  # the button starts there
-        assert w2._list_kind_actions["number"].isChecked()
-    finally:
-        w2.close()
-
-
-def test_corrupt_persisted_list_kind_falls_back_to_bullets(qapp):
+def test_toggles_track_the_caret_via_selection_flow(qapp, tmp_path):
     window = MainWindow()
     try:
-        window._settings.set("last_list_kind", "roman-numerals")
-        assert window._startup_list_kind() == "bullet"
+        view = _edit_view(window, tmp_path)
+        view._begin_paragraph_edit(0, _geom_para(view, "format as a list"))
+        view.toggle_editor_list("number")
+        view._on_editor_selection_changed()  # the caret-tracking flow
+        assert window._list_number_action.isChecked()
+        assert not window._list_bullet_action.isChecked()
+        view._para_editor.cancel()
+        window._on_editor_closed()
+        assert not window._list_number_action.isChecked()  # session over
     finally:
         window.close()
 
 
-def test_list_style_icons_rebake_when_the_theme_changes(theme_app):
+def test_toggle_with_no_editor_formats_the_selected_box(qapp, tmp_path):
+    """The one-shot path: select a text box, click the toggle."""
+    window = MainWindow()
+    try:
+        view = _edit_view(window, tmp_path)
+        para = _geom_para(view, "format as a list")
+        view._selection = ("text", 0, para)
+        window._toggle_list("number")
+        assert view.undo_stack.count() == 1
+        after = _geom_para(view, "format as a list")
+        assert list_item_kind(after)[0] == "number"
+        # Clicking the SAME kind on the (re-selected) item removes it.
+        view._selection = ("text", 0, after)
+        window._toggle_list("number")
+        assert view.undo_stack.count() == 2
+        assert list_item_kind(_geom_para(view, "format as a list"))[0] is None
+    finally:
+        window.close()
+
+
+def test_indent_buttons_step_the_selected_item(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        view = _edit_view(window, tmp_path)
+        para = _geom_para(view, "format as a list")
+        view._selection = ("text", 0, para)
+        window._toggle_list("bullet")
+        item = _geom_para(view, "format as a list")
+        left0 = item.bbox[0]
+        view._selection = ("text", 0, item)
+        window._indent_list(+1)
+        indented = _geom_para(view, "format as a list")
+        assert indented.bbox[0] == pytest.approx(left0 + 18.0, abs=1.5)
+    finally:
+        window.close()
+
+
+def test_list_toggle_is_inert_in_markup_mode(qapp, tmp_path):
+    """Content edits stay edit-mode gated: the toggle does nothing in Markup
+    mode (the view refuses; no command lands)."""
+    window = MainWindow()
+    try:
+        window.open_path(_para_pdf(tmp_path))
+        view = window.active_view  # markup mode (default)
+        para = next(p for p in view.page_geometry(0).paragraphs)
+        view._selection = ("text", 0, para)
+        window._toggle_list("bullet")
+        assert view.undo_stack.count() == 0
+    finally:
+        window.close()
+
+
+def test_list_icons_rebake_when_the_theme_changes(theme_app):
     app, theme = theme_app
     window = MainWindow()
     try:
-        dark = window._list_kind_button.icon().pixmap(20, 20).toImage()
+        dark = window._list_bullet_action.icon().pixmap(20, 20).toImage()
         theme.apply_theme(app, theme.LIGHT)
-        assert window._list_kind_button.icon().pixmap(20, 20).toImage() != dark
-    finally:
-        window.close()
-
-
-def test_insert_list_arms_with_the_picked_kind(qapp, tmp_path):
-    window = MainWindow()
-    try:
-        window._pick_list_kind("number")
-        window.open_path(_blank_pdf(tmp_path))
-        view = window.active_view
-        view.set_edit_mode(True)
-        window.insert_list()
-        assert view._click_action == ("list", "number")
-    finally:
-        window.close()
-
-
-def test_clicking_the_checked_insert_list_action_cancels_it(qapp, tmp_path):
-    """The U4 armed-mode convention: the launching action is checkable and
-    clicking it while checked disarms."""
-    window = MainWindow()
-    try:
-        window.open_path(_blank_pdf(tmp_path))
-        view = window.active_view
-        view.set_edit_mode(True)
-        window.insert_list()
-        assert view.armed_action == "list"
-        assert "Esc cancels" in view._canvas._armed_chip.text()
-        window.insert_list()
-        assert view.armed_action is None
-        assert not window._insert_list_action.isChecked()
+        assert window._list_bullet_action.icon().pixmap(20, 20).toImage() != dark
     finally:
         window.close()

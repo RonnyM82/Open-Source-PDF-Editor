@@ -10,7 +10,7 @@ get a single-style fallback when no matching pieces exist.
 
 ``TextEditorOverlay`` is single-line-ish (Enter commits, text selected on
 open so a value is retyped); ``ParagraphEditorOverlay`` commits on Ctrl+Enter
-(Enter = line break, or — in LIST mode, L3 — commit-and-continue) and opens
+(Enter = line break, or the next item of a live list — v2) and opens
 with the cursor at the END so typing APPENDS.
 Escape cancels. Focus-out does NOT dismiss (the style toolbar needs clicks);
 DocumentView commits an open editor on click-away or when a new edit begins.
@@ -150,10 +150,6 @@ class _RichOverlayBase(QTextEdit):
         self._line_height_px: float | None = None
         self._base_size_pt: float | None = None  # true pt the pin was built for
         self._fit_anchor = "left"  # which edge stays put when the box widens
-        # List mode (L3): only the paragraph editor ACTS on it, but the flag and
-        # the commit-time answer live here because _commit() is what reports it.
-        self._list_mode = False
-        self._continue_requested = False
         # Grow downward while typing/formatting so content stays visible —
         # BOTH editors (a tall word clipped in the single-line editor too).
         self.textChanged.connect(self._auto_grow)
@@ -177,26 +173,6 @@ class _RichOverlayBase(QTextEdit):
 
     def mark_user_sized(self) -> None:
         self._user_sized = True
-
-    # --- list mode (L3) ----------------------------------------------------
-    def set_list_mode(self, on: bool) -> None:
-        """Type a LIST here: plain Enter commits this item and asks for the
-        next one (``continue_requested``), Shift+Enter stays a line break
-        within the item, Ctrl+Enter commits and ends the list. Set AFTER
-        opening — ``open_pieces`` clears it, so a mode never leaks into the
-        next edit. Only ``ParagraphEditorOverlay`` acts on it."""
-        self._list_mode = on
-
-    @property
-    def list_mode(self) -> bool:
-        return self._list_mode
-
-    @property
-    def continue_requested(self) -> bool:
-        """True when the last commit came from a plain Enter in list mode —
-        the caller should start the next item. Read inside the ``committed``
-        handler (the signal is emitted synchronously from ``_commit``)."""
-        return self._continue_requested
 
     # --- lists (v2: live QTextList editing, the Acrobat model) --------------
     def _block_list_state(self, block) -> tuple[str | None, int, int]:
@@ -350,8 +326,6 @@ class _RichOverlayBase(QTextEdit):
         self._committed_text = None
         self._committed_pieces = []
         self._committed_blocks = None
-        self._list_mode = False  # callers opt in AFTER opening (L3)
-        self._continue_requested = False
         self._line_height_px = line_height_px
         self._base_size_pt = base_size_pt
         self.setGeometry(rect)
@@ -506,7 +480,6 @@ class _RichOverlayBase(QTextEdit):
         if not self._active:
             return
         self._active = False
-        self._continue_requested = False  # Esc ends a list, never continues it
         self.hide()
         self.cancelled.emit()
 
@@ -725,11 +698,10 @@ class ParagraphEditorOverlay(_RichOverlayBase):
     (and an invisible right-edge band) set the box width → the paragraph's
     wrap width on commit; height is visual editing room.
 
-    In LIST mode (``set_list_mode``, L3) plain Enter takes on its
-    word-processor meaning — commit this item and start the next — while
-    Shift+Enter keeps the line break and Ctrl+Enter still commits (ending the
-    list). Enter on an empty item ends it too: the commit carries no text, so
-    the caller inserts nothing.
+    In a LIST block (v2) plain Enter continues the list (Qt advances the
+    QTextList's numbering), Enter on an empty item ends it, Shift+Enter is
+    the line break WITHIN an item, Tab / Shift+Tab step the nesting level,
+    and Backspace at an item's start outdents.
     """
 
     _EDGE_PX = 7  # right-edge width-drag band
@@ -804,11 +776,6 @@ class ParagraphEditorOverlay(_RichOverlayBase):
                     # decision — the two line-break keys behave identically
                     # outside a list).
                     self.textCursor().insertBlock()
-                event.accept()
-                return
-            if self._list_mode:  # v1 L3 armed-insert continuation (dies in LR4)
-                self._continue_requested = True
-                self._commit()
                 event.accept()
                 return
             if in_list and not cursor.block().text().strip() and not cursor.hasSelection():

@@ -91,14 +91,17 @@ def test_dropdown_buttons_are_no_wider_than_a_plain_icon_button(qapp):
     the highlighter swatch already does."""
     window = MainWindow()
     try:
-        window.resize(1500, 700)
+        # Wide enough that no toolbar is squeezed: the list v2 toggles grew
+        # the style toolbar, and a cramped window compresses OTHER toolbars'
+        # buttons by a couple of px, which is layout pressure, not the split-
+        # button regression this test guards.
+        window.resize(1800, 700)
         window.show()
         qapp.processEvents()
         style_bar = window.findChild(QToolBar, "text_style_toolbar")
         bold_w = style_bar.widgetForAction(window._bold_action).width()
         assert window._align_button.width() == bold_w
         assert window._highlight_color_button.width() == bold_w
-        assert window._list_kind_button.width() == bold_w
     finally:
         window.close()
 

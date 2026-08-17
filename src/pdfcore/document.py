@@ -589,49 +589,6 @@ class PdfDocument:
         """
         return textedit.set_list_style(self._doc, n, para, kind, ordinal=ordinal, align=align)
 
-    def insert_list_item(
-        self,
-        n: int,
-        point: tuple[float, float],
-        runs: list[StyledRun],
-        kind: str,
-        *,
-        ordinal: int = 1,
-        align: str = "left",
-        pitch: float | None = None,
-        width: float | None = None,
-    ) -> textedit.ListInsertResult:
-        """Create ONE list item from scratch at a baseline point (L3).
-
-        Returns the item's box, its extracted fingerprint lines and where the
-        NEXT item of the list should start. See :func:`textedit.insert_list_item`.
-        """
-        return textedit.insert_list_item(
-            self._doc,
-            n,
-            point,
-            runs,
-            kind,
-            ordinal=ordinal,
-            align=align,
-            pitch=pitch,
-            width=width,
-        )
-
-    def next_list_item_fits(self, n: int, point: tuple[float, float]) -> bool:
-        """Whether a continued list item's baseline still sits on page ``n``."""
-        return textedit.next_item_fits(self._doc, n, point)
-
-    def slot_is_occupied(
-        self,
-        n: int,
-        rect: tuple[float, float, float, float],
-        ignore: Sequence[tuple[float, float, float, float]] = (),
-    ) -> bool:
-        """True when page text other than ``ignore`` overlaps ``rect`` — the
-        list continuation's "is the next slot free" check."""
-        return textedit.slot_is_occupied(self._doc, n, rect, ignore)
-
     def indent_list_item(
         self,
         n: int,

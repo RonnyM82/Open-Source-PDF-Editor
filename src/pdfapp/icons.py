@@ -63,7 +63,6 @@ _NAMES = {
     "new_window": "mdi6.open-in-new",
     "insert_pages": "mdi6.file-plus-outline",
     "insert_text": "mdi6.text-box-plus-outline",
-    "insert_list": "mdi6.playlist-plus",
     "insert_image": "mdi6.image-plus-outline",
     "insert_comment": "mdi6.comment-plus-outline",
     "insert_callout": "mdi6.comment-arrow-left-outline",
@@ -102,6 +101,8 @@ _NAMES = {
     "list_bulleted": "mdi6.format-list-bulleted",
     "list_numbered": "mdi6.format-list-numbered",
     "list_clear": "mdi6.format-list-checkbox",
+    "indent_more": "mdi6.format-indent-increase",
+    "indent_less": "mdi6.format-indent-decrease",
     # Tools
     "extract_text": "mdi6.text-box-search-outline",
     "detect_links": "mdi6.web",

@@ -137,7 +137,9 @@ def _dropped_pdf_paths(mime: QMimeData) -> list[Path]:
 # 3: added the "Insert link" toolbar button (hyperlink feature).
 # 4: added the "Link text" toolbar button (Word-style text links).
 # 5: added the "Insert list" toolbar button + the List style dropdown (L3).
-_STATE_VERSION = 5
+# 6: list v2 — Insert list + the List style dropdown REMOVED; Bulleted /
+#    Numbered toggles + indent buttons joined the Text style toolbar.
+_STATE_VERSION = 6
 
 
 class MainWindow(QMainWindow):
@@ -401,13 +403,10 @@ class MainWindow(QMainWindow):
         self._insert_text_action.setCheckable(True)
         self._insert_text_action.triggered.connect(self.insert_text)
 
-        # Insert list (L3): arms click-to-place like Insert text, but the editor
-        # opens in list mode — Enter commits the item and starts the next, an
-        # empty item ends the list. The KIND comes from the sticky List style
-        # dropdown on the text-style toolbar.
-        self._insert_list_action = QAction("Insert &list…", self)
-        self._insert_list_action.setCheckable(True)
-        self._insert_list_action.triggered.connect(self.insert_list)
+        # No Insert-list command (list v2): a list is a FORMAT applied inside
+        # a text box — Insert text, then the Bulleted/Numbered toggle on the
+        # Text style toolbar (the Acrobat model; the v1 placement gesture was
+        # rejected in the hands-on pass).
 
         self._insert_image_action = QAction("Insert i&mage…", self)
         self._insert_image_action.setCheckable(True)
@@ -467,7 +466,6 @@ class MainWindow(QMainWindow):
             self._add_blank_page_action,
             self._insert_action,
             self._insert_text_action,
-            self._insert_list_action,
             self._insert_image_action,
             self._hyperlink_action,
             self._place_initials_action,
@@ -517,7 +515,6 @@ class MainWindow(QMainWindow):
             self._delete_action: "delete_page",
             self._insert_action: "insert_pages",
             self._insert_text_action: "insert_text",
-            self._insert_list_action: "insert_list",
             self._insert_image_action: "insert_image",
             self._hyperlink_action: "insert_link",
             self._highlight_action: "highlight",
@@ -573,10 +570,6 @@ class MainWindow(QMainWindow):
             ),
             self._find_action: "Find in document (Ctrl+F)",
             self._insert_text_action: "Insert text — then click the page to place it",
-            self._insert_list_action: (
-                "Insert a list — click the page, then Enter starts each next item "
-                "(an empty item ends the list)"
-            ),
             self._insert_image_action: "Insert an image — then click the page to place it",
             self._hyperlink_action: (
                 "Hyperlink (Ctrl+K) — drag over text to link a run (click a word, "
@@ -648,7 +641,6 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         for action in (
             self._insert_text_action,
-            self._insert_list_action,
             self._insert_image_action,
             self._hyperlink_action,
             self._place_initials_action,
@@ -735,10 +727,9 @@ class MainWindow(QMainWindow):
         """(Re-)bake themed icons for every action — build time + theme change."""
         for action, key in self._icon_keys.items():
             action.setIcon(icons.icon(key))
-        # The dropdown buttons borrow their active option's freshly-baked icon
-        # (they are QToolButtons, so they aren't in the action map themselves).
+        # The dropdown button borrows its active option's freshly-baked icon
+        # (it is a QToolButton, so it isn't in the action map itself).
         self._update_align_button()
-        self._update_list_kind_button()
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
@@ -778,7 +769,6 @@ class MainWindow(QMainWindow):
         # the toolbar slots (E11.4, user request); the reveal-all and
         # double-click sub-mode TOGGLES moved to menu-only (less used).
         toolbar.addAction(self._insert_text_action)
-        toolbar.addAction(self._insert_list_action)
         toolbar.addAction(self._insert_image_action)
         toolbar.addAction(self._hyperlink_action)
         toolbar.addSeparator()
@@ -889,28 +879,41 @@ class MainWindow(QMainWindow):
         self._align_button = self._make_dropdown_button(align_menu, "Text alignment")
         bar.addWidget(self._align_button)
 
-        # List style (L3): what "Insert list…" creates. The SAME sticky
-        # InstantPopup pattern as alignment. Deliberately a KIND chooser, not a
-        # marker-glyph palette: base-14 fonts have no U+2022 (helv renders it as
-        # a middot), so offering ◦ ▪ – would promise glyphs we cannot reproduce
-        # — the plan's open question 2 stays open.
-        self._list_kind = self._startup_list_kind()
-        self._list_kind_actions: dict[str, QAction] = {}
-        list_menu = QMenu(self)
-        list_group = QActionGroup(self)
-        list_group.setExclusive(True)
-        for key, label in (("bullet", "Bulleted list"), ("number", "Numbered list")):
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setChecked(key == self._list_kind)
-            action.setToolTip(f"{label} (what Insert list creates)")
-            action.triggered.connect(lambda _checked=False, k=key: self._pick_list_kind(k))
-            list_group.addAction(action)
-            list_menu.addAction(action)
-            self._list_kind_actions[key] = action
-            self._icon_keys[action] = "list_bulleted" if key == "bullet" else "list_numbered"
-        self._list_kind_button = self._make_dropdown_button(list_menu, "List style")
-        bar.addWidget(self._list_kind_button)
+        # Lists (v2, the Acrobat Format-panel model): a Bulleted and a
+        # Numbered TOGGLE — mutually exclusive, tracking the caret's block
+        # while an editor is open; clicking the checked one removes the list
+        # formatting (Acrobat's own unlist gesture) — plus the two indent
+        # steps (Tab / Shift+Tab inside the editor do the same).
+        self._list_bullet_action = QAction("Bulleted list", self)
+        self._list_bullet_action.setCheckable(True)
+        self._list_bullet_action.setToolTip(
+            "Bulleted list — click again on a list to remove the formatting"
+        )
+        self._list_bullet_action.triggered.connect(lambda: self._toggle_list("bullet"))
+        bar.addAction(self._list_bullet_action)
+        self._list_number_action = QAction("Numbered list", self)
+        self._list_number_action.setCheckable(True)
+        self._list_number_action.setToolTip(
+            "Numbered list — click again on a list to remove the formatting"
+        )
+        self._list_number_action.triggered.connect(lambda: self._toggle_list("number"))
+        bar.addAction(self._list_number_action)
+        self._indent_more_action = QAction("Increase indent", self)
+        self._indent_more_action.setToolTip("Increase list indent (Tab at the start of an item)")
+        self._indent_more_action.triggered.connect(lambda: self._indent_list(+1))
+        bar.addAction(self._indent_more_action)
+        self._indent_less_action = QAction("Decrease indent", self)
+        self._indent_less_action.setToolTip("Decrease list indent (Shift+Tab)")
+        self._indent_less_action.triggered.connect(lambda: self._indent_list(-1))
+        bar.addAction(self._indent_less_action)
+        self._icon_keys.update(
+            {
+                self._list_bullet_action: "list_bulleted",
+                self._list_number_action: "list_numbered",
+                self._indent_more_action: "indent_more",
+                self._indent_less_action: "indent_less",
+            }
+        )
 
         self._text_color = QColor(0, 0, 0)
         self._color_button = QToolButton(self)
@@ -1141,43 +1144,45 @@ class MainWindow(QMainWindow):
         self._align_button.setIcon(action.icon())
         self._align_button.setToolTip(f"{action.text()} — click the arrow for other options")
 
-    # --- list style (L3) ---------------------------------------------------
-    def _startup_list_kind(self) -> str:
-        """The persisted last-used list kind (a hand-edited value falls back to
-        bullets — the do-no-harm default, and the only kind the samples use)."""
-        value = self._settings.get("last_list_kind", "bullet")
-        return value if value in LIST_KINDS else "bullet"
-
-    def current_list_kind(self) -> str:
-        """The toolbar's list kind — what Insert list creates (the view's
-        ``list_kind_provider``)."""
-        return self._list_kind
-
-    def _pick_list_kind(self, kind: str) -> None:
-        """A deliberate user pick: reflect it and persist it as the last-used
-        option. Unlike alignment this never touches an open editor — the kind
-        applies to the list the NEXT Insert list creates."""
-        if kind not in LIST_KINDS or self._populating_style:
+    # --- lists (v2) --------------------------------------------------------
+    def _toggle_list(self, kind: str) -> None:
+        """The Bulleted/Numbered toggle: format the open editor's block(s) as
+        ``kind`` (clicking the checked kind removes the formatting — the
+        Acrobat gesture), or, with no editor open, apply/clear it on the
+        selected paragraph(s) as a one-shot command."""
+        if self._populating_style or kind not in LIST_KINDS:
             return
-        self._reflect_list_kind(kind)
-        self._settings.set("last_list_kind", kind)
-
-    def _reflect_list_kind(self, kind: str) -> None:
-        """Show ``kind`` as the active option (state + button + checkmarks)."""
-        if kind not in LIST_KINDS:
+        view = self.active_view
+        if view is None:
+            self._reflect_list_toggles(None)
             return
-        self._list_kind = kind
-        for key, action in self._list_kind_actions.items():
-            action.setChecked(key == kind)
-        self._update_list_kind_button()
-
-    def _update_list_kind_button(self) -> None:
-        """The button wears the ACTIVE option's icon and name."""
-        if not hasattr(self, "_list_kind_button"):
+        if view.toggle_editor_list(kind):
+            self._reflect_list_toggles(view.editor_list_kind())
+            view.focus_open_editor()
             return
-        action = self._list_kind_actions[self._list_kind]
-        self._list_kind_button.setIcon(action.icon())
-        self._list_kind_button.setToolTip(f"{action.text()} — click the arrow for the other option")
+        view.toggle_list_on_selection(kind)
+        self._reflect_list_toggles(None)  # one-shot command; no live caret to track
+
+    def _indent_list(self, delta: int) -> None:
+        """Increase/decrease list indent: the open editor's item(s), or the
+        selected list paragraph(s) as a one-shot command."""
+        view = self.active_view
+        if view is None:
+            return
+        if view.indent_editor_list(delta):
+            view.focus_open_editor()
+            return
+        view.indent_selection_lists(delta)
+
+    def _reflect_list_toggles(self, kind: str | None) -> None:
+        """Check the toggle matching the caret's list kind (display only)."""
+        was = self._populating_style
+        self._populating_style = True
+        try:
+            self._list_bullet_action.setChecked(kind == "bullet")
+            self._list_number_action.setChecked(kind == "number")
+        finally:
+            self._populating_style = was
 
     # --- highlighter colour (A4) ------------------------------------------
     def _startup_highlight_hex(self) -> str:
@@ -1321,6 +1326,11 @@ class MainWindow(QMainWindow):
             else:
                 self._text_color = QColor((color >> 16) & 255, (color >> 8) & 255, color & 255)
                 self._update_color_swatch()
+            # The list toggles track the caret's block (list v2) — checked on
+            # the matching kind, both clear on plain text or a mixed span.
+            kind = fmt.get("list_kind")
+            self._list_bullet_action.setChecked(kind == "bullet")
+            self._list_number_action.setChecked(kind == "number")
         finally:
             self._populating_style = False
 
@@ -1370,6 +1380,10 @@ class MainWindow(QMainWindow):
             self._text_color = QColor(style["color"])
             self._update_color_swatch()
             self._reflect_text_align(style["align"])
+            # Lists are per-box structure, never a global insert default —
+            # both toggles simply clear when the session ends.
+            self._list_bullet_action.setChecked(False)
+            self._list_number_action.setChecked(False)
         finally:
             self._populating_style = False
 
@@ -1570,7 +1584,6 @@ class MainWindow(QMainWindow):
         view.editorClosed.connect(self._on_editor_closed)
         view.style_provider = self.current_text_style
         view.align_provider = self.current_text_align
-        view.list_kind_provider = self.current_list_kind
         self._undo_group.addStack(view.undo_stack)
         index = self._tabs.addTab(view, view.title)
         if view.path is not None:
@@ -1722,15 +1735,6 @@ class MainWindow(QMainWindow):
             else:
                 v.begin_insert_text()
             self._sync_chrome()  # a cancelled dialog must not leave a stale check
-
-    def insert_list(self) -> None:
-        """Arm click-to-place for a NEW list of the toolbar's current kind."""
-        if (v := self.active_view) is not None:
-            if v.armed_action == "list":
-                v.cancel_armed_mode()  # clicking the checked action cancels
-            else:
-                v.begin_insert_list(self._list_kind)
-            self._sync_chrome()
 
     def insert_image(self) -> None:
         if (v := self.active_view) is not None:
@@ -2665,7 +2669,6 @@ class MainWindow(QMainWindow):
         # Armed one-shot modes show as checked on their launching action (U4).
         armed = view.armed_action if view is not None else None
         self._insert_text_action.setChecked(armed == "text")
-        self._insert_list_action.setChecked(armed == "list")
         self._insert_image_action.setChecked(armed == "image")
         self._place_signature_action.setChecked(armed == "sign")
         self._place_initials_action.setChecked(armed == "initials")
