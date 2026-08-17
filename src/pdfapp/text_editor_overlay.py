@@ -29,10 +29,24 @@ from PySide6.QtGui import (
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
+    QTextListFormat,
 )
 from PySide6.QtWidgets import QTextEdit, QWidget
 
 from pdfapp import theme
+
+# List v2: Qt list styles per (kind, level % 3) — the same per-level ladder
+# the engine's markers use (• ◦ ▪ and 1. a. i.), so the editor's WYSIWYG
+# markers match what the commit writes to the page.
+_LIST_STYLES = {
+    ("bullet", 0): QTextListFormat.Style.ListDisc,
+    ("bullet", 1): QTextListFormat.Style.ListCircle,
+    ("bullet", 2): QTextListFormat.Style.ListSquare,
+    ("number", 0): QTextListFormat.Style.ListDecimal,
+    ("number", 1): QTextListFormat.Style.ListLowerAlpha,
+    ("number", 2): QTextListFormat.Style.ListLowerRoman,
+}
+_STYLE_KINDS = {style: kind for (kind, _lvl), style in _LIST_STYLES.items()}
 
 # Forced light chrome: the editors float over a white page, and the dark app
 # theme must NOT bleed into them (a dark box over the white page —
@@ -146,6 +160,7 @@ class _RichOverlayBase(QTextEdit):
         self._grip = _CornerGrip(self)
         self._committed_text: str | None = None
         self._committed_pieces: list[tuple[str, QTextCharFormat]] = []
+        self._committed_blocks: list[tuple[str | None, int, int]] | None = None
         # A scrollbar appearing/disappearing must shove the grip clear of it.
         self.verticalScrollBar().rangeChanged.connect(lambda *_: self._reposition_grip())
         self.horizontalScrollBar().rangeChanged.connect(lambda *_: self._reposition_grip())
@@ -183,6 +198,127 @@ class _RichOverlayBase(QTextEdit):
         handler (the signal is emitted synchronously from ``_commit``)."""
         return self._continue_requested
 
+    # --- lists (v2: live QTextList editing, the Acrobat model) --------------
+    def _block_list_state(self, block) -> tuple[str | None, int, int]:
+        """``(kind, level, ordinal)`` of a block from its QTextList — level
+        from the list format's indent (Qt lists start at indent 1), ordinal
+        from the list's start + the block's position in it."""
+        text_list = block.textList()
+        if text_list is None:
+            return (None, 0, 1)
+        fmt = text_list.format()
+        kind = _STYLE_KINDS.get(fmt.style(), "bullet")  # unknown styles read as bullets
+        level = max(0, fmt.indent() - 1)
+        start = fmt.start() if fmt.start() > 0 else 1
+        return (kind, level, start + text_list.itemNumber(block))
+
+    def blocks_state(self) -> list[tuple[str | None, int, int]]:
+        """Every block's ``(kind, level, ordinal)`` in order — what the
+        commit conversion turns into engine ListBlocks."""
+        out: list[tuple[str | None, int, int]] = []
+        block = self.document().begin()
+        while block.isValid():
+            out.append(self._block_list_state(block))
+            block = block.next()
+        return out
+
+    def caret_list_state(self) -> tuple[str | None, int]:
+        """The caret block's (kind, level) — the toolbar toggles' state."""
+        kind, level, _ordinal = self._block_list_state(self.textCursor().block())
+        return kind, level
+
+    def _selected_blocks(self) -> list:
+        cursor = self.textCursor()
+        doc = self.document()
+        block = doc.findBlock(cursor.selectionStart())
+        last = doc.findBlock(cursor.selectionEnd())
+        blocks = []
+        while block.isValid():
+            blocks.append(block)
+            if block == last:
+                break
+            block = block.next()
+        return blocks
+
+    def _apply_list_format(self, block, kind: str, level: int, start: int = 1) -> None:
+        fmt = QTextListFormat()
+        fmt.setStyle(_LIST_STYLES[(kind, level % 3)])
+        fmt.setIndent(level + 1)
+        if start > 1:
+            fmt.setStart(start)
+        QTextCursor(block).createList(fmt)
+
+    def _remove_list_format(self, block) -> None:
+        text_list = block.textList()
+        if text_list is None:
+            return
+        text_list.remove(block)
+        fmt = QTextBlockFormat()
+        fmt.setIndent(0)
+        QTextCursor(block).mergeBlockFormat(fmt)
+
+    def toggle_list(self, kind: str) -> None:
+        """Format the selection's blocks as a ``kind`` list — or, when they
+        already ARE that kind, remove the formatting (Acrobat: clicking the
+        highlighted list type unlists). Converting keeps each block's level."""
+        blocks = self._selected_blocks()
+        if not blocks:
+            return
+        if all(self._block_list_state(b)[0] == kind for b in blocks):
+            for block in blocks:
+                self._remove_list_format(block)
+        else:
+            for block in blocks:
+                current, level, _ = self._block_list_state(block)
+                self._apply_list_format(block, kind, level if current is not None else 0)
+        self._normalize_lists()
+        self._refresh_line_heights()
+        self._auto_grow()
+
+    def indent_list(self, delta: int) -> bool:
+        """Step the selection's LIST blocks one level deeper/shallower.
+        Outdenting a level-0 block removes its list formatting (Word).
+        False when no list block is selected (the caller beeps/refuses)."""
+        blocks = [b for b in self._selected_blocks() if b.textList() is not None]
+        if not blocks:
+            return False
+        for block in blocks:
+            kind, level, _ = self._block_list_state(block)
+            new_level = level + (1 if delta > 0 else -1)
+            if new_level < 0:
+                self._remove_list_format(block)
+            else:
+                self._apply_list_format(block, kind, new_level)
+        self._normalize_lists()
+        return True
+
+    def _normalize_lists(self) -> None:
+        """Merge consecutive same-style same-level runs into ONE QTextList so
+        numbering is continuous — Qt numbers per list object, and two
+        adjacent lists would both read "1." A nested run does not break its
+        parent's numbering (the outer list resumes); a plain block does."""
+        open_lists: dict[int, object] = {}  # indent -> the QTextList to join
+        block = self.document().begin()
+        while block.isValid():
+            text_list = block.textList()
+            if text_list is None:
+                open_lists.clear()
+            else:
+                fmt = text_list.format()
+                indent = fmt.indent()
+                for deeper in [i for i in open_lists if i > indent]:
+                    del open_lists[deeper]  # returning shallower closes deeper runs
+                existing = open_lists.get(indent)
+                if (
+                    existing is not None
+                    and existing.format().style() == fmt.style()
+                    and text_list is not existing
+                ):
+                    existing.add(block)
+                else:
+                    open_lists[indent] = block.textList()
+            block = block.next()
+
     # --- open/commit/cancel -------------------------------------------------
     def open_pieces(
         self,
@@ -194,6 +330,8 @@ class _RichOverlayBase(QTextEdit):
         fit_content: bool = False,
         alignment: Qt.AlignmentFlag | None = None,
         base_size_pt: float | None = None,
+        list_specs: list[tuple[str, int, int] | None] | None = None,
+        indent_width_px: float | None = None,
     ) -> None:
         """Show the editor prefilled with formatted pieces ("\\n" = break).
 
@@ -211,18 +349,36 @@ class _RichOverlayBase(QTextEdit):
         self._user_sized = False
         self._committed_text = None
         self._committed_pieces = []
+        self._committed_blocks = None
         self._list_mode = False  # callers opt in AFTER opening (L3)
         self._continue_requested = False
         self._line_height_px = line_height_px
         self._base_size_pt = base_size_pt
         self.setGeometry(rect)
         self.clear()
+        if indent_width_px is not None and indent_width_px > 0:
+            # A list level's on-screen indent matches the page's 18 pt step
+            # at the current zoom (Qt's default is a fixed 40 px).
+            self.document().setIndentWidth(indent_width_px)
         cursor = self.textCursor()
         for text, fmt in pieces:
             if text == "\n":
                 cursor.insertBlock()
             elif text:
                 cursor.insertText(text, fmt)
+        if list_specs:
+            # Seed QTextLists AFTER the text is in place: one spec per block
+            # ((kind, level, start_ordinal) or None); consecutive same-kind
+            # runs then merge so live numbering is continuous.
+            block = self.document().begin()
+            for spec in list_specs:
+                if not block.isValid():
+                    break
+                if spec is not None:
+                    kind, level, start = spec
+                    self._apply_list_format(block, kind, level, start)
+                block = block.next()
+            self._normalize_lists()
         self._fit_anchor = "left"
         if alignment == Qt.AlignmentFlag.AlignRight:
             self._fit_anchor = "right"
@@ -342,6 +498,7 @@ class _RichOverlayBase(QTextEdit):
         self._active = False
         self._committed_text = self.toPlainText()
         self._committed_pieces = self._pieces()
+        self._committed_blocks = self.blocks_state()
         self.hide()
         self.committed.emit(self._committed_text)
 
@@ -361,6 +518,13 @@ class _RichOverlayBase(QTextEdit):
         """
         if self._committed_text is not None and self._committed_text == text:
             return self._committed_pieces
+        return None
+
+    def committed_blocks_for(self, text: str) -> list[tuple[str | None, int, int]] | None:
+        """Per-block ``(kind, level, ordinal)`` of the last commit, iff it
+        matches ``text`` — None for direct calls (tests), like the pieces."""
+        if self._committed_text is not None and self._committed_text == text:
+            return self._committed_blocks
         return None
 
     def _pieces(self) -> list[tuple[str, QTextCharFormat]]:
@@ -619,28 +783,59 @@ class ParagraphEditorOverlay(_RichOverlayBase):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        key = event.key()
+        cursor = self.textCursor()
+        in_list = cursor.block().textList() is not None
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             mods = event.modifiers()
             if mods & Qt.KeyboardModifier.ControlModifier:
                 self._commit()  # apply (and, in list mode, end the list)
                 event.accept()
                 return
-            # List mode only: plain Enter finishes this item and asks for the
-            # next. Shift+Enter stays a line break — that is how a list item
-            # gets a second line now that Enter means something else.
             if mods & Qt.KeyboardModifier.ShiftModifier:
-                # Explicitly a BLOCK break. QTextEdit's own Shift+Enter inserts
-                # U+2028 (a soft break inside the block), which `_pieces` hands
-                # to the engine INSIDE a fragment — the engine then laid the
-                # whole thing out as one overlong line (the engine now also
-                # translates it, but producing a real break here keeps the
-                # editor's two line-break keys identical).
-                self.textCursor().insertBlock()
+                if in_list:
+                    # A line break WITHIN the item: QTextEdit's native soft
+                    # break (U+2028) stays inside the block, so the item
+                    # remains ONE engine block and the engine translates the
+                    # separator (probe-verified at L3).
+                    super().keyPressEvent(event)
+                else:
+                    # Plain blocks keep the explicit BLOCK break (the L3
+                    # decision — the two line-break keys behave identically
+                    # outside a list).
+                    self.textCursor().insertBlock()
                 event.accept()
                 return
-            if self._list_mode:
+            if self._list_mode:  # v1 L3 armed-insert continuation (dies in LR4)
                 self._continue_requested = True
                 self._commit()
                 event.accept()
                 return
+            if in_list and not cursor.block().text().strip() and not cursor.hasSelection():
+                # Enter on an EMPTY item ends the list (Word/Acrobat): the
+                # empty block becomes a plain paragraph instead of item N+1.
+                self._remove_list_format(cursor.block())
+                event.accept()
+                return
+            # Enter inside a list item: Qt continues the list (the new block
+            # joins the same QTextList and numbering advances) — default.
+        elif key == Qt.Key.Key_Tab and in_list and cursor.atBlockStart():
+            if self.indent_list(+1):
+                event.accept()
+                return
+        elif key == Qt.Key.Key_Backtab and in_list:
+            if self.indent_list(-1):
+                event.accept()
+                return
+        elif (
+            key == Qt.Key.Key_Backspace
+            and in_list
+            and cursor.atBlockStart()
+            and not cursor.hasSelection()
+        ):
+            # Backspace at the start of an item outdents it a level, then
+            # (at level 0) removes the list formatting — the Word habit.
+            self.indent_list(-1)
+            event.accept()
+            return
         super().keyPressEvent(event)

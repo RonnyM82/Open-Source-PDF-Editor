@@ -326,6 +326,43 @@ def _block_marker_style(spec: ListBlock, group: list[StyledRun]) -> TextStyle:
     return TextStyle(code=base.code, size=base.size, color=base.color)
 
 
+def _marker_gutter(style: TextStyle, kind: str, level: int, marker: str) -> float:
+    """A list block's left gutter: its level indent plus the hanging indent
+    its marker needs (the layout's own rule, shared so the width logic and
+    the layout agree)."""
+    text = (marker or marker_text(kind, level, 1)) + " "
+    hang = max(_LIST_HANG, _style_text_width(style, text) + _MARKER_GAP)
+    return level * LIST_INDENT_STEP + hang
+
+
+def _blocks_gutter(runs: list[StyledRun], blocks: Sequence[ListBlock | None]) -> float:
+    """The deepest gutter the given blocks will lay out with."""
+    gutter = 0.0
+    for spec, group in zip(blocks, _split_block_runs(runs), strict=False):
+        if spec is None or spec.kind is None:
+            continue
+        style = _block_marker_style(spec, group)
+        gutter = max(gutter, _marker_gutter(style, spec.kind, spec.level, spec.marker))
+    return gutter
+
+
+def _specs_gutter(specs: Sequence[BlockSpec]) -> float:
+    """The deepest gutter a paragraph's EXISTING list blocks occupy — the
+    old half of the widen-by-the-difference rule (helv-measured; the marker
+    font's widths differ by well under the _LIST_HANG floor)."""
+    gutter = 0.0
+    for spec in specs:
+        if spec.kind is None:
+            continue
+        size = next(
+            (s.size for line in spec.lines for s in line if s.text.strip()),
+            11.0,
+        )
+        style = TextStyle(size=size)
+        gutter = max(gutter, _marker_gutter(style, spec.kind, spec.level, spec.marker))
+    return gutter
+
+
 def _layout_block_runs(
     runs: list[StyledRun],
     blocks: Sequence[ListBlock | None],
@@ -2159,6 +2196,14 @@ def replace_paragraph_runs(
         hang = 0.0
         marker_runs, body_runs, keep_span = None, runs, None
         align_val = "left"
+        if width is None:
+            # The box widens by the DIFFERENCE between the new and existing
+            # marker gutters: converting plain text adds the gutter once so
+            # the body does not spuriously wrap behind the marker, while
+            # re-committing an existing list adds nothing (no width creep),
+            # and an explicit ``width`` (a user drag) always wins.
+            grown = _blocks_gutter(runs, blocks) - _specs_gutter(paragraph_blocks(para))
+            wrap = max(20.0, wrap + max(0.0, grown))
         body_wrap = wrap
         lines = _layout_block_runs(runs, blocks, wrap, slack=_GROW_WIDTH_FACTOR)
     else:
@@ -2623,13 +2668,10 @@ def _rebuild_blocks(
     runs = []
     blocks: list[ListBlock] = []
     counters: dict[int, int] = {}
-    para_width = para.bbox[2] - para.bbox[0]
-    extra = 0.0
     for i, (spec, (kind, level)) in enumerate(zip(specs, new_fmt, strict=True)):
         if i:
             runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
-        body = _spec_body_runs(spec)
-        runs.extend(body)
+        runs.extend(_spec_body_runs(spec))
         if kind is None:
             blocks.append(ListBlock(None, 0))
             continue
@@ -2640,18 +2682,10 @@ def _rebuild_blocks(
             counters[level] = ordinal
         else:
             ordinal = 1
-        mtext = marker_text(kind, level, ordinal)
-        block = ListBlock(kind, level, mtext)
-        blocks.append(block)
-        style = _block_marker_style(block, body)
-        hang = max(_LIST_HANG, _style_text_width(style, mtext + " ") + 2.0)
-        extra = max(extra, level * LIST_INDENT_STEP + hang)
-    # The box GROWS by the deepest marker gutter so short body text is not
-    # spuriously wrapped by the marker (the v1 rule, generalised per level).
-    width = para_width + extra
-    return replace_paragraph_runs(
-        doc, page_index, para, runs, blocks=blocks, width=width, align=align
-    )
+        blocks.append(ListBlock(kind, level, marker_text(kind, level, ordinal)))
+    # No explicit width: the engine widens the box by the marker-gutter
+    # DIFFERENCE itself (plain -> list grows once, re-formatting never creeps).
+    return replace_paragraph_runs(doc, page_index, para, runs, blocks=blocks, align=align)
 
 
 def set_list_style(

@@ -1254,8 +1254,9 @@ def _bullet_list_pdf(tmp_path):
 
 
 def test_ui_bullet_item_opens_grouped_with_marker(qapp, tmp_path):
-    """Double-clicking a bulleted item opens the WHOLE item (marker + body) as
-    one hanging-indent paragraph, and an unchanged commit is a no-op."""
+    """Double-clicking a bulleted item opens the WHOLE item as one list
+    block: the marker becomes LIVE list structure (a QTextList bullet, not
+    editable text — list v2), and an unchanged commit is a no-op."""
     window = MainWindow()
     try:
         window.open_path(_bullet_list_pdf(tmp_path))
@@ -1266,7 +1267,10 @@ def test_ui_bullet_item_opens_grouped_with_marker(qapp, tmp_path):
         assert para is not None and para.hang_indent > 0
         view._begin_paragraph_edit(0, para)
         editor = view._para_editor
-        assert editor.toPlainText().lstrip()[:1] in ("•", "·")  # marker shown
+        assert editor.caret_list_state() == ("bullet", 0)  # live list structure
+        text = editor.toPlainText()
+        assert "Second short item." in text
+        assert text.lstrip()[:1] not in ("•", "·")  # the marker is not TEXT any more
         editor.commit()  # unchanged
         assert view.undo_stack.count() == 0
     finally:

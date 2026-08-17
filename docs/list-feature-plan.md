@@ -298,10 +298,16 @@ round-trip tests for every mutating op).
   including the round trip: commit blocks with LR1, re-detect, get the same
   structure back.
 - **LR3, editor integration.** Seeding, toggles, key handling, commit
-  conversion, indent refusal, `indentWidth` zoom mapping, and the removal
-  of the v1 kept-span machinery in `replace_paragraph_runs` now that every
-  commit redraws markers from structure. Offscreen UI tests drive the
+  conversion, `indentWidth` zoom mapping. Offscreen UI tests drive the
   editor document and commit handlers directly (the established pattern).
+  The kept-span machinery stays even after this milestone: box MOVES,
+  align/distribute and hyperlink styling still re-lay a paragraph without
+  block awareness, and the kept span is what preserves an imported bullet
+  there. LR4 makes those paths block-aware (a moved list re-lays as the
+  same list), and the kept-span path can only retire after that. A too-deep
+  indent is refused at COMMIT time by the engine's width check rather than
+  at the Tab keystroke; Acrobat refuses at the keystroke, and moving the
+  check earlier is a polish item for the manual pass to judge.
 - **LR4, chrome + removal of v1.** Toolbar toggles + indent buttons with
   selection tracking, menu rebuild, delete the L3 machinery end to end
   (UI, engine, settings, help), `_STATE_VERSION` bump, cheat sheet.

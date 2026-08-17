@@ -51,6 +51,7 @@ from pdfapp.undo import SnapshotCommand, undo_limit_for
 from pdfcore import links, protect, textselect
 from pdfcore.document import PdfDocument
 from pdfcore.links import LinkInfo
+from pdfcore.lists import marker_text
 from pdfcore.textedit import (
     FLAG_BOLD,
     FLAG_ITALIC,
@@ -59,6 +60,7 @@ from pdfcore.textedit import (
     SCRIPT_NORMAL,
     SCRIPT_SUB,
     SCRIPT_SUPER,
+    ListBlock,
     Paragraph,
     StyledRun,
     TextSpan,
@@ -68,6 +70,7 @@ from pdfcore.textedit import (
     logical_line_groups,
     map_font_to_base14,
     merge_paragraphs,
+    paragraph_blocks,
 )
 
 # Thumbnails render at a fixed low dpi for speed; the main page renders at
@@ -95,6 +98,38 @@ _QT_ALIGNMENT = {
 # The six box-alignment edges/centres (task 2), used to build the fly-out and
 # dispatch it.
 _ALIGN_EDGES = ("left", "hcenter", "right", "top", "vcenter", "bottom")
+
+
+def _strip_leading_chars(pieces: list, count: int) -> list:
+    """Drop the first ``count`` characters from a run of editor pieces — an
+    INLINE list marker being stripped off a prefill (the engine redraws it)."""
+    out = []
+    remaining = count
+    for text, fmt in pieces:
+        if remaining > 0 and text != "\n":
+            take = min(remaining, len(text))
+            text = text[take:]
+            remaining -= take
+            if not text:
+                continue
+        out.append((text, fmt))
+    return out
+
+
+def _engine_blocks(states: list | None) -> list[ListBlock | None] | None:
+    """Editor block states ``(kind, level, ordinal)`` -> engine ListBlocks.
+
+    None when the states carry no list at all — the commit then takes the
+    ordinary (non-block) layout path, byte-identical to pre-list behaviour.
+    Markers are regenerated from the editor's LIVE numbering, which is how a
+    list renumbers itself within its box on every commit (the Acrobat model).
+    """
+    if states is None or all(kind is None for kind, _level, _ordinal in states):
+        return None
+    return [
+        ListBlock(kind, level, marker_text(kind, level, ordinal)) if kind is not None else None
+        for kind, level, ordinal in states
+    ]
 
 
 def _save_failure_text(path, exc: Exception) -> str:
@@ -258,6 +293,9 @@ class DocumentView(QWidget):
         self._edit_embedded_fonts: dict[tuple[str, bool, bool], str] = {}
         # The paragraph editor's reflowed plain text as opened (no-op baseline).
         self._edit_open_text = ""
+        # The editor's per-block list structure as opened (list v2): a list
+        # toggle/indent with unchanged text is still a real edit.
+        self._edit_open_blocks: list | None = None
         # Review comments (E11): pending create (page, rect, callout target),
         # pending text edit (page, xref), and an in-flight Ctrl+drag move.
         self._pending_comment: tuple[int, tuple, tuple | None] | None = None
@@ -1441,20 +1479,48 @@ class DocumentView(QWidget):
         # become ONE editor block that reflows, only intentional short-line
         # breaks stay hard "\n". Without this a font/size change re-wrapped each
         # frozen visual line and overflowed ("grows into occupied space").
+        # A box carrying LIST blocks prefills per detected block instead
+        # (marker text stripped, QTextLists seeded — the markers become live
+        # structure while editing, exactly Acrobat's model).
+        specs = paragraph_blocks(para)
+        list_specs: list | None = None
         pieces: list = []
-        for gi, group in enumerate(logical_line_groups(para)):
-            if gi:
-                pieces.append(("\n", QTextCharFormat()))
-            for li, line in enumerate(group):
-                if li:
-                    # Soft-join wrapped lines with a single space (a wrap point
-                    # carries no literal character), unless one already abuts.
-                    prev = pieces[-1][0] if pieces else ""
-                    lead = line[0].text[:1] if line and line[0].text else ""
-                    if prev and not prev[-1:].isspace() and not lead[:1].isspace():
-                        pieces.append((" ", pieces[-1][1]))
-                for line_span in line:
-                    pieces.extend(self._pieces_from_span(line_span))
+        if any(s.kind is not None for s in specs):
+            list_specs = []
+            for si, spec in enumerate(specs):
+                if si:
+                    pieces.append(("\n", QTextCharFormat()))
+                list_specs.append(
+                    (spec.kind, spec.level, spec.ordinal or 1) if spec.kind is not None else None
+                )
+                block_start = len(pieces)
+                for li, line in enumerate(spec.lines):
+                    if li:
+                        prev = pieces[-1][0] if len(pieces) > block_start else ""
+                        if prev and not prev[-1:].isspace():
+                            pieces.append((" ", pieces[-1][1]))
+                    for line_span in line:
+                        if li == 0 and line_span is spec.marker_span:
+                            continue  # the engine redraws the marker from structure
+                        span_pieces = self._pieces_from_span(line_span)
+                        if li == 0 and spec.marker_chars and line_span is spec.lines[0][0]:
+                            span_pieces = _strip_leading_chars(span_pieces, spec.marker_chars)
+                        pieces.extend(span_pieces)
+        else:
+            for gi, group in enumerate(logical_line_groups(para)):
+                if gi:
+                    pieces.append(("\n", QTextCharFormat()))
+                for li, line in enumerate(group):
+                    if li:
+                        # Soft-join wrapped lines with a single space (a wrap
+                        # point carries no literal character), unless one
+                        # already abuts.
+                        prev = pieces[-1][0] if pieces else ""
+                        lead = line[0].text[:1] if line and line[0].text else ""
+                        if prev and not prev[-1:].isspace() and not lead[:1].isspace():
+                            pieces.append((" ", pieces[-1][1]))
+                    for line_span in line:
+                        pieces.extend(self._pieces_from_span(line_span))
         if not pieces:
             pieces = [(para.text, self._char_format_for(para))]
         font = self._editor_font_for(para)
@@ -1475,11 +1541,18 @@ class DocumentView(QWidget):
             fit_content=True,
             alignment=alignment,
             base_size_pt=para.size if para.size > 0 else None,
+            list_specs=list_specs,
+            indent_width_px=(
+                LIST_INDENT_STEP * font.pixelSize() / para.size if para.size > 0 else None
+            ),
         )
         self._edit_open_sig = self._pieces_signature(self._para_editor)
         # The reflowed plain text as opened — the no-op baseline (comparing to
         # para.text would false-negative now that wraps became spaces).
         self._edit_open_text = self._para_editor.toPlainText()
+        # The list structure as opened — a toggle/indent with unchanged text
+        # is still a real edit (the no-op check compares against this).
+        self._edit_open_blocks = self._para_editor.blocks_state()
         self.editWarning.emit("Editing paragraph — Ctrl+Enter applies, Esc cancels.")
         self.stateChanged.emit()  # the Hyperlink command greys out while editing
 
@@ -2288,9 +2361,17 @@ class DocumentView(QWidget):
                 return
             if pieces is not None:  # rich path: styles typed/applied in the editor
                 runs, _resolved = self._runs_from_pieces(pieces)
+                blocks = _engine_blocks(self._para_editor.committed_blocks_for(text))
+                insert_width = None
+                if blocks is not None and self._para_editor.user_sized_width is not None:
+                    insert_width = max(
+                        30.0, (self._para_editor.user_sized_width - 8) / self._canvas.zoom
+                    )
 
                 def do_insert(doc: PdfDocument) -> tuple[str, ...]:
-                    return doc.insert_runs(page_index, point, runs, align=align)
+                    return doc.insert_runs(
+                        page_index, point, runs, align=align, blocks=blocks, width=insert_width
+                    )
             else:  # direct-call fallback: uniform toolbar style
                 style = self._current_style()
 
@@ -2336,18 +2417,21 @@ class DocumentView(QWidget):
         resolved = True
         if pieces is not None:  # rich path — per-word styles preserved/applied
             runs, resolved = self._runs_from_pieces(pieces)
+            block_states = self._para_editor.committed_blocks_for(text)
+            blocks = _engine_blocks(block_states)
             signature = tuple((run.text, run.style) for run in runs)
             if (
                 text == self._edit_open_text
                 and width_pts is None
                 and signature == self._edit_open_sig
                 and same_align
+                and block_states == self._edit_open_blocks
             ):
-                return  # nothing changed — text, width, styling and alignment
+                return  # nothing changed — text, width, styling, align, lists
 
             def do_edit(doc: PdfDocument):
                 return doc.replace_paragraph_runs(
-                    page_index, para, runs, width=width_pts, align=align
+                    page_index, para, runs, width=width_pts, align=align, blocks=blocks
                 )
         else:  # direct-call fallback: one uniform style for the whole block
             style = self._current_style()
@@ -3905,6 +3989,24 @@ class DocumentView(QWidget):
             return False
         self._para_editor.set_alignment(_QT_ALIGNMENT.get(align, Qt.AlignmentFlag.AlignLeft))
         return True
+
+    def toggle_editor_list(self, kind: str) -> bool:
+        """Toggle bulleted/numbered formatting on the open paragraph/insert
+        editor's current block(s) — live QTextLists, committed as engine list
+        blocks. Clicking the active kind removes the formatting (Acrobat).
+        False = no paragraph editor open."""
+        if kind not in LIST_KINDS or not self._para_editor.is_editing:
+            return False
+        self._para_editor.toggle_list(kind)
+        return True
+
+    def indent_editor_list(self, delta: int) -> bool:
+        """Step the open editor's selected list item(s) one level (Tab /
+        Shift+Tab do the same at an item's start). False = no editor open or
+        nothing list-formatted under the caret/selection."""
+        if not self._para_editor.is_editing:
+            return False
+        return self._para_editor.indent_list(delta)
 
     def _current_style(self):
         """The style toolbar's TextStyle, or None (match the original)."""
