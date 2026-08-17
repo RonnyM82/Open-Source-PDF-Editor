@@ -554,13 +554,23 @@ class PdfDocument:
         offset: tuple[float, float] = (0.0, 0.0),
         width: float | None = None,
         align: str | None = None,
+        blocks: Sequence[textedit.ListBlock | None] | None = None,
     ) -> textedit.ParagraphReplaceResult:
         """Replace ``para`` with RICH runs (per-word styles preserved, E9).
 
         ``align`` overrides the detected justification (None keeps it).
+        ``blocks`` switches on per-block list layout (list v2).
         """
         return textedit.replace_paragraph_runs(
-            self._doc, n, para, runs, fill=fill, offset=offset, width=width, align=align
+            self._doc,
+            n,
+            para,
+            runs,
+            fill=fill,
+            offset=offset,
+            width=width,
+            align=align,
+            blocks=blocks,
         )
 
     def set_list_style(
@@ -656,14 +666,19 @@ class PdfDocument:
         *,
         align: str = "left",
         pitch: float | None = None,
+        blocks: Sequence[textedit.ListBlock | None] | None = None,
+        width: float | None = None,
     ) -> tuple[str, ...]:
         """Insert NEW rich text at a baseline point on page ``n`` (E9). Returns
         the box's VISUAL line texts (content fingerprint).
 
         ``pitch`` overrides the default 1.2-em baseline spacing (a copy of an
-        existing paragraph reproduces that paragraph's own pitch).
+        existing paragraph reproduces that paragraph's own pitch). ``blocks``
+        switches on per-block list layout with body wrap to ``width`` (v2).
         """
-        return textedit.insert_new_runs(self._doc, n, point, runs, align=align, pitch=pitch)
+        return textedit.insert_new_runs(
+            self._doc, n, point, runs, align=align, pitch=pitch, blocks=blocks, width=width
+        )
 
     def highlight(
         self, n: int, span: TextSpan, color: tuple[float, float, float] | None = None

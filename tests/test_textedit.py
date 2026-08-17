@@ -696,7 +696,9 @@ def test_clear_list_strips_marker(tmp_path):
         assert "Text to bullet and then clear" in p.text
 
 
-def test_indent_list_item_shifts_and_keeps_bullet(tmp_path):
+def test_indent_list_item_steps_a_level(tmp_path):
+    """List v2: indent nests the item one LEVEL deeper inside its box (the
+    Acrobat model) — the marker steps right and takes the level-1 glyph."""
     src = _para_pdf(tmp_path, ["A list item to indent right and left."])
     with PdfDocument.open(src) as doc:
         doc.set_list_style(0, doc.paragraphs(0)[0], "bullet")
@@ -710,9 +712,9 @@ def test_indent_list_item_shifts_and_keeps_bullet(tmp_path):
         doc.save(out2)
     with PdfDocument.open(out2) as doc:
         after = doc.paragraphs(0)[0]
-        assert after.bbox[0] == pytest.approx(left0 + 18.0, abs=1.5)  # whole item shifted right
+        assert after.bbox[0] == pytest.approx(left0 + 18.0, abs=1.5)  # item stepped right
         assert after.hang_indent > 0  # still a grouped bullet
-        assert after.text.lstrip()[:1] in ("•", "·")
+        assert after.text.lstrip()[:1] in ("•", "·", "◦")  # level-1 glyph when a font resolved
 
 
 def test_indent_non_list_item_refused(tmp_path):
@@ -853,9 +855,12 @@ def test_insert_list_item_numbers_in_order(tmp_path):
         _results, bounds = _insert_items(doc, ["One", "Two", "Three"], "number")
         items = doc.paragraphs(0, boundaries=bounds)
         assert [i.text for i in items] == ["1. One", "2. Two", "3. Three"]
-        # Numbered markers stay INLINE (a numbered hang is a later refinement).
+        # v1 L3 numbered markers are INLINE helv text that MERGES with the
+        # body span, and v2's conservative detection reads a lone merged
+        # "1. One" paragraph as prose — so list_item_kind no longer claims
+        # these. The v1 insert path dies in LR4; the text itself is what
+        # this test still pins.
         assert all(i.hang_indent == 0.0 for i in items)
-        assert [list_item_kind(i) for i in items] == [("number", n) for n in (1, 2, 3)]
 
 
 def test_insert_list_item_wraps_long_text(tmp_path):

@@ -22,6 +22,7 @@ leading token of a line's text (for the hanging-indent split).
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 
@@ -135,3 +136,94 @@ def split_leading_marker(text: str) -> tuple[str, str] | None:
     if marker is None:
         return None
     return text[: marker.end], text[marker.end :]
+
+
+# --- Marker GENERATION (list v2) -------------------------------------------
+# The engine writes markers from structure at commit time. Per-level styles
+# are the Office defaults: bullets cycle • ◦ ▪, numbers cycle 1. a. i.
+
+BULLET_LEVEL_GLYPHS = ("•", "◦", "▪")
+
+# Real bullet glyphs need a real font: base-14 helv renders U+2022 as a middot
+# speck (the "Format as list has zero effect" report). Probed 2026-08-18:
+# Arial and Segoe UI both carry • ◦ ▪. Resolved engine-side the same way
+# pdfcore/ocr.py probes for tesseract; a caller can override, and when no
+# font resolves the layout falls back to the base-14 code (and the middot)
+# rather than refusing.
+_MARKER_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+)
+
+
+def marker_fontfile() -> str | None:
+    """A font file whose subset can draw the bullet glyphs, or ``None``."""
+    for candidate in _MARKER_FONT_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def bullet_glyph(level: int) -> str:
+    """The bullet glyph for a 0-based indent level (• ◦ ▪, cycling)."""
+    return BULLET_LEVEL_GLYPHS[max(0, level) % len(BULLET_LEVEL_GLYPHS)]
+
+
+def alpha_ordinal(n: int) -> str:
+    """1 -> "a", 26 -> "z", 27 -> "aa" (spreadsheet-column style)."""
+    if n < 1:
+        raise ValueError("ordinal must be >= 1")
+    out = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("a") + rem) + out
+    return out
+
+
+_ROMAN_TABLE = (
+    (1000, "m"),
+    (900, "cm"),
+    (500, "d"),
+    (400, "cd"),
+    (100, "c"),
+    (90, "xc"),
+    (50, "l"),
+    (40, "xl"),
+    (10, "x"),
+    (9, "ix"),
+    (5, "v"),
+    (4, "iv"),
+    (1, "i"),
+)
+
+
+def roman_ordinal(n: int) -> str:
+    """1 -> "i", 4 -> "iv" (lower-case roman)."""
+    if n < 1:
+        raise ValueError("ordinal must be >= 1")
+    out = ""
+    for value, glyphs in _ROMAN_TABLE:
+        while n >= value:
+            out += glyphs
+            n -= value
+    return out
+
+
+def number_marker(level: int, ordinal: int) -> str:
+    """The numbered marker for a 0-based level: "1." then "a." then "i.",
+    cycling at deeper levels."""
+    style = max(0, level) % 3
+    if style == 0:
+        return f"{ordinal}."
+    if style == 1:
+        return f"{alpha_ordinal(ordinal)}."
+    return f"{roman_ordinal(ordinal)}."
+
+
+def marker_text(kind: str, level: int, ordinal: int) -> str:
+    """The literal marker for a list block: kind "bullet" or "number"."""
+    if kind == "bullet":
+        return bullet_glyph(level)
+    if kind == "number":
+        return number_marker(level, ordinal)
+    raise ValueError(f"kind must be 'bullet' or 'number', not {kind!r}")

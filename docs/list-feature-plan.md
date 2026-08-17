@@ -109,8 +109,14 @@ at `marker_x + 18 pt` (or after the marker if it measures wider, e.g.
 "viii."), continuation lines wrapping under the body's left edge. Bullets per
 level are • ◦ ▪ (cycling if deeper), drawn from the embedded Arial subset at
 the block's own size and colour. Numbers per level are the Office defaults
-"1." then "a." then "i.", written in the item's own text font as literal
-text; ordinals come from the editor's live numbering at commit time.
+"1." then "a." then "i."; ordinals come from the editor's live numbering at
+commit time. Numbered markers ALSO draw in the marker font, not the item's
+text font (an LR1 finding): a helv "1." merges with a helv body into one
+extracted span, a merged lone item reads as prose under the conservative
+detection, and clearing or re-formatting it then does nothing, which is the
+"zero effect" failure again. A different-font marker stays its own span, so
+the separate-marker geometry always detects it, and Arial digits beside helv
+body text are metrically near-identical anyway.
 
 This fixes the v1 numbered-item geometry too: numbered items get the same
 hanging indent as bullets instead of an inline "1. " that nothing lines up

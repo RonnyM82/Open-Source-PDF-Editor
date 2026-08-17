@@ -24,7 +24,14 @@ from pathlib import Path
 
 import pymupdf
 
-from pdfcore.lists import is_bullet_only, leading_marker, split_leading_marker
+from pdfcore.lists import (
+    ListMarker,
+    is_bullet_only,
+    leading_marker,
+    marker_fontfile,
+    marker_text,
+    split_leading_marker,
+)
 
 # get_text("dict") span flag bits. Verified empirically (flags-probe test and
 # the real quote sample: Helvetica-Bold spans report flags=16).
@@ -245,6 +252,143 @@ def _layout_runs(runs: list[StyledRun], wrap_width: float | None) -> list[list[_
             current.append(_Fragment(token, style, x, width))
             x += width
         lines.append(_finish_line(current))
+    return lines
+
+
+@dataclass(frozen=True)
+class ListBlock:
+    """Per-block list formatting for the runs ops (list v2).
+
+    The runs of an op are split into logical BLOCKS on hard ``"\\n"`` breaks
+    (U+2028/U+2029 stay line breaks WITHIN a block — Qt's Shift+Enter). A
+    ``blocks`` sequence runs parallel to those splits: entry N formats block
+    N. ``None`` in a slot (or ``kind=None``) means a plain block.
+
+    - ``kind``: ``"bullet"`` | ``"number"`` | ``None``.
+    - ``level``: 0-based indent level; each level steps the whole block
+      right by ``LIST_INDENT_STEP``.
+    - ``marker``: the literal marker text ("•", "3.", "b."). The CALLER
+      computes it (the editor's live numbering owns ordinals); empty with a
+      list ``kind`` means "generate from kind/level" with ordinal 1.
+    - ``marker_style``: the marker's font/size/colour. ``None`` derives from
+      the block's first styled run, with bullets upgraded to the resolved
+      marker font (``lists.marker_fontfile``) so a real • lands on the page
+      instead of helv's middot.
+    """
+
+    kind: str | None
+    level: int = 0
+    marker: str = ""
+    marker_style: TextStyle | None = None
+
+
+# The gap kept between a marker wider than the hang gutter and its body text.
+_MARKER_GAP = 4.0
+
+
+def _split_block_runs(runs: list[StyledRun]) -> list[list[StyledRun]]:
+    """Split runs into per-block run lists on hard ``"\\n"`` breaks ONLY.
+
+    ``\\r\\n``/``\\r`` normalise to ``\\n``; U+2028/U+2029 pass through so
+    they stay line breaks WITHIN a block for :func:`_layout_runs`.
+    """
+    blocks: list[list[StyledRun]] = [[]]
+    for run in runs:
+        text = run.text.replace("\r\n", "\n").replace("\r", "\n")
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if i:
+                blocks.append([])
+            if part:
+                blocks[-1].append(StyledRun(part, run.style))
+    return blocks
+
+
+def _block_marker_style(spec: ListBlock, group: list[StyledRun]) -> TextStyle:
+    """The style a block's marker is drawn with (see :class:`ListBlock`).
+
+    EVERY marker uses the resolved marker font (Arial), not just bullets.
+    Bullets need it for the glyphs (helv draws U+2022 as a middot and has no
+    ◦/▪ at all). Numbers need it for DETECTION: a helv "1." marker merges
+    with a helv body into ONE extracted span, and a merged single item reads
+    as prose — so clearing or re-formatting it would then do nothing, which
+    is the exact "zero effect" failure this redesign kills. A different-font
+    marker stays its own span, the separate-marker geometry always detects,
+    and Arial digits next to helv body text are metrically near-identical
+    anyway. Never the BODY's embedded font: a Word subset may lack digits.
+    """
+    if spec.marker_style is not None:
+        return spec.marker_style
+    base = next((r.style for r in group if r.text.strip()), TextStyle())
+    fontfile = marker_fontfile()
+    if fontfile is not None:
+        return TextStyle(fontfile=fontfile, size=base.size, color=base.color)
+    return TextStyle(code=base.code, size=base.size, color=base.color)
+
+
+def _layout_block_runs(
+    runs: list[StyledRun],
+    blocks: Sequence[ListBlock | None],
+    wrap: float,
+    slack: float = 0.0,
+) -> list[list[_Fragment]]:
+    """Lay runs out block by block with per-block list formatting.
+
+    Returns visual lines whose fragment x-offsets are PRE-BAKED with each
+    block's indent and hanging indent, so every downstream consumer
+    (insertion, collision pre-flight, bbox) works unchanged with a plain
+    ``origin_x``. A list block's first line is the marker fragment at
+    ``level × LIST_INDENT_STEP`` followed by the body at ``+ hang``;
+    continuation lines wrap under the body's left edge. ``slack`` is the
+    re-wrap grace factor (see ``_GROW_WIDTH_FACTOR``).
+    """
+    groups = _split_block_runs(runs)
+    if len(blocks) != len(groups):
+        raise ValueError(
+            f"blocks ({len(blocks)}) must match the runs' hard-break blocks ({len(groups)})"
+        )
+
+    def graced(width: float) -> float:
+        return width * (1.0 + slack) + 2.0 if slack else width
+
+    lines: list[list[_Fragment]] = []
+    for spec, group in zip(blocks, groups, strict=True):
+        if spec is None or spec.kind is None:
+            indent = 0.0 if spec is None else spec.level * LIST_INDENT_STEP
+            body_wrap = wrap - indent
+            if body_wrap < 20.0:
+                raise ValueError("There is no room for text at this indent level.")
+            for line in _layout_runs(group, graced(body_wrap)):
+                lines.append([replace(f, x=f.x + indent) for f in line] if indent else line)
+            continue
+        indent = spec.level * LIST_INDENT_STEP
+        style = _block_marker_style(spec, group)
+        marker_src = spec.marker or marker_text(spec.kind, spec.level, 1)
+        if spec.kind == "bullet" and style.fontfile is None:
+            # Base-14 fallback (no marker font resolved): helv draws • as a
+            # middot and has NO ◦/▪ glyphs at all, so every level degrades
+            # to the plain bullet rather than emitting .notdef.
+            marker_src = "•"
+        # The trailing space is deliberate: extraction concatenates adjacent
+        # same-style glyphs with no synthetic space, so a spaceless "1."
+        # marker would re-extract as "1.body" and stop reading as a marker.
+        marker = marker_src + " "
+        marker_width = _style_text_width(style, marker)
+        hang = max(_LIST_HANG, marker_width + _MARKER_GAP)
+        body_wrap = wrap - indent - hang
+        if body_wrap < 20.0:
+            raise ValueError(
+                "There is no room for a list item at this indent level — "
+                "widen the box or decrease the indent."
+            )
+        body_lines = _layout_runs(group, graced(body_wrap))
+        while body_lines and not body_lines[-1]:
+            body_lines.pop()
+        first = body_lines[0] if body_lines else []
+        marker_frag = _Fragment(marker, style, indent, marker_width)
+        lines.append([marker_frag, *(replace(f, x=f.x + indent + hang) for f in first)])
+        for line in body_lines[1:]:
+            lines.append([replace(f, x=f.x + indent + hang) for f in line])
     return lines
 
 
@@ -1952,6 +2096,7 @@ def replace_paragraph_runs(
     align: str | None = None,
     hang: float | None = None,
     indent: float = 0.0,
+    blocks: Sequence[ListBlock | None] | None = None,
 ) -> ParagraphReplaceResult:
     """Replace a paragraph with RICH runs, laid out by the engine (E9).
 
@@ -2005,30 +2150,43 @@ def replace_paragraph_runs(
     # whole item's box-left (L4 increase/decrease indent) and forces the marker
     # to be DRAWN at the new position (the kept-glyph span cannot be moved).
     in_place = offset == (0.0, 0.0)
-    detected_hang = para.hang_indent if in_place else 0.0
-    hang = detected_hang if hang is None else (hang if in_place else 0.0)
-    marker_runs = None
-    body_runs = runs
-    if hang > 0:
-        marker_runs, body_runs = _split_marker_runs(runs)
-        if marker_runs is None:  # no leading marker in the runs — plain paragraph
-            hang, body_runs = 0.0, runs
-    # KEEP an existing folded bullet's original span (preserve its exact symbol
-    # glyph) when editing it in place; a CREATED marker (no such span, a numbered
-    # marker, or an INDENT that moves the whole item) is DRAWN instead.
-    keep_span = (
-        para.spans[0]
-        if (
-            marker_runs is not None
-            and indent == 0.0
-            and para.hang_indent > 0
-            and para.spans
-            and is_bullet_only(para.spans[0].text)
+    if blocks is not None:
+        # Block mode (list v2): per-block markers, indents and hanging
+        # indents are laid out by _layout_block_runs with fragment x-offsets
+        # pre-baked, so the shared machinery below (fit, collision, insert,
+        # bbox) runs with hang 0 and no justification shift. List boxes are
+        # left-set; the v1 single-hang/kept-span path never engages.
+        hang = 0.0
+        marker_runs, body_runs, keep_span = None, runs, None
+        align_val = "left"
+        body_wrap = wrap
+        lines = _layout_block_runs(runs, blocks, wrap, slack=_GROW_WIDTH_FACTOR)
+    else:
+        detected_hang = para.hang_indent if in_place else 0.0
+        hang = detected_hang if hang is None else (hang if in_place else 0.0)
+        marker_runs = None
+        body_runs = runs
+        if hang > 0:
+            marker_runs, body_runs = _split_marker_runs(runs)
+            if marker_runs is None:  # no leading marker in the runs — plain paragraph
+                hang, body_runs = 0.0, runs
+        # KEEP an existing folded bullet's original span (preserve its exact
+        # symbol glyph) when editing it in place; a CREATED marker (no such
+        # span, a numbered marker, or an INDENT that moves the whole item) is
+        # DRAWN instead.
+        keep_span = (
+            para.spans[0]
+            if (
+                marker_runs is not None
+                and indent == 0.0
+                and para.hang_indent > 0
+                and para.spans
+                and is_bullet_only(para.spans[0].text)
+            )
+            else None
         )
-        else None
-    )
-    body_wrap = max(20.0, wrap - hang)
-    lines = _layout_runs(body_runs, body_wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
+        body_wrap = max(20.0, wrap - hang)
+        lines = _layout_runs(body_runs, body_wrap * (1.0 + _GROW_WIDTH_FACTOR) + 2.0)
     while lines and not lines[-1]:
         lines.pop()  # trailing empty lines add height but render nothing
     has_text = any(frag.text.strip() for line in lines for frag in line)
@@ -2142,6 +2300,19 @@ def replace_paragraph_runs(
             origin_x + wrap,
             first_baseline + (max(len(lines), 1) - 1) * pitch_val + descent,
         )
+    visual = _visual_line_texts(lines)
+    if blocks is not None and new_bbox is not None:
+        # Block mode fingerprints must be what the page RE-EXTRACTS, not the
+        # layout's own text: MuPDF folds a same-baseline marker fragment onto
+        # its body line with its own spacing, and a fingerprint that misses
+        # is a box that owns nothing (the v1 L2 bug). ``origins`` restricts
+        # the read to the lines just drawn.
+        origins = [
+            (origin_x + line[0].x, first_baseline + i * pitch_val)
+            for i, line in enumerate(lines)
+            if line
+        ]
+        visual = lines_in_box(doc, page_index, new_bbox, origins)
     return ParagraphReplaceResult(
         inserted=has_text,
         used_font=_dominant_label(runs),
@@ -2149,7 +2320,7 @@ def replace_paragraph_runs(
         uniform_style=para.uniform_style,
         resized=resized,
         new_bbox=new_bbox,
-        visual_lines=_visual_line_texts(lines),
+        visual_lines=visual,
         font_fallback=font_fallback,
     )
 
@@ -2161,37 +2332,326 @@ _LIST_HANG = 18.0
 LIST_KINDS = ("bullet", "number")
 
 
-def _paragraph_body_runs(para: Paragraph) -> list[StyledRun]:
-    """Rich runs for a paragraph's content with any LEADING list marker removed
-    — the body from which a new marker is (re)built. Per-span styles, embedded
-    fonts and drawn rules are preserved (the same conversion moves use)."""
+def _line_runs(
+    line: tuple[TextSpan, ...],
+    skip: TextSpan | None = None,
+    strip: int = 0,
+) -> list[StyledRun]:
+    """Rich runs for ONE visual line's spans — per-span styles, embedded-font
+    intents and drawn rules preserved (the same conversion moves use).
+
+    ``skip`` drops a separate marker span; ``strip`` drops that many leading
+    characters (an INLINE marker) off the front of the line's text."""
     runs: list[StyledRun] = []
     codes = _BASE14_CODES["helv"]
-    for i, line in enumerate(para.lines):
-        if i:
-            runs.append(StyledRun("\n", TextStyle()))
-        for span in line:
-            reuse = span.embedded and map_font_to_base14(span.font, span.flags) is None
-            idx = (1 if span.flags & FLAG_BOLD else 0) + (2 if span.flags & FLAG_ITALIC else 0)
-            segments = getattr(span, "rule_segments", None) or (
-                (span.text, span.underline, span.strike),
-            )
-            for text, underline, strike in segments:
-                runs.append(
-                    StyledRun(
-                        text,
-                        TextStyle(
-                            code=span.base14 or codes[idx],
-                            size=span.size,
-                            color=span.color,
-                            underline=underline,
-                            strike=strike,
-                            embed_name=span.font if reuse else None,
-                        ),
-                    )
+    remaining = strip
+    for span in line:
+        if span is skip:
+            continue
+        reuse = span.embedded and map_font_to_base14(span.font, span.flags) is None
+        idx = (1 if span.flags & FLAG_BOLD else 0) + (2 if span.flags & FLAG_ITALIC else 0)
+        segments = getattr(span, "rule_segments", None) or (
+            (span.text, span.underline, span.strike),
+        )
+        for text, underline, strike in segments:
+            if remaining:
+                take = min(remaining, len(text))
+                text = text[take:]
+                remaining -= take
+                if not text:
+                    continue
+            runs.append(
+                StyledRun(
+                    text,
+                    TextStyle(
+                        code=span.base14 or codes[idx],
+                        size=span.size,
+                        color=span.color,
+                        underline=underline,
+                        strike=strike,
+                        embed_name=span.font if reuse else None,
+                    ),
                 )
-    marker_runs, body_runs = _split_marker_runs(runs)
-    return body_runs if marker_runs is not None else runs
+            )
+    return runs
+
+
+@dataclass(frozen=True)
+class BlockSpec:
+    """One logical block of a paragraph/box as READ off the page (list v2).
+
+    The read-side counterpart of :class:`ListBlock`: :func:`paragraph_blocks`
+    splits a paragraph's visual lines into these, and the rebuild ops /
+    editor seeding consume them. ``marker`` is the literal marker text as it
+    appears (``""`` for a plain block); ``marker_span`` is a SEPARATE marker
+    span to drop on rebuild (a folded/committed bullet or number), while
+    ``marker_chars`` counts INLINE marker characters to strip from the first
+    line's text instead."""
+
+    kind: str | None
+    level: int
+    ordinal: int | None
+    marker: str
+    lines: tuple[tuple[TextSpan, ...], ...]
+    marker_span: TextSpan | None = None
+    marker_chars: int = 0
+
+
+def _marker_only(span: TextSpan) -> ListMarker | None:
+    """The marker when ``span`` is NOTHING BUT a list marker, else None."""
+    stripped = span.text.strip()
+    if not stripped:
+        return None
+    mk = leading_marker(stripped)
+    if mk is not None and mk.end >= len(stripped):
+        return mk
+    return None
+
+
+# paragraph_blocks line classifications (internal).
+_PLAIN, _MARKER = 0, 1
+
+
+def _marker_style_level(mk: ListMarker) -> int | None:
+    """The indent level a marker's own STYLE implies, or ``None``.
+
+    Our committed markers encode their level (• ◦ ▪ and 1. a. i.), and the
+    box's leftmost ink IS its shallowest marker, so geometry alone cannot
+    tell an indented-only box from a level-0 one (found by probe: indenting
+    an item then re-reading it reported level 0 and an outdent wrongly
+    unlisted it). Bullets map by glyph; numbers by ordinal family. A lone
+    "i." parses as alpha (level 1) rather than roman (level 2) — the same
+    ambiguity Word has; siblings ("ii.") resolve their cluster upward."""
+    if mk.kind == "bullet":
+        try:
+            return ("•", "◦", "▪").index(mk.text)
+        except ValueError:
+            return None
+    return {"decimal": 0, "alpha": 1, "roman": 2}.get(mk.kind)
+
+
+def paragraph_blocks(para: Paragraph) -> list[BlockSpec]:
+    """Split a paragraph's visual lines into logical list/plain blocks.
+
+    - A line whose FIRST span is a lone marker with body text sitting deeper
+      on the same line starts a list block (a folded imported bullet, or a
+      v2-committed marker fragment) — strong geometric evidence, always
+      accepted.
+    - A line whose text STARTS with a marker (inline — an imported Word
+      number, or v1-committed output) starts a list block only with
+      corroboration: another marker line in the paragraph, a continuation
+      line hanging under it, or the paragraph's own detected hang. A lone
+      "1990 was a good year." stays prose.
+    - A non-marker line deeper than the current list block's marker is that
+      block's continuation; otherwise it is plain. Consecutive plain lines
+      group by the reflow classifier's full-width heuristic so wrapped prose
+      stays one block.
+
+    Levels derive from each marker's x against the box left in
+    ``LIST_INDENT_STEP`` steps.
+    """
+    lines = [ln for ln in para.lines if any(s.text.strip() for s in ln)]
+    if not lines:
+        return []
+    box_left = para.bbox[0]
+    box_right = max(max(s.bbox[2] for s in ln) for ln in lines)
+
+    # Pass 1: classify each line.
+    infos: list[dict] = []
+    for line in lines:
+        spans = [s for s in line if s.text.strip()]
+        first = spans[0]
+        info = {"line": line, "x0": first.bbox[0], "kind": _PLAIN}
+        mk = _marker_only(first)
+        body = [s for s in spans[1:] if s.bbox[0] > first.bbox[0] + 1.0]
+        if mk is not None and body:
+            info.update(
+                kind=_MARKER,
+                list_kind="bullet" if mk.kind == "bullet" else "number",
+                marker=mk,
+                marker_span=first,
+                marker_chars=0,
+                separate=True,
+            )
+        else:
+            mk2 = leading_marker(first.text)
+            if mk2 is not None and mk2.end < len(first.text):
+                info.update(
+                    kind=_MARKER,
+                    list_kind="bullet" if mk2.kind == "bullet" else "number",
+                    marker=mk2,
+                    marker_span=None,
+                    marker_chars=mk2.end,
+                    separate=False,
+                )
+        infos.append(info)
+
+    # Pass 2: inline NUMBER markers need corroboration (see docstring).
+    marker_count = sum(1 for i in infos if i["kind"] == _MARKER)
+    for idx, info in enumerate(infos):
+        if info["kind"] != _MARKER or info["separate"] or info["list_kind"] == "bullet":
+            continue
+        follower_hangs = (
+            idx + 1 < len(infos)
+            and infos[idx + 1]["kind"] == _PLAIN
+            and infos[idx + 1]["x0"] > info["x0"] + 6.0
+        )
+        if marker_count < 2 and not follower_hangs and para.hang_indent == 0:
+            info["kind"] = _PLAIN  # demoted: a sentence that starts with "1."
+
+    # Pass 2.5: marker LEVELS. Geometry gives the relative structure (x steps
+    # of LIST_INDENT_STEP against the SHALLOWEST marker); the shallowest
+    # cluster's own marker style supplies the base level, because the box's
+    # leftmost ink is that marker — see _marker_style_level.
+    marker_infos = [i for i in infos if i["kind"] == _MARKER]
+    if marker_infos:
+        base_x = min(i["x0"] for i in marker_infos)
+        base_styles = [
+            _marker_style_level(i["marker"])
+            for i in marker_infos
+            if i["x0"] - base_x < LIST_INDENT_STEP / 2
+        ]
+        base_level = max((s for s in base_styles if s is not None), default=0)
+        for info in marker_infos:
+            info["level"] = base_level + max(0, round((info["x0"] - base_x) / LIST_INDENT_STEP))
+
+    # Pass 3: group into blocks.
+    specs: list[BlockSpec] = []
+    current: dict | None = None  # an open block being accumulated
+
+    def flush() -> None:
+        nonlocal current
+        if current is None:
+            return
+        mk = current.get("marker")
+        specs.append(
+            BlockSpec(
+                kind=current.get("list_kind"),
+                level=current["level"],
+                ordinal=mk.ordinal if mk is not None else None,
+                marker=mk.text if mk is not None else "",
+                lines=tuple(current["lines"]),
+                marker_span=current.get("marker_span"),
+                marker_chars=current.get("marker_chars", 0),
+            )
+        )
+        current = None
+
+    def _prev_line_fills(block: dict) -> bool:
+        """Whether the block's last line runs to the box's right edge — the
+        soft-wrap signal. Word wraps an item's overflow to the CONTAINER
+        left, not the hang (the real sample's '…flag to Dar / us.'), so a
+        continuation can sit at the marker indent; the full-width previous
+        line is what marks it as a wrap rather than a new paragraph."""
+        prev = block["lines"][-1]
+        prev_right = max(s.bbox[2] for s in prev)
+        size = max((s.size for s in prev if s.text.strip()), default=11.0)
+        return prev_right >= box_right - _WRAP_FULL_SLACK_EM * size
+
+    for info in infos:
+        if info["kind"] == _MARKER:
+            flush()
+            current = dict(info, lines=[info["line"]])
+            continue
+        if (
+            current is not None
+            and current.get("list_kind") is not None
+            and (info["x0"] >= current["x0"] + 6.0 or _prev_line_fills(current))
+        ):
+            current["lines"].append(info["line"])  # hanging (or wrapped) continuation
+            continue
+        # Plain line: join wrapped prose onto the open plain block, else start
+        # a new one (same full-width heuristic as logical_line_groups).
+        if current is not None and current.get("list_kind") is None:
+            prev = current["lines"][-1]
+            prev_right = max(s.bbox[2] for s in prev)
+            size = max((s.size for s in prev if s.text.strip()), default=11.0)
+            wide = box_right - box_left >= _MIN_REFLOW_WIDTH
+            if wide and prev_right >= box_right - _WRAP_FULL_SLACK_EM * size:
+                current["lines"].append(info["line"])
+                continue
+        flush()
+        current = {"list_kind": None, "level": 0, "x0": info["x0"], "lines": [info["line"]]}
+    flush()
+    return specs
+
+
+def _spec_body_runs(spec: BlockSpec) -> list[StyledRun]:
+    """A block's BODY as rich runs: marker dropped, continuation lines joined
+    as soft wraps (the body re-wraps to the new layout width)."""
+    runs: list[StyledRun] = []
+    for j, line in enumerate(spec.lines):
+        line_runs = _line_runs(
+            line,
+            skip=spec.marker_span if j == 0 else None,
+            strip=spec.marker_chars if j == 0 else 0,
+        )
+        if not line_runs:
+            continue
+        if runs:
+            runs.append(StyledRun(" ", runs[-1].style))
+        runs.extend(line_runs)
+    return runs
+
+
+def _rebuild_blocks(
+    doc: pymupdf.Document,
+    page_index: int,
+    para: Paragraph,
+    specs: list[BlockSpec],
+    new_fmt: list[tuple[str | None, int]],
+    *,
+    start_ordinal: int = 1,
+    align: str | None = None,
+) -> ParagraphReplaceResult:
+    """Re-lay ``para`` with each block reformatted per ``new_fmt`` — the shared
+    engine of :func:`set_list_style` and :func:`indent_list_item`.
+
+    All-plain output takes the ordinary paragraph path (justification
+    preserved); any list block switches to block layout, with numbered
+    markers renumbered per level (deeper counters reset when a shallower
+    item appears; level-0 numbering starts at ``start_ordinal`` so a
+    multi-selection numbers across boxes)."""
+    if all(kind is None for kind, _level in new_fmt):
+        runs: list[StyledRun] = []
+        for i, spec in enumerate(specs):
+            if i:
+                runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
+            runs.extend(_spec_body_runs(spec))
+        return replace_paragraph_runs(doc, page_index, para, runs, hang=0.0, align=align)
+
+    runs = []
+    blocks: list[ListBlock] = []
+    counters: dict[int, int] = {}
+    para_width = para.bbox[2] - para.bbox[0]
+    extra = 0.0
+    for i, (spec, (kind, level)) in enumerate(zip(specs, new_fmt, strict=True)):
+        if i:
+            runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
+        body = _spec_body_runs(spec)
+        runs.extend(body)
+        if kind is None:
+            blocks.append(ListBlock(None, 0))
+            continue
+        if kind == "number":
+            for deeper in [lv for lv in counters if lv > level]:
+                counters.pop(deeper)
+            ordinal = counters.get(level, (start_ordinal - 1) if level == 0 else 0) + 1
+            counters[level] = ordinal
+        else:
+            ordinal = 1
+        mtext = marker_text(kind, level, ordinal)
+        block = ListBlock(kind, level, mtext)
+        blocks.append(block)
+        style = _block_marker_style(block, body)
+        hang = max(_LIST_HANG, _style_text_width(style, mtext + " ") + 2.0)
+        extra = max(extra, level * LIST_INDENT_STEP + hang)
+    # The box GROWS by the deepest marker gutter so short body text is not
+    # spuriously wrapped by the marker (the v1 rule, generalised per level).
+    width = para_width + extra
+    return replace_paragraph_runs(
+        doc, page_index, para, runs, blocks=blocks, width=width, align=align
+    )
 
 
 def set_list_style(
@@ -2201,46 +2661,25 @@ def set_list_style(
     kind: str | None,
     *,
     ordinal: int = 1,
-    indent: float = 0.0,
     align: str | None = None,
 ) -> ParagraphReplaceResult:
-    """Convert a paragraph to/from a list item (L2, user request).
+    """Convert a paragraph's blocks to/from list items (list v2).
 
-    ``kind`` ``"bullet"`` prepends a ``•`` marker at the box left and hangs the
-    body at ``box-left + _LIST_HANG`` (the L1 structure, so it round-trips and
-    edits as a grouped item); ``"number"`` prepends ``f"{ordinal}. "`` INLINE
-    (no hanging indent yet); ``None`` strips any leading marker back to a plain
-    paragraph. An existing marker is replaced (bullet→number, renumber, …).
-    ``align`` overrides the justification (``None`` keeps the detected one) —
-    L3 passes the toolbar's choice through to a freshly created item.
-
-    Per the plan's Option B the marker is ordinary editable TEXT — this is a
-    formatting convenience, not a managed list structure."""
-    body_runs = _paragraph_body_runs(para)
-    marker_style = TextStyle(code=para.base14 or "helv", size=para.size, color=para.color)
-    # The box must GROW to fit the marker so short body text is not spuriously
-    # wrapped: a bullet adds the hang gutter to the left, a number the marker's
-    # own width. None (clear) keeps the paragraph's own width.
-    para_width = para.bbox[2] - para.bbox[0]
+    ``kind`` ``"bullet"``/``"number"`` formats EVERY block of the paragraph
+    as that kind (existing levels preserved, markers regenerated with real
+    glyphs, numbered items renumbered from ``ordinal``); ``None`` strips all
+    list formatting back to plain text. Markers on the page stay literal
+    text (Option B) — this re-derives the structure and rewrites it."""
+    if kind is not None and kind not in LIST_KINDS:
+        raise ValueError(f"list kind must be one of {LIST_KINDS} or None, not {kind!r}")
+    specs = paragraph_blocks(para)
+    if not specs:
+        raise ValueError("nothing to format")
     if kind is None:
-        return replace_paragraph_runs(
-            doc, page_index, para, body_runs, hang=0.0, indent=indent, align=align
-        )
-    if kind == "bullet":
-        runs = [StyledRun("• ", marker_style), *body_runs]
-        width = para_width + _LIST_HANG
-        return replace_paragraph_runs(
-            doc, page_index, para, runs, hang=_LIST_HANG, width=width, indent=indent, align=align
-        )
-    if kind == "number":
-        marker = f"{ordinal}. "
-        marker_w = pymupdf.get_text_length(marker, fontname=marker_style.code, fontsize=para.size)
-        runs = [StyledRun(marker, marker_style), *body_runs]
-        width = para_width + marker_w + 2.0
-        return replace_paragraph_runs(
-            doc, page_index, para, runs, hang=0.0, width=width, indent=indent, align=align
-        )
-    raise ValueError(f"list kind must be one of {LIST_KINDS} or None, not {kind!r}")
+        fmt: list[tuple[str | None, int]] = [(None, 0) for _ in specs]
+    else:
+        fmt = [(kind, spec.level if spec.kind is not None else 0) for spec in specs]
+    return _rebuild_blocks(doc, page_index, para, specs, fmt, start_ordinal=ordinal, align=align)
 
 
 _ORIGIN_TOL = 0.75  # pt, matching a re-extracted line back to a drawn one
@@ -2474,20 +2913,15 @@ def next_item_fits(doc: pymupdf.Document, page_index: int, point: tuple[float, f
 
 
 def list_item_kind(para: Paragraph) -> tuple[str | None, int]:
-    """The list kind of a paragraph: ``("bullet", 1)`` for a folded bullet,
-    ``("number", n)`` for a leading ordinal, ``(None, 1)`` for a plain
-    paragraph. Drives the toolbar/menu state and re-application on indent."""
-    if para.hang_indent > 0 and para.spans and is_bullet_only(para.spans[0].text):
-        return "bullet", 1
-    marker = leading_marker(para.text)
-    if marker is not None and marker.kind != "bullet":
-        return "number", marker.ordinal or 1
-    if marker is not None and marker.kind == "bullet":
-        return "bullet", 1
+    """The list kind of a paragraph: the FIRST list block's kind and ordinal
+    (``(None, 1)`` for a plain paragraph). Drives the toolbar/menu state."""
+    for spec in paragraph_blocks(para):
+        if spec.kind is not None:
+            return spec.kind, spec.ordinal or 1
     return None, 1
 
 
-# The indent step (pt) for L4 increase/decrease indent — the samples' marker gap.
+# The indent step (pt) per list LEVEL — the samples' marker gap.
 LIST_INDENT_STEP = 18.0
 
 
@@ -2497,16 +2931,27 @@ def indent_list_item(
     para: Paragraph,
     delta: float,
 ) -> ParagraphReplaceResult:
-    """Shift a list item's whole box left/right by ``delta`` (L4 increase /
-    decrease indent), re-drawing its marker at the new position.
+    """Step the paragraph's list blocks one indent LEVEL deeper (``delta`` > 0)
+    or shallower (list v2 — the Acrobat/Word model: indentation nests within
+    the box, the box itself never moves).
 
-    Only for a list item (a plain paragraph is returned unchanged). The marker
-    is REDRAWN, so an imported symbol bullet becomes a standard bullet glyph on
-    indent (its original span cannot be translated) — an accepted trade-off."""
-    kind, ordinal = list_item_kind(para)
-    if kind is None:
+    Only the sign of ``delta`` matters (the parameter shape is shared with
+    the UI's step buttons). Outdenting an item already at level 0 removes its
+    list formatting, the Word convention. Raises when the paragraph has no
+    list block at all. Markers are REDRAWN at the new level (per-level glyph
+    or numbering), which is the point of the level change."""
+    specs = paragraph_blocks(para)
+    if not any(spec.kind is not None for spec in specs):
         raise ValueError("not a list item")
-    return set_list_style(doc, page_index, para, kind, ordinal=ordinal, indent=delta)
+    step = 1 if delta > 0 else -1
+    fmt: list[tuple[str | None, int]] = []
+    for spec in specs:
+        if spec.kind is None:
+            fmt.append((None, 0))
+        else:
+            level = spec.level + step
+            fmt.append((spec.kind, level) if level >= 0 else (None, 0))
+    return _rebuild_blocks(doc, page_index, para, specs, fmt)
 
 
 def _split_span_selection(
@@ -2656,9 +3101,18 @@ def insert_new_runs(
     *,
     align: str = "left",
     pitch: float | None = None,
+    blocks: Sequence[ListBlock | None] | None = None,
+    width: float | None = None,
 ) -> tuple[str, ...]:
     """Insert NEW rich text at a baseline point (E9). Additive. Returns the
     VISUAL line texts laid out (for the box content fingerprint).
+
+    ``blocks`` switches on per-block list layout (list v2, see
+    :class:`ListBlock`): markers drawn from structure, bodies hung, and the
+    body WRAPS to ``width`` (or to the page's right margin when ``width`` is
+    None) — free-standing plain text keeps its no-wrap hard-break layout.
+    In block mode the returned lines come from re-reading the page
+    (:func:`lines_in_box`), so the fingerprint matches extraction exactly.
 
     Hard ``\\n`` breaks only (no wrap width for free-standing text); line
     pitch defaults to 1.2 × the first run's base size. The point (and every
@@ -2684,14 +3138,20 @@ def insert_new_runs(
     # spans' fonts) to concrete fonts before layout.
     runs, _font_fallback = _resolve_embed_runs(doc, page_index, runs)
     page = doc[page_index]
-    width, height = page.rect.width, page.rect.height
+    page_w, page_h = page.rect.width, page.rect.height
     if page.rotation % 180 == 90:
-        width, height = height, width
+        page_w, page_h = page_h, page_w
     x, y = point
-    if not (0 <= x < width and 0 < y <= height):
+    if not (0 <= x < page_w and 0 < y <= page_h):
         raise ValueError("insertion point is outside the page")
 
-    lines = _layout_runs(runs, None)
+    if blocks is not None:
+        wrap = width if width is not None else (page_w - 2.0 - x)
+        if wrap < 20.0:
+            raise ValueError("There is no room for a list here — start it further left.")
+        lines = _layout_block_runs(runs, blocks, wrap)
+    else:
+        lines = _layout_runs(runs, None)
     while lines and not lines[-1]:
         lines.pop()
     base_size = next(
@@ -2701,10 +3161,22 @@ def insert_new_runs(
         pitch = 1.2 * base_size
     elif pitch <= 0:
         raise ValueError("pitch must be positive")
-    if y + (len(lines) - 1) * pitch > height:
+    if y + (len(lines) - 1) * pitch > page_h:
         raise ValueError("the text runs off the page bottom — remove some lines")
     widths = [(line[-1].x + line[-1].width) if line else 0.0 for line in lines]
     block = max(widths, default=0.0)
+    if blocks is not None:
+        # Block mode: fragment x-offsets are pre-baked (indents, hangs), so
+        # every line starts at the point with no justification shift, and the
+        # fingerprint comes from re-reading the page (see the docstring).
+        for i, line in enumerate(lines):
+            _insert_line(page, x, y + i * pitch, line)
+        max_size = max(
+            (f.style.size for line in lines for f in line if f.text.strip()), default=base_size
+        )
+        bbox = (x, y - 1.1 * max_size, x + block, y + (len(lines) - 1) * pitch + 0.35 * max_size)
+        origins = [(x + line[0].x, y + i * pitch) for i, line in enumerate(lines) if line]
+        return lines_in_box(doc, page_index, bbox, origins)
     for i, line in enumerate(lines):
         _insert_line(page, x + _align_shift(align, block, widths[i]), y + i * pitch, line)
     return _visual_line_texts(lines)
