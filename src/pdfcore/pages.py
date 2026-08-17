@@ -70,7 +70,7 @@ def reorder(doc: pymupdf.Document, order: Iterable[int]) -> None:
         boxregistry.write_boxes(
             doc,
             [
-                boxregistry.BoxRecord(b.id, mapping[b.page], b.rect)
+                boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text)
                 for b in boxes_before
                 if b.page in mapping
             ],

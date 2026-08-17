@@ -96,10 +96,14 @@ def test_delete_pages_remaps_and_drops(tmp_path):
 def test_reorder_remaps(tmp_path):
     src = _blank_pdf(tmp_path, pages=3)
     with PdfDocument.open(src) as doc:
-        box = doc.add_box(0, (1.0, 1.0, 2.0, 2.0))
+        box = doc.add_box(0, (1.0, 1.0, 2.0, 2.0), "hello\nworld")
         doc.reorder([2, 0, 1])  # old page 0 is now page 1
         assert doc.boxes()[0].page == 1
         assert doc.boxes()[0].id == box.id
+        # reorder rebuilds the registry by hand (select() drops PieceInfo) —
+        # the content fingerprint must survive that rebuild, not just id/rect
+        # (it silently came back "" until 0.10.0).
+        assert doc.boxes()[0].text == "hello\nworld"
 
 
 def test_insert_pages_shifts(tmp_path):
