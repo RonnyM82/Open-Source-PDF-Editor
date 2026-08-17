@@ -294,6 +294,16 @@ class PdfDocument:
         """Every paragraph on page ``n`` (unrotated page coordinates)."""
         return textedit.paragraphs_on_page(self._doc, n, boundaries=boundaries)
 
+    def available_wrap_width(self, n: int, para: Paragraph) -> float:
+        """How wide ``para`` may set text without printing over anything to its
+        right — the honest wrap width for a user-INSERTED text box.
+
+        Only for paragraphs a registered box owns: a pre-existing document
+        paragraph has a real column width. See
+        :func:`pdfcore.textedit.available_wrap_width`.
+        """
+        return textedit.available_wrap_width(self._doc, n, para)
+
     def replace_paragraph(
         self,
         n: int,
@@ -678,23 +688,41 @@ class PdfDocument:
         boxes = boxregistry.read_boxes(self._doc)
         return boxes if n is None else [b for b in boxes if b.page == n]
 
-    def add_box(self, n: int, rect: tuple[float, float, float, float], text: str = "") -> BoxRecord:
+    def add_box(
+        self,
+        n: int,
+        rect: tuple[float, float, float, float],
+        text: str = "",
+        width: float = 0.0,
+    ) -> BoxRecord:
         """Register a newly inserted box on page ``n``; returns its record.
 
         ``text`` is the box's content fingerprint (used to disambiguate
         overlapping boxes — task 5); empty falls back to pure geometry.
+        ``width`` records a wrap width the user chose deliberately (0.0 = none,
+        measured per edit instead — BW2).
         """
-        return boxregistry.add_box(self._doc, n, rect, text)
+        return boxregistry.add_box(self._doc, n, rect, text, width)
 
     def update_box_rect(self, box_id: str, rect: tuple[float, float, float, float]) -> None:
         """Record a registered box's new placement after a MOVE/resize (content
         unchanged, so the fingerprint is preserved)."""
         boxregistry.update_box_rect(self._doc, box_id, rect)
 
-    def update_box(self, box_id: str, rect: tuple[float, float, float, float], text: str) -> None:
+    def update_box(
+        self,
+        box_id: str,
+        rect: tuple[float, float, float, float],
+        text: str,
+        width: float | None = None,
+    ) -> None:
         """Record a box's new placement AND content after an EDIT changed its
-        text (the fingerprint must follow the new content)."""
-        boxregistry.update_box(self._doc, box_id, rect, text)
+        text (the fingerprint must follow the new content).
+
+        ``width`` sets a newly chosen wrap width; ``None`` keeps the box's
+        existing one, so an ordinary edit never discards the user's drag.
+        """
+        boxregistry.update_box(self._doc, box_id, rect, text, width)
 
     def remove_box(self, box_id: str) -> None:
         """Drop a box from the registry (e.g. its text was deleted)."""

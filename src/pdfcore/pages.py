@@ -70,7 +70,7 @@ def reorder(doc: pymupdf.Document, order: Iterable[int]) -> None:
         boxregistry.write_boxes(
             doc,
             [
-                boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text)
+                boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text, b.width)
                 for b in boxes_before
                 if b.page in mapping
             ],
@@ -141,7 +141,7 @@ def extract(doc: pymupdf.Document, page_nos: Iterable[int], out: str | Path) -> 
             boxregistry.write_boxes(
                 dst,
                 [
-                    boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text)
+                    boxregistry.BoxRecord(b.id, mapping[b.page], b.rect, b.text, b.width)
                     for b in boxes_before
                     if b.page in mapping
                 ],

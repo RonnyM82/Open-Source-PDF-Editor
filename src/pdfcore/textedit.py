@@ -2084,6 +2084,85 @@ def merge_paragraphs(paras: Sequence[Paragraph]) -> Paragraph:
     )
 
 
+# Clearance (pt) kept between a box's wrap width and the next obstacle to its
+# right. The page's own right margin uses _PAGE_MARGIN, which matches what
+# insert_new_runs already leaves for free-standing text.
+_BOX_CLEARANCE = 4.0
+_PAGE_MARGIN = 2.0
+
+
+def _text_band(origin_y: float, size: float) -> tuple[float, float]:
+    """A line's occupied vertical band from its baseline and size.
+
+    The SAME convention the E9.4 growth-collision check uses, deliberately:
+    the horizontal and the vertical guard must agree about what counts as
+    overlapping text. Span BBOXES are the wrong measure here — they run the
+    line's full ascender..descender height, and real documents set lines
+    tighter than their font metrics (the sample quote's description lines
+    overlap by 2.39 pt), so a bbox test lets the line ABOVE a box veto its
+    width.
+    """
+    return origin_y - 0.8 * size, origin_y + 0.25 * size
+
+
+def available_wrap_width(doc: pymupdf.Document, page_index: int, para: Paragraph) -> float:
+    """How wide ``para`` may set text without printing over anything to its
+    right (the honest wrap width for a user-INSERTED text box).
+
+    An inserted box registers as wide as the glyphs first typed into it, and
+    ``replace_paragraph_runs`` falls back to the paragraph's own bbox, so
+    re-editing such a box wraps at the width of whatever was typed the first
+    time: adding one word manufactures a second line, and the E9.4
+    growth-collision check then refuses the edit outright. This measures the
+    room the box actually has instead.
+
+    From the paragraph's left edge to the nearest obstacle on its right — any
+    other text span or image whose vertical band overlaps one of the
+    paragraph's own line bands — less a small clearance, capped by the page's
+    right margin. Bands come from :func:`_text_band`, not from bboxes.
+
+    The result is FLOORED at the paragraph's own ink width: never return less
+    than the text already occupies, or the next commit would re-wrap text that
+    was fitting perfectly (the same class of bug the wrap grace exists for). So
+    a box that is already wider than its surroundings allow keeps its width and
+    gains nothing, and E9.4 still refuses to grow it, which is honest — there
+    really is no room.
+
+    The CALLER decides who gets this: the UI applies it only to paragraphs a
+    registered box owns. A pre-existing document paragraph has a real column
+    width, and widening that would re-wrap real documents.
+    """
+    from pdfcore import imageedit as imageedit_module
+
+    x0 = para.bbox[0]
+    ink = max(0.0, para.bbox[2] - x0)
+    page = doc[page_index]
+    page_w = page.rect.width
+    if page.rotation % 180 == 90:  # unrotated bounds (the space we insert in)
+        page_w = page.rect.height
+    limit = max(0.0, page_w - _PAGE_MARGIN - x0)
+
+    bands = [_text_band(span.origin[1], span.size) for span in para.spans] or [
+        (para.bbox[1], para.bbox[3])
+    ]
+
+    def overlaps(top: float, bottom: float) -> bool:
+        return any(top < b_bot and bottom > b_top for b_top, b_bot in bands)
+
+    members = set(para.spans)
+    for span in extract_spans(doc, page_index):
+        if span in members or not span.text.strip():
+            continue
+        top, bottom = _text_band(span.origin[1], span.size)
+        if span.bbox[0] > x0 and overlaps(top, bottom):
+            limit = min(limit, span.bbox[0] - x0 - _BOX_CLEARANCE)
+    for image in imageedit_module.images_on_page(doc, page_index):
+        ix0, iy0, ix1, iy1 = image.bbox
+        if ix0 > x0 and ix1 > ix0 and overlaps(iy0, iy1):
+            limit = min(limit, ix0 - x0 - _BOX_CLEARANCE)
+    return max(ink, limit)
+
+
 def replace_paragraph_text(
     doc: pymupdf.Document,
     page_index: int,
@@ -2364,14 +2443,30 @@ def replace_paragraph_runs(
         # A KEPT bullet marker survives the redaction (its span is excluded),
         # preserving the exact symbol glyph. A CREATED marker (L2 make_list, or a
         # numbered marker) has no such span and is DRAWN at the box left.
+        ink_right = 0.0
         if marker_runs is not None and keep_span is None:
             marker_lines = _layout_runs(marker_runs, None)
             if marker_lines and marker_lines[0]:
                 _insert_line(page, origin_x, first_baseline, marker_lines[0])
+                ink_right = marker_lines[0][-1].x + marker_lines[0][-1].width
+        # The box rect hugs the laid-out INK, never the wrap width. The rect is
+        # what box ownership hit-tests against (``_line_region`` / ``_box_for``),
+        # and the wrap width is now the room the box HAS rather than the width
+        # of its text (see available_wrap_width) — reporting the wrap would
+        # register a page-wide rect around three words and inflate what the box
+        # claims. An unbreakable word that overflows the wrap widens the ink
+        # honestly.
+        ink_right = max(
+            ink_right,
+            max(
+                (hang + line_shift(line) + line[-1].x + line[-1].width for line in lines if line),
+                default=0.0,
+            ),
+        )
         new_bbox = (
             origin_x,
             first_baseline - ascent,
-            origin_x + wrap,
+            origin_x + ink_right,
             first_baseline + (max(len(lines), 1) - 1) * pitch_val + descent,
         )
     visual = _visual_line_texts(lines)

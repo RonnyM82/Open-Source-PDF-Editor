@@ -3064,3 +3064,198 @@ def test_partial_strike_survives_reedit_via_segments(tmp_path):
         span2 = next(s for s in doc.text_spans(0) if "SKIP" in s.text)
         plain2 = "".join(t for t, _u, s in span2.rule_segments if not s)
         assert "SKIP" in plain2  # the cleared word stayed cleared through the edit
+
+
+# --- available wrap width for inserted boxes (BW1) -------------------------
+
+
+def _inserted_box_pdf(tmp_path, *, below=True, right_of=None, image=False):
+    """A page with a short inserted-style label at (72, 117), optionally with a
+    paragraph one pitch below it (the E9.4 trap) and an obstacle to its right."""
+    path = tmp_path / f"box{'_below' if below else ''}{'_img' if image else ''}.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    if below:
+        # Pitch 10 on a 9 pt font, so the label's bbox and this paragraph's
+        # OVERLAP by ~2.4 pt while their baseline bands do not — the real
+        # quote's geometry, and the reason the width scan uses bands.
+        page.insert_text((72, 127), "International Bank or Wire Fees", fontname="helv", fontsize=9)
+        page.insert_text((72, 140), "apply to overseas payments.", fontname="helv", fontsize=9)
+    if right_of is not None:
+        page.insert_text((right_of, 117), "COLUMN", fontname="helv", fontsize=9)
+    if image:
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8))
+        pix.set_rect(pix.irect, (200, 40, 40))
+        page.insert_image(pymupdf.Rect(300, 108, 340, 122), pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def _insert_label(pdoc, text="Terms of trade", point=(72.0, 117.0)):
+    """Insert a text box the way the UI does; returns (paragraph, boundaries, box).
+
+    Mirrors ``DocumentView``'s insert command: lay the text out, register the
+    box with the INK bbox of the new spans plus the visual-line fingerprint,
+    then read the paragraph back through those boundaries.
+    """
+    before = {(s.text, s.bbox) for s in pdoc.text_spans(0)}
+    lines = pdoc.insert_text(0, point, text, style=TextStyle(code="helv", size=9.0))
+    new = [s for s in pdoc.text_spans(0) if (s.text, s.bbox) not in before]
+    rect = (
+        min(s.bbox[0] for s in new),
+        min(s.bbox[1] for s in new),
+        max(s.bbox[2] for s in new),
+        max(s.bbox[3] for s in new),
+    )
+    box = pdoc.add_box(0, rect, text="\n".join(lines))
+    boundaries = [(b.rect, b.text) for b in pdoc.boxes(0)]
+    para = pdoc.paragraph_at(
+        0, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2, boundaries=boundaries
+    )
+    return para, boundaries, box
+
+
+def test_inserted_box_registers_ink_wide(tmp_path):
+    """The premise of the whole fix: an inserted box is as wide as the glyphs
+    typed into it, with the rest of the page sitting unused to its right."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path)) as pdoc:
+        para, _bounds, box = _insert_label(pdoc)
+        assert box.rect[2] - box.rect[0] < 70.0  # ~58 pt of ink
+        assert para.bbox[2] - para.bbox[0] == pytest.approx(box.rect[2] - box.rect[0], abs=0.5)
+
+
+def test_available_width_reaches_the_page_margin(tmp_path):
+    """Nothing to the right, so the box may set text to the page margin."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        # 595 pt page, 2 pt margin, box left at 72.
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(595 - 2 - 72, abs=0.01)
+
+
+def test_available_width_capped_by_text_to_the_right(tmp_path):
+    """A span in the box's own band caps the width at its left edge, less the
+    clearance — the horizontal half of the collision idea."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, right_of=300.0)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(300 - 72 - 4, abs=0.01)
+
+
+def test_available_width_ignores_text_outside_the_band(tmp_path):
+    """The paragraph one pitch BELOW must not cap the width even though the span
+    bboxes overlap: lines are set tighter than their font metrics (2.39 pt on
+    the real quote), which is why the scan uses baseline bands, not bboxes."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        below = next(s for s in pdoc.text_spans(0) if "International" in s.text)
+        assert below.bbox[1] < para.bbox[3]  # the bboxes really do overlap
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(595 - 2 - 72, abs=0.01)
+
+
+def test_available_width_capped_by_an_image(tmp_path):
+    """An image beside the box caps it the way text does."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, image=True)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(300 - 72 - 4, abs=0.01)
+
+
+def test_available_width_never_below_the_paragraphs_own_ink(tmp_path):
+    """A box wider than the room it has (text inserted near the right margin)
+    keeps its own ink width. Returning less would re-wrap text that was fitting
+    perfectly, and E9.4 still speaks for whether the box may grow."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, below=False)) as pdoc:
+        para, _bounds, _box = _insert_label(
+            pdoc,
+            text="a label long enough to reach past the right margin of the page",
+            point=(400.0, 117.0),
+        )
+        ink = para.bbox[2] - para.bbox[0]
+        assert ink > 595 - 2 - 400  # the premise: it already overruns the margin
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(ink, abs=0.01)
+
+
+def test_available_width_floored_when_an_obstacle_sits_inside_the_box(tmp_path):
+    """A box MOVED over other text has an obstacle inside its own x-range, which
+    would compute a negative width. The floor keeps it at its ink."""
+    path = tmp_path / "inside.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((100, 133), "under", fontname="helv", fontsize=9)  # in line two's band
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc, text="line one\nline two")
+        assert len(para.lines) == 2  # the obstacle is not a member of the box
+        ink = para.bbox[2] - para.bbox[0]
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(ink, abs=0.01)
+
+
+def test_available_width_ignores_the_paragraphs_own_spans(tmp_path):
+    """A multi-line box measures its room from the page, not from its own later
+    lines (which start at the same left edge)."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, below=False)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc, text="line one\nline two here")
+        assert len(para.lines) == 2
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(595 - 2 - 72, abs=0.01)
+
+
+def test_new_bbox_hugs_the_ink_not_the_wrap_width(tmp_path):
+    """The reported box rect is the laid-out INK, so a short edit inside a wide
+    box no longer registers a page-wide rect (the rect is what ownership
+    hit-tests against)."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, below=False)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        result = pdoc.replace_paragraph_runs(
+            0, para, [StyledRun("Terms", TextStyle(code="helv", size=9.0))], width=460.0
+        )
+        span = next(s for s in pdoc.text_spans(0) if s.text == "Terms")
+        assert result.new_bbox[2] == pytest.approx(span.bbox[2], abs=1.0)
+        assert result.new_bbox[2] - result.new_bbox[0] < 60.0  # not the 460 pt wrap
+
+
+def test_reedit_of_an_inserted_box_fits_with_the_available_width(tmp_path):
+    """The reported defect, round-tripped: adding two words to a box that sits
+    one pitch above existing text is REFUSED at the box's ink width and fits on
+    one line at its available width. Save, reopen, and the page below is
+    untouched."""
+    out = tmp_path / "reedit.pdf"
+    with PdfDocument.open(_inserted_box_pdf(tmp_path)) as pdoc:
+        para, _boundaries, box = _insert_label(pdoc)
+        runs = [StyledRun("Terms of trade apply here", TextStyle(code="helv", size=9.0))]
+        with pytest.raises(ValueError, match="already"):
+            pdoc.replace_paragraph_runs(0, para, runs)  # ink width: the refusal
+
+        width = pdoc.available_wrap_width(0, para)
+        result = pdoc.replace_paragraph_runs(0, para, runs, width=width)
+        assert result.visual_lines == ("Terms of trade apply here",)
+        pdoc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+        pdoc.save(out)
+
+    with PdfDocument.open(out) as reopened:
+        texts = [s.text for s in reopened.text_spans(0)]
+        assert "Terms of trade apply here" in texts
+        assert "International Bank or Wire Fees" in texts  # bystander intact
+        assert "apply to overseas payments." in texts
+        # The box still owns exactly its own line after the round trip.
+        stored = reopened.boxes(0)
+        assert len(stored) == 1
+        rect = stored[0].rect
+        owned = reopened.paragraph_at(
+            0,
+            (rect[0] + rect[2]) / 2,
+            (rect[1] + rect[3]) / 2,
+            boundaries=[(b.rect, b.text) for b in stored],
+        )
+        assert owned.text == "Terms of trade apply here"
+
+
+def test_hemmed_in_box_still_refuses_to_grow(tmp_path):
+    """E9.4 is untouched: with an obstacle to the right AND text below, the
+    available width equals the ink and the refusal still fires. The fix gives
+    boxes an honest width, it does not weaken the check."""
+    with PdfDocument.open(_inserted_box_pdf(tmp_path, right_of=140.0)) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        width = pdoc.available_wrap_width(0, para)
+        runs = [StyledRun("Terms of trade apply here as well", TextStyle(code="helv", size=9.0))]
+        with pytest.raises(ValueError, match="already"):
+            pdoc.replace_paragraph_runs(0, para, runs, width=width)

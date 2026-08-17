@@ -169,3 +169,67 @@ def test_legacy_record_without_text_reads_as_empty_fingerprint(tmp_path):
         boxes = doc.boxes()
         assert len(boxes) == 1
         assert boxes[0].text == ""  # absent -> empty, backward compatible
+
+
+# --- chosen wrap width (BW2) ------------------------------------------------
+
+
+def test_chosen_width_roundtrips_through_save(tmp_path):
+    """BW2: the width the user set by dragging the editor's right edge is stored
+    with the box, so it survives the editor closing, a save and a reopen."""
+    src = _blank_pdf(tmp_path)
+    out = tmp_path / "width.pdf"
+    with PdfDocument.open(src) as doc:
+        plain = doc.add_box(0, (10.0, 20.0, 30.0, 40.0), "auto")
+        assert plain.width == 0.0  # nothing chosen: measured per edit instead
+        box = doc.add_box(0, (10.0, 60.0, 30.0, 80.0), "dragged", width=210.0)
+        assert box.width == 210.0
+        doc.save(out)
+    with PdfDocument.open(out) as reopened:
+        assert sorted(b.width for b in reopened.boxes(0)) == [0.0, 210.0]
+
+
+def test_move_and_edit_preserve_a_chosen_width(tmp_path):
+    """A move changes neither content nor width; an edit replaces the content and
+    keeps the width unless a new one is given."""
+    with PdfDocument.open(_blank_pdf(tmp_path)) as doc:
+        box = doc.add_box(0, (10.0, 20.0, 30.0, 40.0), "hello", width=180.0)
+
+        doc.update_box_rect(box.id, (50.0, 60.0, 70.0, 80.0))  # a move
+        assert doc.boxes()[0].width == 180.0
+
+        doc.update_box(box.id, (50.0, 60.0, 70.0, 80.0), "hello there")  # an edit
+        assert doc.boxes()[0].width == 180.0  # the drag is not discarded
+        assert doc.boxes()[0].text == "hello there"
+
+        doc.update_box(box.id, (50.0, 60.0, 70.0, 80.0), "hello there", width=240.0)
+        assert doc.boxes()[0].width == 240.0  # a fresh drag replaces it
+
+
+def test_page_ops_preserve_a_chosen_width(tmp_path):
+    """reorder rebuilds the registry by hand (select() drops PieceInfo), so the
+    width has to survive that rebuild the way the fingerprint does."""
+    with PdfDocument.open(_blank_pdf(tmp_path, pages=3)) as doc:
+        doc.add_box(0, (1.0, 1.0, 2.0, 2.0), "hello", width=150.0)
+        doc.reorder([2, 0, 1])
+        assert doc.boxes()[0].page == 1
+        assert doc.boxes()[0].width == 150.0
+        doc.delete([0])
+        assert doc.boxes()[0].width == 150.0
+
+
+def test_legacy_record_without_width_reads_as_zero(tmp_path):
+    """Every record already in a user's files predates BW2, so an absent (or
+    null) width reads as 0.0 rather than raising."""
+    import json
+
+    with PdfDocument.open(_blank_pdf(tmp_path)) as doc:
+        cat = doc._doc.pdf_catalog()
+        payload = json.dumps(
+            [
+                {"id": "abc123", "page": 0, "rect": [1.0, 2.0, 3.0, 4.0], "text": "x"},
+                {"id": "def456", "page": 0, "rect": [1.0, 2.0, 3.0, 4.0], "width": None},
+            ]
+        )
+        doc._doc.xref_set_key(cat, "PieceInfo/PDFEditor/Private", pymupdf.get_pdf_str(payload))
+        assert [b.width for b in doc.boxes()] == [0.0, 0.0]
