@@ -949,6 +949,33 @@ class DocumentView(QWidget):
 
         self._push_command("Insert pages", op, ("all", -1))
 
+    def insert_blank_page(self, at: int) -> None:
+        """Insert a blank page matching the currently displayed page size."""
+        width, height = self._doc.page_size(self._current_page)
+
+        def op(doc: PdfDocument) -> None:
+            doc.insert_blank(at, width, height)
+            self._current_page = min(at, doc.page_count - 1)
+
+        self._push_command("Add blank page", op, ("all", -1))
+
+    def extract_current_page(self, out: Path) -> bool:
+        """Export the current page, including unsaved edits, to ``out``."""
+        try:
+            source = self._doc.source
+            if source is not None and out.resolve() == source.resolve():
+                raise ValueError("choose a new file; extraction cannot replace the open document")
+            self._doc.extract_pages([self._current_page], out)
+        except Exception as exc:  # noqa: BLE001 - surface filesystem/PDF errors
+            if self.isVisible():
+                QMessageBox.critical(
+                    self, "Extract page failed", f"Could not extract page:\n\n{exc}"
+                )
+            else:
+                self.editWarning.emit(f"Extract page failed: {exc}")
+            return False
+        return True
+
     # --- click-to-edit text (Phase 2) ------------------------------------
     def focus_open_editor(self) -> None:
         """Hand keyboard focus back to whichever in-place editor is open.

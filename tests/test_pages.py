@@ -136,6 +136,31 @@ def test_insert_from_page_range(multipage_pdf, tmp_path):
     assert len(texts) == before + 1
 
 
+def test_insert_blank_roundtrip(multipage_pdf, page_marker, tmp_path):
+    out = tmp_path / "blank.pdf"
+    with PdfDocument.open(multipage_pdf) as doc:
+        width, height = doc.page_size(1)
+        doc.insert_blank(2, width, height)
+        doc.save(out)
+    assert _page_texts(out) == [
+        page_marker(0),
+        page_marker(1),
+        "",
+        page_marker(2),
+        page_marker(3),
+        page_marker(4),
+    ]
+
+
+def test_extract_uses_live_document_state(multipage_pdf, page_marker, tmp_path):
+    out = tmp_path / "page.pdf"
+    with PdfDocument.open(multipage_pdf) as doc:
+        doc.rotate([2], 90)
+        doc.extract_pages([2], out)
+    assert _page_texts(out) == [page_marker(2)]
+    assert _rotations(out) == [90]
+
+
 # --- M10: merge ---------------------------------------------------------
 
 
