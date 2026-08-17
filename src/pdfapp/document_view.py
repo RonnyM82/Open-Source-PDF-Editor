@@ -596,6 +596,28 @@ class DocumentView(QWidget):
             return min(legacy, key=area) if legacy else None
         return min(containing, key=area)
 
+    @staticmethod
+    def _box_wrap_width(doc: PdfDocument, n: int, para: Paragraph, box) -> float | None:
+        """The width a user-INSERTED text box sets text at, or None when the
+        paragraph is pre-existing document text (BW3).
+
+        An inserted box registers as wide as the glyphs first typed into it, and
+        the engine otherwise wraps a re-edit to the paragraph's own bbox — so
+        adding one word manufactured a second line and E9.4 refused the edit.
+        A box the user has RESIZED keeps the width they chose (it persists in
+        the registry now); every other inserted box is measured against the page
+        (``available_wrap_width``), which stops at the next obstacle on its
+        right, so the extra room can never print over anything.
+
+        None for pre-existing text is deliberate: a quote's description column
+        has a real width, and widening it would re-wrap real documents.
+        """
+        if box is None:
+            return None
+        if box.width > 0:
+            return box.width
+        return doc.available_wrap_width(n, para)
+
     # --- read-only / edit mode (U0) ---------------------------------------
     @property
     def edit_mode(self) -> bool:
@@ -1452,8 +1474,17 @@ class DocumentView(QWidget):
             self._begin_text_edit(page_index, para.spans[0])
             return
         self._clear_selection()  # one chrome at a time — the editor takes over
+        # The editor opens at the width the COMMIT will wrap at, so what the
+        # user watches wrapping is what wraps (BW3): an inserted box gets the
+        # room it actually has, pre-existing text its own column. Widened in
+        # PAGE space so the seam keeps rotated pages honest.
+        box = self._box_for(self._doc, page_index, para.bbox, para.text)
+        edit_bbox = para.bbox
+        wrap = self._box_wrap_width(self._doc, page_index, para, box)
+        if wrap is not None and wrap > para.bbox[2] - para.bbox[0]:
+            edit_bbox = (para.bbox[0], para.bbox[1], para.bbox[0] + wrap, para.bbox[3])
         scene_rect = page_coords.page_rect_to_scene(
-            para.bbox,
+            edit_bbox,
             render_zoom=self._canvas.render_zoom,
             rotation=self._doc.page_rotation(page_index),
             page_size_pts=self._doc.page_size(page_index),
@@ -1461,6 +1492,9 @@ class DocumentView(QWidget):
         top_left = self._canvas.mapFromScene(QPointF(scene_rect[0], scene_rect[1]))
         bottom_right = self._canvas.mapFromScene(QPointF(scene_rect[2], scene_rect[3]))
         rect = QRect(top_left, bottom_right).normalized().adjusted(-2, -2, 2, 8)
+        viewport = self._canvas.viewport()
+        if viewport.isVisible():  # never open past the viewport's right edge
+            rect.setWidth(min(rect.width(), max(60, viewport.width() - rect.left() - 2)))
         self._pending_paragraph = (page_index, para)
         self._edit_embedded_fonts = self._embedded_font_keys(para.spans)
         # Emitted BEFORE the align capture: the toolbar reflects the
@@ -2315,14 +2349,19 @@ class DocumentView(QWidget):
             align = self._current_align() or "left"
             if not text.strip():
                 return
+            # A width the user set by dragging the insert editor's right edge.
+            # It is the box's wrap width from its first edit onward (BW3) — the
+            # plain insert path still lays text out with hard breaks only, so it
+            # is recorded rather than applied here.
+            chosen_width = 0.0
+            if self._para_editor.user_sized_width is not None:
+                chosen_width = max(
+                    30.0, (self._para_editor.user_sized_width - 8) / self._canvas.zoom
+                )
             if pieces is not None:  # rich path: styles typed/applied in the editor
                 runs, _resolved = self._runs_from_pieces(pieces)
                 blocks = _engine_blocks(self._para_editor.committed_blocks_for(text))
-                insert_width = None
-                if blocks is not None and self._para_editor.user_sized_width is not None:
-                    insert_width = max(
-                        30.0, (self._para_editor.user_sized_width - 8) / self._canvas.zoom
-                    )
+                insert_width = chosen_width if (blocks is not None and chosen_width) else None
 
                 def do_insert(doc: PdfDocument) -> tuple[str, ...]:
                     return doc.insert_runs(
@@ -2351,6 +2390,7 @@ class DocumentView(QWidget):
                             max(s.bbox[3] for s in new),
                         ),
                         text="\n".join(lines),  # VISUAL-line fingerprint (task 5)
+                        width=chosen_width,  # 0.0 = measure the room per edit
                     )
 
             self._push_command("Insert text", insert_op, ("page", page_index))
@@ -2385,9 +2425,9 @@ class DocumentView(QWidget):
             ):
                 return  # nothing changed — text, width, styling, align, lists
 
-            def do_edit(doc: PdfDocument):
+            def do_edit(doc: PdfDocument, width: float | None):
                 return doc.replace_paragraph_runs(
-                    page_index, para, runs, width=width_pts, align=align, blocks=blocks
+                    page_index, para, runs, width=width, align=align, blocks=blocks
                 )
         else:  # direct-call fallback: one uniform style for the whole block
             style = self._current_style()
@@ -2399,19 +2439,33 @@ class DocumentView(QWidget):
             ):
                 return
 
-            def do_edit(doc: PdfDocument):
+            def do_edit(doc: PdfDocument, width: float | None):
                 return doc.replace_paragraph(
-                    page_index, para, text, style=style, width=width_pts, align=align
+                    page_index, para, text, style=style, width=width, align=align
                 )
 
         def op(doc: PdfDocument) -> None:
             box = self._box_for(doc, page_index, para.bbox, para.text)  # match on OLD content
-            result = do_edit(doc)
+            # A drag in THIS editor session wins; otherwise an inserted box
+            # wraps at the width it has rather than at the width of the text
+            # last typed into it (BW3), and pre-existing text keeps its own.
+            width = (
+                width_pts
+                if width_pts is not None
+                else self._box_wrap_width(doc, page_index, para, box)
+            )
+            result = do_edit(doc, width)
             results.append(result)
             if box is not None:  # keep the registry rect + fingerprint in step
                 if result.new_bbox is not None:
                     # Store the VISUAL lines (post-wrap), not the logical text.
-                    doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+                    # width_pts (a real drag) persists; None keeps the box's own.
+                    doc.update_box(
+                        box.id,
+                        result.new_bbox,
+                        "\n".join(result.visual_lines),
+                        width=width_pts,
+                    )
                 else:  # emptied — the box's text is gone, drop its identity
                     doc.remove_box(box.id)
 
