@@ -233,7 +233,15 @@ the viewport now, which means at high zoom the editor can show more wrapping
 than the commit will produce. That is the pre-fix situation for that one case,
 and it is better than an editor running off screen.
 
-Test counts: 17 engine tests (BW1 and BW2), 6 UI tests (BW3), whole suite 1215
+A self-review after BW3 found one gap the plan had not thought about, fixed on
+the spot. A ROTATED obstacle (a quarter-turn CAD dimension label) occupies its
+whole tall box, but the baseline band is a horizontal-text rule and measures it
+as a thin strip around its origin, so a box beside one could widen straight
+over it. Rotated spans are measured by bbox now. The E9.4 collision check has
+the same blind spot, which is worth knowing but is not this fix's to close: it
+would change what an edit refuses, and that deserves its own decision.
+
+Test counts: 18 engine tests (BW1 and BW2), 6 UI tests (BW3), whole suite 1216
 green. `scripts/lint.ps1` and `scripts/test.ps1` clean.
 
 ## 7. Open questions

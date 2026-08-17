@@ -3152,6 +3152,28 @@ def test_available_width_ignores_text_outside_the_band(tmp_path):
         assert pdoc.available_wrap_width(0, para) == pytest.approx(595 - 2 - 72, abs=0.01)
 
 
+def test_available_width_capped_by_rotated_text_by_its_bbox(tmp_path):
+    """A quarter-turn CAD dimension label occupies its whole (tall) box, so it
+    is measured by bbox: the baseline band is a horizontal-text rule and would
+    under-detect it, letting the box widen straight over it."""
+    path = tmp_path / "rot.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    # Bottom-up text whose baseline origin sits well below the label's band,
+    # but whose ink runs up THROUGH it.
+    page.insert_text((300, 150), "DIMENSION 42.5 REF", fontname="helv", fontsize=9, rotate=90)
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc)
+        rotated = next(s for s in pdoc.text_spans(0) if "DIM" in s.text)
+        assert rotated.rotation == 90
+        assert not (rotated.origin[1] - 0.8 * 9 < para.bbox[3])  # band alone misses it
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(
+            rotated.bbox[0] - 72 - 4, abs=0.01
+        )
+
+
 def test_available_width_capped_by_an_image(tmp_path):
     """An image beside the box caps it the way text does."""
     with PdfDocument.open(_inserted_box_pdf(tmp_path, image=True)) as pdoc:

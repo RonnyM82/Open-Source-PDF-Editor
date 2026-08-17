@@ -2153,7 +2153,14 @@ def available_wrap_width(doc: pymupdf.Document, page_index: int, para: Paragraph
     for span in extract_spans(doc, page_index):
         if span in members or not span.text.strip():
             continue
-        top, bottom = _text_band(span.origin[1], span.size)
+        # A ROTATED obstacle is measured by its bbox: the baseline band is a
+        # horizontal-text rule, and a quarter-turn CAD dimension label really
+        # does occupy its whole (tall) box, so the band would under-detect it.
+        top, bottom = (
+            _text_band(span.origin[1], span.size)
+            if span.rotation == 0
+            else (span.bbox[1], span.bbox[3])
+        )
         if span.bbox[0] > x0 and overlaps(top, bottom):
             limit = min(limit, span.bbox[0] - x0 - _BOX_CLEARANCE)
     for image in imageedit_module.images_on_page(doc, page_index):
