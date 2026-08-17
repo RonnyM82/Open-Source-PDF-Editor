@@ -234,7 +234,9 @@ def test_multi_item_list_lays_out_in_one_box(tmp_path):
         spans = _spans(doc)
         marker = next(s for s in spans if s.text.strip() == "1.")
         body = next(s for s in spans if "Alpha" in s.text)
-        wrapped = next(s for s in spans if "second visual line" in s.text)
+        # The wrap point may shift a word with layout grace — find the
+        # CONTINUATION span (item 2's tail on its own line, no marker).
+        wrapped = next(s for s in spans if "visual line" in s.text and "Beta" not in s.text)
         nested = next(s for s in spans if "Gamma" in s.text)
         nested_marker = next(s for s in spans if s.text.strip() == "a.")
         # marker at the point, bodies and wraps hang 18 deeper; the nested

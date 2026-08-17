@@ -224,6 +224,76 @@ def test_insert_editor_creates_a_list_from_scratch(qapp, tmp_path):
         window.close()
 
 
+# --- LR4b: moves / duplicates / merges keep the list --------------------------
+
+
+def _bullet_box(view, needle):
+    """Format the paragraph containing ``needle`` as a bullet item via the
+    editor (the real flow), returning the re-read paragraph."""
+    view._begin_paragraph_edit(0, _geom_para(view, needle))
+    view.toggle_editor_list("bullet")
+    view._para_editor.commit()
+    return _geom_para(view, needle)
+
+
+def test_moving_a_list_box_keeps_the_list(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        view = _view(window, tmp_path, ["An item that will be moved"])
+        item = _bullet_box(view, "will be moved")
+        z = view._canvas.render_zoom
+        cx = (item.bbox[0] + item.bbox[2]) / 2
+        cy = (item.bbox[1] + item.bbox[3]) / 2
+        view._on_move_drag_started(cx * z, cy * z)
+        view._on_move_drag_finished(cx * z, cy * z, (cx + 60.0) * z, (cy + 40.0) * z)
+        moved = _geom_para(view, "will be moved")
+        assert moved.bbox[1] > item.bbox[1] + 30
+        specs = paragraph_blocks(moved)
+        assert [s.kind for s in specs] == ["bullet"]  # still a list at the new spot
+        assert moved.hang_indent > 0
+    finally:
+        window.close()
+
+
+def test_duplicating_a_list_box_copies_the_list(qapp, tmp_path):
+    window = MainWindow()
+    try:
+        view = _view(window, tmp_path, ["An item to duplicate"])
+        item = _bullet_box(view, "to duplicate")
+        view._duplicate_paragraph_at(0, item)
+        copies = [p for p in view.page_geometry(0).paragraphs if "to duplicate" in p.text]
+        assert len(copies) == 2
+        for para in copies:
+            assert [s.kind for s in paragraph_blocks(para)] == ["bullet"]
+    finally:
+        window.close()
+
+
+def test_merging_two_list_boxes_stays_a_list(qapp, tmp_path):
+    """Two ADJACENT inserted list boxes merge into one box that still reads
+    as a two-item list (the union's blocks re-derive from the markers)."""
+    window = MainWindow()
+    try:
+        view = _view(window, tmp_path)
+        for y, text in ((200.0, "Alpha merge item"), (230.0, "Beta merge item")):
+            view._pending_insert = (0, (100.0, y))
+            view._on_paragraph_committed(text)
+        for needle in ("Alpha merge", "Beta merge"):
+            view._begin_paragraph_edit(0, _geom_para(view, needle))
+            view.toggle_editor_list("number")
+            view._para_editor.commit()
+        a = _geom_para(view, "Alpha merge")
+        b = _geom_para(view, "Beta merge")
+        view._multi_paragraphs = [(0, a), (0, b)]
+        view._merge_selected_paragraphs()
+        merged = _geom_para(view, "Alpha merge")
+        assert "Beta merge" in merged.text  # one box now
+        specs = paragraph_blocks(merged)
+        assert [s.kind for s in specs] == ["number", "number"]
+    finally:
+        window.close()
+
+
 def test_shift_enter_breaks_the_line_within_an_item(qapp, tmp_path):
     window = MainWindow()
     try:

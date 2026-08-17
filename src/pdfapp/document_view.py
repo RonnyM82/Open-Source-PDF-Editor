@@ -71,6 +71,7 @@ from pdfcore.textedit import (
     map_font_to_base14,
     merge_paragraphs,
     paragraph_blocks,
+    paragraph_runs_blocks,
 )
 
 # Thumbnails render at a fixed low dpi for speed; the main page renders at
@@ -2984,7 +2985,9 @@ class DocumentView(QWidget):
         except ValueError as exc:
             self.editWarning.emit(str(exc))
             return
-        runs = self._runs_from_paragraph(union)
+        # Merging boxes that carry list items keeps them a list (LR4b): the
+        # union's blocks re-derive from the members' own markers.
+        runs, blocks = self._runs_blocks_from_paragraph(union)
 
         def op(doc: PdfDocument) -> None:
             boxes = [
@@ -2992,7 +2995,7 @@ class DocumentView(QWidget):
                 for box in (self._box_for(doc, n, pp.bbox, pp.text) for pp in paras)
                 if box is not None
             ]
-            result = doc.replace_paragraph_runs(n, union, runs)
+            result = doc.replace_paragraph_runs(n, union, runs, blocks=blocks)
             seen: set[str] = set()
             for box in boxes:
                 if box.id not in seen:
@@ -3015,7 +3018,7 @@ class DocumentView(QWidget):
         ``update_box_rect``. Zero-offset boxes are skipped, so an align that
         leaves the anchor box put does not needlessly redact it."""
         moves = [
-            (para, self._runs_from_paragraph(para), off)
+            (para, *self._runs_blocks_from_paragraph(para), off)
             for para, off in offsets
             if off != (0.0, 0.0)
         ]
@@ -3023,11 +3026,17 @@ class DocumentView(QWidget):
             return
 
         def op(doc: PdfDocument) -> None:
-            for para, runs, off in moves:
+            for para, runs, blocks, off in moves:
                 box = self._box_for(doc, page_index, para.bbox, para.text)
-                result = doc.replace_paragraph_runs(page_index, para, runs, offset=off)
+                result = doc.replace_paragraph_runs(
+                    page_index, para, runs, offset=off, blocks=blocks
+                )
                 if box is not None and result.new_bbox is not None:
-                    doc.update_box_rect(box.id, result.new_bbox)  # move: content unchanged
+                    if blocks is not None and result.visual_lines:
+                        # A list re-lay redraws markers: refresh the fingerprint.
+                        doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+                    else:
+                        doc.update_box_rect(box.id, result.new_bbox)  # content unchanged
 
         self._push_command(label, op, ("page", page_index))
 
@@ -3351,16 +3360,25 @@ class DocumentView(QWidget):
             return  # selection cleared by after_command (stale payloads)
 
         # Rebuild the paragraph as rich runs from its own spans — a move now
-        # PRESERVES mixed styles instead of flattening to the dominant one.
-        runs = self._runs_from_paragraph(para)
+        # PRESERVES mixed styles instead of flattening to the dominant one,
+        # and a LIST box travels as the same list (blocks re-laid, LR4b).
+        runs, blocks = self._runs_blocks_from_paragraph(para)
         results: list = []
 
         def op(doc: PdfDocument) -> None:
             box = self._box_for(doc, page_index, para.bbox, para.text)  # match BEFORE the move
-            result = doc.replace_paragraph_runs(page_index, para, runs, offset=offset)
+            result = doc.replace_paragraph_runs(
+                page_index, para, runs, offset=offset, blocks=blocks
+            )
             results.append(result)
             if box is not None and result.new_bbox is not None:
-                doc.update_box_rect(box.id, result.new_bbox)  # registry follows
+                # A move keeps content, but a LIST re-lay refreshes the
+                # fingerprint too (markers redraw): update_box when we have
+                # fresh visual lines, rect-only otherwise.
+                if blocks is not None and result.visual_lines:
+                    doc.update_box(box.id, result.new_bbox, "\n".join(result.visual_lines))
+                else:
+                    doc.update_box_rect(box.id, result.new_bbox)  # registry follows
 
         if not self._push_command("Move text", op, ("page", page_index)):
             return
@@ -3657,7 +3675,8 @@ class DocumentView(QWidget):
         if not self._edit_mode or para is None:
             return
         self._clear_selection()
-        runs = self._runs_from_paragraph(para)
+        # A LIST box duplicates as the same list (blocks re-laid; LR4b).
+        runs, blocks = self._runs_blocks_from_paragraph(para)
         page_w, page_h = self._doc.page_size(page_index)
         if self._doc.page_rotation(page_index) % 180 == 90:
             page_w, page_h = page_h, page_w  # the engine speaks unrotated space
@@ -3677,7 +3696,15 @@ class DocumentView(QWidget):
             # Register INSIDE the op so the snapshot carries content +
             # registry together and undo can never split them (E10).
             before = {(s.text, s.bbox) for s in doc.text_spans(page_index)}
-            lines = doc.insert_runs(page_index, point, runs, align=para.align, pitch=para.pitch)
+            lines = doc.insert_runs(
+                page_index,
+                point,
+                runs,
+                align=para.align,
+                pitch=para.pitch,
+                blocks=blocks,
+                width=(para.bbox[2] - para.bbox[0]) if blocks is not None else None,
+            )
             new = [s for s in doc.text_spans(page_index) if (s.text, s.bbox) not in before]
             if new:
                 rect = (
@@ -3757,6 +3784,16 @@ class DocumentView(QWidget):
             doc.rotate_image(page_index, image, deg)
 
         self._push_command("Rotate image", op, ("page", page_index))
+
+    def _runs_blocks_from_paragraph(self, para: Paragraph) -> tuple[list[StyledRun], list | None]:
+        """``(runs, blocks)`` re-laying ``para`` as it is — LIST boxes get
+        engine list blocks so a move/duplicate/merge keeps the list (markers
+        redrawn from structure at the new spot); plain paragraphs keep the
+        established `_runs_from_paragraph` conversion and the non-block path."""
+        runs, blocks = paragraph_runs_blocks(para)
+        if blocks is None:
+            return self._runs_from_paragraph(para), None
+        return runs, blocks
 
     def _runs_from_paragraph(self, para: Paragraph) -> list[StyledRun]:
         """The paragraph's own content as engine runs (per-span styles AND

@@ -280,6 +280,27 @@ Each lands green and committed on `feat/lists` before the next starts, per
 the repo rules (lint + full pytest; engine changes carry pytest coverage;
 round-trip tests for every mutating op).
 
+Status 2026-08-18: LR1 (with LR2's detection folded in — `set_list_style`
+needed `paragraph_blocks` on day one), LR3, LR4 and LR4b are committed
+green. LR5 is the remaining milestone, and its deciding half is Scott's
+hands-on pass.
+
+Two decisions made during LR4b, recorded here because they moved:
+
+- **Ordinal markers now FOLD like bullets do.** v1 skipped them because a
+  helv "1." merges into its body span. v2 draws markers in the marker font,
+  and MuPDF then puts the Arial "1." and its helv body in separate blocks,
+  so without folding a committed numbered item re-extracted as a lone
+  marker paragraph plus a plain body (the merge probe caught it). The
+  table-row guard: a lone ordinal folds only when it sits within 12 pt of
+  its body (`_ORDINAL_FOLD_MAX_GAP`) — a table's number column pads more.
+- **The kept-span machinery STAYS.** After LR4b, moves, group offsets,
+  duplicates and merges all re-lay lists as blocks, but
+  `style_paragraph_selection` (hyperlink styling) still re-lays a paragraph
+  without block awareness, and the kept span is what preserves an imported
+  bullet through it. Retiring it means making that path block-aware too;
+  not worth it for link colour alone.
+
 - **LR1, engine block layout.** `ListBlock`, block-aware layout in
   `replace_paragraph_runs` + `insert_new_runs`, real-glyph markers resolved
   by the engine, hanging numbered markers, `set_list_style` /
@@ -313,6 +334,14 @@ round-trip tests for every mutating op).
   (UI, engine, settings, help), `_STATE_VERSION` bump, cheat sheet.
   Tests: toggle state tracking, one-shot apply with no editor open, and
   the Markup-mode inertness test for the new controls.
+- **LR4b, block-aware box operations.** A moved, group-moved, duplicated or
+  merged list box travels AS a list: `paragraph_runs_blocks(para)` derives
+  the runs + blocks that re-lay a paragraph exactly as it is (page
+  numbering preserved verbatim, so moving a "3." item never renumbers it),
+  wired into the four `_runs_from_paragraph` call sites. Registry
+  fingerprints refresh on list moves (markers redraw). Explicit-width block
+  inserts get the same re-wrap grace as the replace path, or a duplicate
+  wrapped a line its original held.
 - **LR5, docs + manual pass.** CLAUDE.md current-state rewrite of the Lists
   section, this plan updated to DONE per milestone, and a hands-on pass on
   the real samples (create, convert, nest, renumber, unlist, undo, save,

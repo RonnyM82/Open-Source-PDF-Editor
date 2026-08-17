@@ -1527,6 +1527,29 @@ def _line_text(line: dict) -> str:
 # in another column; a hanging indent is only ~18 pt.
 _MARKER_FOLD_BASELINE_TOL = 2.0
 _MARKER_FOLD_MAX_GAP = 72.0
+# A lone ORDINAL span folds only when it sits hard against its body (the
+# marker gutter is a few points wide): a table's number column pads more,
+# and folding a row number onto its row would swallow table structure.
+_ORDINAL_FOLD_MAX_GAP = 12.0
+
+
+def _line_marker_kind(line: dict) -> str | None:
+    """ "bullet"/"number" when the line is NOTHING BUT a list marker.
+
+    v1 folded only bullets ("an inline number already groups") — true for
+    helv markers that merge into the body span. v2 draws EVERY marker in the
+    marker FONT (detection needs the separate span), and MuPDF then puts an
+    Arial "1." and its helv body in separate blocks, so ordinal markers need
+    the same folding or a committed numbered item re-extracts as a lone
+    marker paragraph plus a plain body (the merge probe caught it)."""
+    text = _line_text(line)
+    if is_bullet_only(text):
+        return "bullet"
+    stripped = text.strip()
+    mk = leading_marker(stripped)
+    if mk is not None and mk.kind != "bullet" and mk.end >= len(stripped):
+        return "number"
+    return None
 
 
 def _merge_lines(marker: dict, body: dict) -> dict:
@@ -1562,22 +1585,28 @@ def _folded_page_blocks(page: pymupdf.Page, keep) -> list[list[dict]]:
         (bi, li, _line_baseline(line), line["bbox"][0])
         for bi, lines in enumerate(blocks)
         for li, line in enumerate(lines)
-        if _line_rotation(line) == 0 and not is_bullet_only(_line_text(line))
+        if _line_rotation(line) == 0 and _line_marker_kind(line) is None
     ]
     merge_into: dict[tuple[int, int], dict] = {}  # (bi, li) body -> marker line
-    remove: set[tuple[int, int]] = set()  # bullet lines consumed
+    remove: set[tuple[int, int]] = set()  # marker lines consumed
     claimed: set[tuple[int, int]] = set()
     for bi, lines in enumerate(blocks):
         for li, line in enumerate(lines):
-            if _line_rotation(line) != 0 or not is_bullet_only(_line_text(line)):
+            if _line_rotation(line) != 0:
+                continue
+            marker_kind = _line_marker_kind(line)
+            if marker_kind is None:
                 continue
             mbase, mx = _line_baseline(line), line["bbox"][0]
+            m_right = line["bbox"][2]
             best = None
             for bbi, bli, bbase, bx0 in bodies:
                 if (bbi, bli) in claimed:
                     continue
                 gap = bx0 - mx
                 aligned = abs(bbase - mbase) <= _MARKER_FOLD_BASELINE_TOL
+                if marker_kind == "number" and bx0 - m_right > _ORDINAL_FOLD_MAX_GAP:
+                    continue  # a padded table number column, not a marker gutter
                 if aligned and 1.0 < gap <= _MARKER_FOLD_MAX_GAP:
                     if best is None or gap < best[0]:
                         best = (gap, bbi, bli)
@@ -2688,6 +2717,41 @@ def _rebuild_blocks(
     return replace_paragraph_runs(doc, page_index, para, runs, blocks=blocks, align=align)
 
 
+def paragraph_runs_blocks(
+    para: Paragraph,
+) -> tuple[list[StyledRun], list[ListBlock] | None]:
+    """The runs + list blocks that re-lay ``para`` exactly AS IT IS.
+
+    What a box MOVE, group offset, duplicate or merge feeds the runs ops so
+    a LIST box travels as the same list (markers redrawn from structure at
+    the new position) instead of degrading to inline marker text with no
+    hang. ``(_, None)`` for a plain paragraph — the caller then uses its own
+    plain conversion and the ops' non-block path, byte-identical to before.
+    Page numbering is preserved VERBATIM (each block's own ordinal as read),
+    so moving the "3." item of a split list does not renumber it to "1.".
+    """
+    specs = paragraph_blocks(para)
+    if not any(spec.kind is not None for spec in specs):
+        return [], None
+    runs: list[StyledRun] = []
+    blocks: list[ListBlock] = []
+    for i, spec in enumerate(specs):
+        if i:
+            runs.append(StyledRun("\n", runs[-1].style if runs else TextStyle()))
+        runs.extend(_spec_body_runs(spec))
+        if spec.kind is None:
+            blocks.append(ListBlock(None, 0))
+        else:
+            blocks.append(
+                ListBlock(
+                    spec.kind,
+                    spec.level,
+                    marker_text(spec.kind, spec.level, spec.ordinal or 1),
+                )
+            )
+    return runs, blocks
+
+
 def set_list_style(
     doc: pymupdf.Document,
     page_index: int,
@@ -3002,7 +3066,13 @@ def insert_new_runs(
         wrap = width if width is not None else (page_w - 2.0 - x)
         if wrap < 20.0:
             raise ValueError("There is no room for a list here — start it further left.")
-        lines = _layout_block_runs(runs, blocks, wrap)
+        # An EXPLICIT width is a measured box (a duplicate of an existing
+        # one): give it the same re-wrap grace as the replace path, or a
+        # hair of measurement wobble wraps a line the original held. The
+        # page-margin default stays exact (nothing to re-measure against).
+        lines = _layout_block_runs(
+            runs, blocks, wrap, slack=_GROW_WIDTH_FACTOR if width is not None else 0.0
+        )
     else:
         lines = _layout_runs(runs, None)
     while lines and not lines[-1]:
