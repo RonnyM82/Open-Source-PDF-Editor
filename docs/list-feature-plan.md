@@ -377,7 +377,11 @@ Open questions, none blocking LR1:
 2. Whether Backspace-at-start outdenting (a Word habit) annoys more than it
    helps in a PDF editor. It is one small handler; drop it if the manual
    pass says so.
-3. The v1 "ink-wide box" limitation (re-editing a created box can hit the
-   E9.4 refusal because its registered rect hugs the ink). Unchanged by
-   this redesign and general to all inserted boxes; still parked as its own
-   fix (derive wrap width from the registry rect).
+3. CLOSED on 2026-08-18: the v1 "ink-wide box" limitation (re-editing a
+   created box can hit the E9.4 refusal because its registered rect hugs the
+   ink). It was general to all inserted boxes, so it was fixed as its own
+   piece of work, `docs/box-width-plan.md`. The wrap width is now measured
+   from the page per edit rather than taken from the ink, and a width the
+   user drags persists with the box. The registry RECT turned out to be the
+   wrong carrier (it is what ownership hit-tests against), which is why that
+   plan stores a separate width instead.

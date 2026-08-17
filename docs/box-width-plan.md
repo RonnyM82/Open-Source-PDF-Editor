@@ -1,10 +1,12 @@
 # Inserted text boxes get an honest wrap width
 
-Status: **planned, not yet built** (2026-08-18). Written on `feat/lists`, but
-the defect and the fix are general to every inserted text box, so this lands
-independently of the list feature. It is the fix for open question 3 in
-`docs/list-feature-plan.md` section 8, where it is recorded as the sharpest
-remaining edge on that branch.
+Status: **BUILT, suite green** (2026-08-18). BW1 and BW2 landed in one engine
+commit, BW3 wired the UI, BW4 is the documentation. Written on `feat/lists`,
+but the defect and the fix are general to every inserted text box, so this
+lands independently of the list feature. It closes open question 3 in
+`docs/list-feature-plan.md` section 8, where it was recorded as the sharpest
+remaining edge on that branch. Section 7's open questions survive the build and
+are what Scott's hands-on pass should look at.
 
 ## 1. The defect, reproduced
 
@@ -213,6 +215,26 @@ dispatch methods the way the existing UI tests are:
 CLAUDE.md's box-registry and paragraph-editing sections gain the width rule,
 `docs/PLAN.md` gets the milestone record, and open question 3 in
 `docs/list-feature-plan.md` is closed with a pointer here.
+
+## As built
+
+The milestones landed as planned, with two details worth recording.
+
+BW1 and BW2 went in as ONE commit rather than two. Both change
+`pdfcore/document.py`, and splitting that file would have left an intermediate
+commit where the wrappers call a registry that cannot take a width yet. A
+broken snapshot is worse for bisecting than a slightly larger commit.
+
+The paragraph editor's opening width needed a viewport clamp that the plan did
+not anticipate. `_fit_to_content` only ever clamps the width it derives from
+the CONTENT, so a rect wider than the viewport (a generous width at high zoom)
+would have opened the editor past the right edge of the window. It is capped at
+the viewport now, which means at high zoom the editor can show more wrapping
+than the commit will produce. That is the pre-fix situation for that one case,
+and it is better than an editor running off screen.
+
+Test counts: 17 engine tests (BW1 and BW2), 6 UI tests (BW3), whole suite 1215
+green. `scripts/lint.ps1` and `scripts/test.ps1` clean.
 
 ## 7. Open questions
 
