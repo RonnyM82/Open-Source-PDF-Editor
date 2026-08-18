@@ -121,6 +121,35 @@ def leading_marker(text: str) -> ListMarker | None:
     return None
 
 
+# Letters that are BOTH a latin ordinal and a roman numeral: "i." is alpha 9
+# and roman 1, and the marker text alone cannot say which.
+_ROMAN_ALPHA_AMBIGUOUS = frozenset("ivxlcdm")
+
+
+def ordinal_at_level(mk: ListMarker, level: int) -> int | None:
+    """``mk``'s ordinal read at ``level``'s ladder rung.
+
+    ``leading_marker`` parses a single letter as ALPHA, so a third-level
+    roman "i." came back as ordinal 9 — the editor then seeded the list at 9
+    and the items renumbered ix, x, xi (user report, 2026-08-18: "i, ii"
+    became "ix, x" and a new item "xi" instead of "iii"). The marker alone is
+    genuinely ambiguous (Word shares this); the CALLER knows the block's
+    level from the box's indent geometry, and the ladder names each rung's
+    style (1. a. i., cycling), so a marker whose parse disagrees with its
+    rung is re-read in the rung's style when the text supports it: "i." at a
+    roman rung means 1, not 9. Unambiguous markers keep their parsed value —
+    "b." at a roman rung stays ordinal 2 (and regenerates as "ii.", the
+    renumber-on-edit rule). Bullets have no ordinal.
+    """
+    if mk.kind == "bullet":
+        return None
+    if max(0, level) % 3 == 2 and mk.kind == "alpha":
+        core = mk.text.strip("()").rstrip(".)")
+        if core.lower() in _ROMAN_ALPHA_AMBIGUOUS:
+            return _roman_value(core)
+    return mk.ordinal
+
+
 def is_bullet_only(text: str) -> bool:
     """True when ``text`` is JUST a bullet glyph (+ optional whitespace) — the
     lone-marker span the paragraph layer folds onto the following line."""

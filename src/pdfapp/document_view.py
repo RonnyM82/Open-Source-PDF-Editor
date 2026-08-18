@@ -597,7 +597,9 @@ class DocumentView(QWidget):
         return min(containing, key=area)
 
     @staticmethod
-    def _box_wrap_width(doc: PdfDocument, n: int, para: Paragraph, box) -> float | None:
+    def _box_wrap_width(
+        doc: PdfDocument, n: int, para: Paragraph, box, align: str | None = None
+    ) -> float | None:
         """The width a user-INSERTED text box sets text at, or None when the
         paragraph is pre-existing document text (BW3).
 
@@ -609,6 +611,16 @@ class DocumentView(QWidget):
         (``available_wrap_width``), which stops at the next obstacle on its
         right, so the extra room can never print over anything.
 
+        The MEASURED width applies to LEFT-aligned boxes only (``align`` is the
+        justification the commit will use; None falls back to the detected
+        ``para.align``): the engine anchors a right/centre block's shift within
+        the box it is given, so a generous width re-anchors the text at
+        ``origin_x + wrap`` and the box slides toward the page margin (probe:
+        a right-aligned box at x 100..193 re-committed to x 500..593). Such
+        boxes keep their own bbox, which pins their anchored edge — the
+        pre-BW behaviour. A width the user DRAGGED is honoured regardless,
+        as it always was: they chose it with the box in view.
+
         None for pre-existing text is deliberate: a quote's description column
         has a real width, and widening it would re-wrap real documents.
         """
@@ -616,6 +628,9 @@ class DocumentView(QWidget):
             return None
         if box.width > 0:
             return box.width
+        effective = align if align is not None else para.align
+        if effective != "left":
+            return None
         return doc.available_wrap_width(n, para)
 
     # --- read-only / edit mode (U0) ---------------------------------------
@@ -2452,7 +2467,7 @@ class DocumentView(QWidget):
             width = (
                 width_pts
                 if width_pts is not None
-                else self._box_wrap_width(doc, page_index, para, box)
+                else self._box_wrap_width(doc, page_index, para, box, align=align)
             )
             result = do_edit(doc, width)
             results.append(result)

@@ -183,3 +183,49 @@ def test_editor_opens_at_the_width_the_commit_uses(qapp, tmp_path):
         view._para_editor.cancel()
     finally:
         window.close()
+
+
+def test_right_aligned_box_is_not_auto_widened(qapp, tmp_path):
+    """Fable review finding: the engine anchors a right/centre block's shift
+    within the box it is given, so a measured width re-anchored the text at
+    origin_x + wrap and the box slid toward the page margin (probe: x 100..193
+    re-committed to x 500..593). Right/centre boxes keep their own bbox, which
+    pins the anchored edge."""
+    from pdfcore.textedit import StyledRun, TextStyle
+
+    window = MainWindow()
+    try:
+        view = _view(window, _pdf(tmp_path, below=False))
+        doc = view.document
+        before = {(s.text, s.bbox) for s in doc.text_spans(0)}
+        lines = doc.insert_runs(
+            0,
+            (100.0, 117.0),
+            [StyledRun("a longer first line of text\nshort", TextStyle(code="helv", size=9.0))],
+            align="right",
+        )
+        new = [s for s in doc.text_spans(0) if (s.text, s.bbox) not in before]
+        rect = (
+            min(s.bbox[0] for s in new),
+            min(s.bbox[1] for s in new),
+            max(s.bbox[2] for s in new),
+            max(s.bbox[3] for s in new),
+        )
+        box = doc.add_box(0, rect, text="\n".join(lines))
+        view.after_command(("page", 0))  # caches must see the new boundaries
+
+        para = _para(view, "longer first")
+        assert para.align == "right"
+        assert view._box_wrap_width(doc, 0, para, box) is None  # the guard
+        right_before = para.bbox[2]
+
+        view._begin_paragraph_edit(0, para)
+        view._para_editor.setPlainText("a longer first line of text\nshort and more")
+        view._para_editor.commit()
+
+        after = _para(view, "longer first")
+        assert "short and more" in after.text
+        # The anchored right edge stayed put instead of sliding to the margin.
+        assert after.bbox[2] == pytest.approx(right_before, abs=2.0)
+    finally:
+        window.close()

@@ -411,3 +411,133 @@ def test_block_mode_fingerprint_matches_extraction(tmp_path):
         page_set = fingerprint_lineset(para.text)
         stored = fingerprint_lineset("\n".join(result.visual_lines))
         assert stored and stored <= page_set  # every stored line matches the page
+
+
+# --- ambiguous roman ordinals (user report 2026-08-18) ------------------------
+
+
+def test_ordinal_at_level_reads_the_rung():
+    """ "i." is alpha 9 AND roman 1 — only the level's ladder rung can decide.
+    Unambiguous markers keep their parsed value at any rung."""
+    from pdfcore.lists import leading_marker, ordinal_at_level
+
+    for text, level, want in (
+        ("i.", 2, 1),
+        ("v.", 2, 5),
+        ("x.", 2, 10),
+        ("(iv)", 2, 4),
+        ("b.", 2, 2),  # a real letter at the roman rung keeps its value
+        ("ii.", 2, 2),  # multi-letter roman is unambiguous
+        ("i.", 1, 9),  # at the ALPHA rung "i." really is the 9th letter
+        ("c.", 1, 3),
+        ("7.", 0, 7),
+    ):
+        mk = leading_marker(f"{text} body")
+        assert ordinal_at_level(mk, level) == want, (text, level)
+
+
+def test_nested_roman_items_keep_their_ordinals(tmp_path):
+    """User report: a third-level "i., ii." re-read as ordinals 9, 10 ("i" is
+    also the 9th letter), so an edit renumbered them ix, x and a new item came
+    out xi instead of iii. Detected ordinals must be 1, 2 — and regenerating
+    the markers from them (the editor's commit loop) with a third item must
+    produce iii."""
+    src = _para_pdf(tmp_path, [], name="blank.pdf")
+    style = TextStyle(size=11)
+    runs = [
+        StyledRun("First item\n", style),
+        StyledRun("2nd item\n", style),
+        StyledRun("indented item\n", style),
+        StyledRun("further indented\n", style),
+        StyledRun("Loving it\n", style),
+        StyledRun("Stuff", style),
+    ]
+    blocks = [
+        ListBlock("number", 0, "1."),
+        ListBlock("number", 0, "2."),
+        ListBlock("number", 1, "a."),
+        ListBlock("number", 2, "i."),
+        ListBlock("number", 2, "ii."),
+        ListBlock("number", 0, "3."),
+    ]
+    region = (85.0, 85.0, 420.0, 185.0)
+    with PdfDocument.open(src) as doc:
+        doc.insert_runs(0, (90.0, 100.0), runs, blocks=blocks, width=300.0)
+        out = tmp_path / "nested.pdf"
+        doc.save(out)
+
+    with PdfDocument.open(out) as doc:
+        para = doc.paragraph_at(0, 150.0, 100.0, boundaries=(region,))
+        specs = paragraph_blocks(para)
+        assert [(s.kind, s.level, s.ordinal) for s in specs] == [
+            ("number", 0, 1),
+            ("number", 0, 2),
+            ("number", 1, 1),
+            ("number", 2, 1),  # NOT 9: "i." at the roman rung
+            ("number", 2, 2),
+            ("number", 0, 3),
+        ]
+
+        # The editor commit loop: markers regenerate from the detected
+        # ordinals, with a new third roman item spliced in before "Stuff".
+        new_runs = [
+            StyledRun("First item\n", style),
+            StyledRun("2nd item\n", style),
+            StyledRun("indented item\n", style),
+            StyledRun("further indented\n", style),
+            StyledRun("Loving it\n", style),
+            StyledRun("what?\n", style),
+            StyledRun("Stuff", style),
+        ]
+        ords = [s.ordinal for s in specs]
+        new_blocks = [
+            ListBlock("number", 0, marker_text("number", 0, ords[0])),
+            ListBlock("number", 0, marker_text("number", 0, ords[1])),
+            ListBlock("number", 1, marker_text("number", 1, ords[2])),
+            ListBlock("number", 2, marker_text("number", 2, ords[3])),
+            ListBlock("number", 2, marker_text("number", 2, ords[4])),
+            ListBlock("number", 2, marker_text("number", 2, ords[4] + 1)),
+            ListBlock("number", 0, marker_text("number", 0, ords[5])),
+        ]
+        result = doc.replace_paragraph_runs(0, para, new_runs, blocks=new_blocks)
+        joined = "\n".join(result.visual_lines)
+        assert "iii." in joined  # the new item
+        assert "ix." not in joined and "xi." not in joined  # the bug's output
+        out2 = tmp_path / "nested2.pdf"
+        doc.save(out2)
+
+    with PdfDocument.open(out2) as doc:  # round-trip: detection stays fixed
+        para = doc.paragraph_at(0, 150.0, 100.0, boundaries=(region,))
+        deep = [s.ordinal for s in paragraph_blocks(para) if s.level == 2]
+        assert deep == [1, 2, 3]
+
+
+# --- merging list items (user report 2026-08-18, sample_lists.pdf page 2) -----
+
+
+def test_real_sample_numbered_items_merge_into_one_list(tmp_path):
+    """The reported gesture: the four "Key scope questions" items on page 2
+    merge into ONE numbered list. The union used to take the 25 pt inter-item
+    gap as its pitch, re-lay taller than the boxes it replaced, and E9.4
+    refused against "I have not started building" one paragraph below."""
+    from pdfcore.textedit import merge_paragraphs, paragraph_runs_blocks
+
+    with PdfDocument.open(_sample("sample_lists.pdf")) as doc:
+        items = [p for p in doc.paragraphs(1) if p.text.lstrip()[:2] in ("1.", "2.", "3.", "4.")]
+        assert len(items) == 4
+        union = merge_paragraphs(items)
+        assert union.pitch == pytest.approx(17.0, abs=0.5)  # the ITEMS' pitch, not the gap
+        runs, blocks = paragraph_runs_blocks(union)
+        result = doc.replace_paragraph_runs(1, union, runs, blocks=blocks)
+        assert result.inserted
+        out = tmp_path / "merged.pdf"
+        doc.save(out)
+
+    with PdfDocument.open(out) as doc:
+        paras = doc.paragraphs(1)
+        merged = next(p for p in paras if "How far" in p.text)
+        for marker in ("1.", "2.", "3.", "4."):
+            assert marker in merged.text  # numbering survived the merge
+        assert "Nesting in scope" in merged.text
+        below = next(p for p in paras if "not started building" in p.text)
+        assert below.bbox[1] == pytest.approx(297.7, abs=1.0)  # bystander untouched

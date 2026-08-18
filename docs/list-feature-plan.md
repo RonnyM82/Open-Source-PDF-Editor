@@ -368,6 +368,18 @@ Decided for v2:
   identical rendering, and it buys the removal of the kept-span special
   case.
 
+Hands-on findings ahead of LR5 (2026-08-18, both fixed same-day; full
+narrative in `docs/PLAN.md` under the Fable review pass):
+
+1. Merging the four numbered items on sample_lists.pdf page 2 was refused by
+   E9.4. The merge pitch took the union median, which for list items is the
+   25 pt inter-item GAP, so the re-lay was taller than the boxes it replaced.
+   `merge_paragraphs` now pitches at the members' own intra-box advances.
+2. A third-level "i., ii." renumbered to ix, x (and a new item to xi): the
+   single-letter marker parsed as alpha 9, the 9th letter, and seeded the
+   editor's list start there. `lists.ordinal_at_level` re-reads an ambiguous
+   letter at its level's ladder rung, so "i." at the roman rung is 1.
+
 Open questions, none blocking LR1:
 
 1. Whether the bulleted/numbered toggles should also live in the right-click

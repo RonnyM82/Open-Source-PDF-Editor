@@ -30,6 +30,7 @@ from pdfcore.lists import (
     leading_marker,
     marker_fontfile,
     marker_text,
+    ordinal_at_level,
     split_leading_marker,
 )
 
@@ -2058,12 +2059,35 @@ def merge_paragraphs(paras: Sequence[Paragraph]) -> Paragraph:
     rep = next(s for s in spans if style_key(s) == dominant_key)
     uniform = all(style_key(s) == dominant_key for s in spans)
 
+    # Pitch: the MEMBERS' OWN line spacing, never the gaps between the boxes
+    # being merged. Four list items with 17 pt lines and 25 pt gaps used to
+    # take the union median (25) — the re-lay was then TALLER than the boxes
+    # it replaced and E9.4 refused the merge against the paragraph below
+    # (user report, sample_lists.pdf page 2). Intra-member advances are what
+    # "one paragraph" should be set at; only when every member is single-line
+    # (nothing intra to measure) does the union median remain — which keeps
+    # the fragment-repair case exact and the merge-two-labels case unchanged.
+    intra: list[float] = []
+    for para in paras:
+        member_baselines = [min(s.origin[1] for s in line) for line in para.lines if line]
+        intra.extend(
+            d
+            for d in (
+                member_baselines[i + 1] - member_baselines[i]
+                for i in range(len(member_baselines) - 1)
+            )
+            if d >= _MIN_LINE_PITCH
+        )
+    intra.sort()
     deltas = sorted(
         d
         for d in (baselines[i + 1] - baselines[i] for i in range(len(baselines) - 1))
         if d >= _MIN_LINE_PITCH
     )
-    pitch = deltas[len(deltas) // 2] if deltas else rep.size * 1.2
+    if intra:
+        pitch = intra[len(intra) // 2]
+    else:
+        pitch = deltas[len(deltas) // 2] if deltas else rep.size * 1.2
 
     return Paragraph(
         align=_detect_alignment(line_tuples),
@@ -2161,10 +2185,25 @@ def available_wrap_width(doc: pymupdf.Document, page_index: int, para: Paragraph
             if span.rotation == 0
             else (span.bbox[1], span.bbox[3])
         )
-        if span.bbox[0] > x0 and overlaps(top, bottom):
+        if not overlaps(top, bottom):
+            continue
+        if span.bbox[0] > x0:
             limit = min(limit, span.bbox[0] - x0 - _BOX_CLEARANCE)
+        elif span.bbox[2] > x0:
+            # The obstacle STRADDLES the box's left edge — the box was placed
+            # ON a wider line. No widening past the box's own ink is safe
+            # (any new territory is that line's remaining text), so cap at
+            # the ink, which is exactly the pre-BW wrap. An obstacle entirely
+            # LEFT of the box (bbox[2] <= x0, the label-beside-a-value row)
+            # never caps rightward growth.
+            limit = min(limit, ink)
     for image in imageedit_module.images_on_page(doc, page_index):
         ix0, iy0, ix1, iy1 = image.bbox
+        # Images deliberately keep the bbox[0] > x0 rule WITHOUT a straddle
+        # cap: a box placed ON an image is a label on a diagram, the image is
+        # its background, and capping to ink would re-refuse the very growth
+        # this function exists to allow. Only an image that STARTS to the
+        # box's right is an obstacle to stop before.
         if ix0 > x0 and ix1 > ix0 and overlaps(iy0, iy1):
             limit = min(limit, ix0 - x0 - _BOX_CLEARANCE)
     return max(ink, limit)
@@ -2704,7 +2743,9 @@ def paragraph_blocks(para: Paragraph) -> list[BlockSpec]:
             BlockSpec(
                 kind=current.get("list_kind"),
                 level=current["level"],
-                ordinal=mk.ordinal if mk is not None else None,
+                # At the block's level, not the raw parse: "i." is alpha 9 AND
+                # roman 1, and only the rung can say which (the ix/x/xi bug).
+                ordinal=ordinal_at_level(mk, current["level"]) if mk is not None else None,
                 marker=mk.text if mk is not None else "",
                 lines=tuple(current["lines"]),
                 marker_span=current.get("marker_span"),

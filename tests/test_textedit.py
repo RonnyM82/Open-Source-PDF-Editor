@@ -3281,3 +3281,115 @@ def test_hemmed_in_box_still_refuses_to_grow(tmp_path):
         runs = [StyledRun("Terms of trade apply here as well", TextStyle(code="helv", size=9.0))]
         with pytest.raises(ValueError, match="already"):
             pdoc.replace_paragraph_runs(0, para, runs, width=width)
+
+
+def test_available_width_capped_when_the_box_sits_on_a_wider_line(tmp_path):
+    """Fable review finding: an obstacle STRADDLING the box's left edge (the
+    box was placed ON a wider line) was ignored — `bbox[0] > x0` never saw it,
+    and the width ran to the page margin (measured: 393 pt over a line the box
+    overlapped). No widening past the box's own ink is safe there: any new
+    territory is that line's remaining text."""
+    path = tmp_path / "straddle.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text(
+        (72, 119),
+        "a long existing line of prose that runs well past the insertion point x",
+        fontname="helv",
+        fontsize=9,
+    )
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        _para0, boundaries, _box = _insert_label(pdoc, point=(200.0, 117.0))
+        # The insert overlaps the long line, so the centre hit-test can land on
+        # the line's paragraph — take the box's REGION paragraph explicitly.
+        para = next(
+            p for p in pdoc.paragraphs(0, boundaries=boundaries) if p.text == "Terms of trade"
+        )
+        ink = para.bbox[2] - para.bbox[0]
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(ink, abs=0.01)
+
+
+def test_available_width_stays_generous_over_an_image(tmp_path):
+    """A box ON an image is a label on a diagram: the image is its background,
+    not an obstacle, and capping to ink would re-refuse the very growth this
+    feature exists to allow. Deliberate: only an image STARTING to the box's
+    right caps the width."""
+    path = tmp_path / "onimage.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8))
+    pix.set_rect(pix.irect, (200, 40, 40))
+    page.insert_image(pymupdf.Rect(150, 90, 420, 200), pixmap=pix)
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        para, _bounds, _box = _insert_label(pdoc, text="label", point=(200.0, 130.0))
+        assert pdoc.available_wrap_width(0, para) == pytest.approx(595 - 2 - 200, abs=0.01)
+
+
+def test_merge_repitches_to_the_members_own_line_spacing(tmp_path):
+    """User report (sample_lists.pdf page 2): four items with 15 pt lines and
+    35 pt gaps used to merge at the UNION median (the gap), so the re-lay was
+    TALLER than the boxes it replaced and E9.4 refused against the paragraph
+    below. The merge pitch is the members' own line spacing; the gaps between
+    the boxes being merged are not text."""
+    from pdfcore.textedit import merge_paragraphs
+
+    path = tmp_path / "gaps.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    for y, text in (
+        (100, "item one first line"),
+        (115, "item one second line"),
+        (150, "item two"),
+        (185, "item three"),
+        (220, "item four first line"),
+        (235, "item four second line"),
+        (270, "bystander paragraph below the items"),
+    ):
+        page.insert_text((72, y), text, fontname="helv", fontsize=11)
+    doc.save(str(path))
+    doc.close()
+
+    out = tmp_path / "merged.pdf"
+    with PdfDocument.open(path) as pdoc:
+        paras = pdoc.paragraphs(0)
+        members = [p for p in paras if p.text.startswith("item")]
+        assert len(members) == 4
+        bystander_bbox = next(p for p in paras if "bystander" in p.text).bbox
+        union = merge_paragraphs(members)
+        # Median of the INTRA-member advances (15, 15), never of the union's
+        # [15, 35, 35, 35, 15] whose median is the 35 pt box gap.
+        assert union.pitch == pytest.approx(15.0, abs=0.1)
+        result = pdoc.replace_paragraph_runs(
+            0, union, [StyledRun(union.text, TextStyle(code="helv", size=11.0))]
+        )
+        assert result.inserted
+        pdoc.save(out)
+
+    with PdfDocument.open(out) as reopened:
+        paras = reopened.paragraphs(0)
+        merged = next(p for p in paras if "item one first line" in p.text)
+        assert "item four second line" in merged.text  # ONE box now
+        bystander = next(p for p in paras if "bystander" in p.text)
+        assert bystander.bbox == pytest.approx(bystander_bbox, abs=0.1)  # untouched
+
+
+def test_merge_of_single_line_boxes_keeps_the_union_median(tmp_path):
+    """Nothing intra to measure (every member is one line): the union median
+    remains, so the merge-two-labels case is unchanged."""
+    from pdfcore.textedit import merge_paragraphs
+
+    path = tmp_path / "labels.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "label one", fontname="helv", fontsize=11)
+    page.insert_text((72, 128), "label two", fontname="helv", fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    with PdfDocument.open(path) as pdoc:
+        paras = [p for p in pdoc.paragraphs(0) if p.text.startswith("label")]
+        union = merge_paragraphs(paras)
+        assert union.pitch == pytest.approx(28.0, abs=0.1)  # the old rule, kept

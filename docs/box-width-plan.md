@@ -241,8 +241,36 @@ over it. Rotated spans are measured by bbox now. The E9.4 collision check has
 the same blind spot, which is worth knowing but is not this fix's to close: it
 would change what an edit refuses, and that deserves its own decision.
 
-Test counts: 18 engine tests (BW1 and BW2), 6 UI tests (BW3), whole suite 1216
-green. `scripts/lint.ps1` and `scripts/test.ps1` clean.
+Test counts: 15 engine tests (BW1 and BW2, 16 with the rotated-obstacle fix),
+6 UI tests (BW3). Suite totals: 1209 after BW1+BW2, 1215 after BW3, 1216 after
+the rotated fix. An earlier revision of this section said 17 and 18 engine
+tests; the suite totals are the verifiable record and they say 15 and 16.
+
+## The Fable review pass (2026-08-18, same day)
+
+The milestones above were built with the session set to Opus 5 by mistake, so
+the whole set was re-checked with Fable enabled, by re-deriving the risky
+claims with probes rather than re-reading the reasoning. Two real defects came
+out, both fixed with regression tests; the full narrative (plus two hands-on
+findings Scott reported mid-pass, in merge pitch and list ordinals, which are
+not box-width defects) lives in `docs/PLAN.md`.
+
+- **The measured width is left-aligned boxes only.** The engine anchors a
+  right/centre block's justification shift within the box it is given, so a
+  generous width re-anchored the text at origin_x + wrap and the box slid
+  toward the page margin (probe: x 100..193 re-committed to x 500..593).
+  `_box_wrap_width` takes the commit's effective align and returns None for
+  right/centre boxes, whose own bbox pins the anchored edge. A dragged width
+  is honoured regardless, as it always was.
+- **An obstacle straddling the box's left edge caps the width at the ink.**
+  The scan only counted obstacles STARTING right of the box, so a box placed
+  ON a wider line widened to the page margin over that line's remainder.
+  Straddling text now caps to the box's own ink (the pre-BW wrap). Two
+  deliberate non-caps: an obstacle entirely to the LEFT never caps, and a
+  straddling IMAGE never caps, because a box on an image is a label on a
+  diagram and the image is its background.
+
+`scripts/lint.ps1` and `scripts/test.ps1` clean.
 
 ## 7. Open questions
 
