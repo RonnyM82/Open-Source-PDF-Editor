@@ -361,6 +361,27 @@ def signature_banner_qss(problem: bool) -> str:
     )
 
 
+def update_banner_qss() -> str:
+    """Widget-local style for the app-level "an update is available" banner.
+
+    Accent-tinted rather than the signature banner's red/green: an available
+    update is neither a warning nor a verdict, it is an offer. Built with the
+    CURRENT mode; MainWindow re-applies it on a theme switch.
+    """
+    dark = _mode == DARK
+    bg = "#1e3346" if dark else "#dceaf7"
+    fg = "#d6e6f5" if dark else "#123653"
+    border = accent()
+    return (
+        f"QFrame#update_banner {{ background-color: {bg};"
+        f" border: none; border-bottom: 1px solid {border}; }}"
+        f" QFrame#update_banner QLabel {{ color: {fg}; background: transparent; }}"
+        f" QFrame#update_banner QPushButton {{ color: {fg}; background: transparent;"
+        f" border: 1px solid {border}; border-radius: 4px; padding: 2px 10px; }}"
+        f" QFrame#update_banner QPushButton:hover {{ background-color: {border}; }}"
+    )
+
+
 def on_change(callback: Callable[[str], None]) -> None:
     """Register ``callback(mode)`` to run after every apply_theme()."""
     _callbacks.append(callback)

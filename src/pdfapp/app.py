@@ -183,6 +183,13 @@ def main(argv: list[str] | None = None) -> int:
     for arg in file_args:
         window.open_path(Path(arg))
 
+    # Ask GitHub whether a newer release exists — real UI only (the smokes above
+    # return before this), a few seconds after the window is up so startup never
+    # waits on the network, and silent on any failure. The window applies its own
+    # gates: the PDF_EDITOR_NO_UPDATE_CHECK switch, dev builds, and the
+    # once-a-day throttle.
+    window.schedule_update_check()
+
     exit_code = app.exec()
     if instance_server is not None:
         instance_server.close()

@@ -13,11 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt
+from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -47,9 +48,11 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QToolBar,
     QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
-from pdfapp import diagnostics, highlight_colors, icons, portable, theme
+from pdfapp import diagnostics, highlight_colors, icons, portable, theme, updates
 from pdfapp.document_view import DocumentView
 from pdfapp.font_files import font_choice
 from pdfapp.print_support import PrintDialog, PrintOptions, print_document, show_preview
@@ -59,6 +62,8 @@ from pdfapp.settings import Settings
 from pdfapp.sign_dialog import SignDialog
 from pdfapp.signature_manager_dialog import DEFAULT_P12_KEY, SignatureManagerDialog
 from pdfapp.signature_store import STORE_FILENAME, SignatureStore
+from pdfapp.update_banner import UpdateBanner
+from pdfapp.update_check import UpdateChecker
 from pdfcore import pages, signing
 from pdfcore.document import PdfDocument
 from pdfcore.textedit import (
@@ -178,7 +183,31 @@ class MainWindow(QMainWindow):
         self._tabs.tabBar().setDrawBase(False)
         self._tabs.currentChanged.connect(lambda _idx: self._sync_chrome())
         self._tabs.tabCloseRequested.connect(self._close_tab)
-        self.setCentralWidget(self._tabs)
+
+        # The update banner sits ABOVE the tabs — an available update is a fact
+        # about the app, not about any one open document (the signature banner
+        # is per document for the opposite reason), so the central widget is a
+        # thin container holding banner + tabs rather than the tabs alone.
+        self._update_banner = UpdateBanner(self)
+        self._update_banner.updateRequested.connect(self._start_update)
+        self._update_banner.remindLaterRequested.connect(self._snooze_update)
+        self._update_banner.skipRequested.connect(self._skip_update)
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._update_banner)
+        central_layout.addWidget(self._tabs, 1)
+        self.setCentralWidget(central)
+
+        # Update state: what the last check found, and how it went. Both feed
+        # the About dialog's status line (UP3); the banner reads the info only.
+        self._update_info: updates.UpdateInfo | None = None
+        self._update_error: str | None = None
+        self._update_checked = False
+        self._update_checker = UpdateChecker(self)
+        self._update_checker.finished.connect(self._on_update_found)
+        self._update_checker.failed.connect(self._on_update_check_failed)
 
         self._build_actions()
         self._build_menu()
@@ -717,6 +746,7 @@ class MainWindow(QMainWindow):
         # Re-label to the NEW target (dark applied → now offers "Light theme").
         self._dark_theme_action.setText(self._theme_action_label(mode))
         self._assign_icons()  # glyph colour follows the mode
+        self._update_banner.refresh_theme()
         for view in self._views():
             view.refresh_theme()
         # Persist so the next launch starts in this mode (app.main reads it
@@ -2831,6 +2861,94 @@ class MainWindow(QMainWindow):
             "window_state", bytes(self.saveState(_STATE_VERSION).toBase64()).decode("ascii")
         )
 
+    # --- updates --------------------------------------------------------
+    def schedule_update_check(self, delay_ms: int = 3000) -> bool:
+        """Queue the automatic launch check. False when it will not run.
+
+        Deliberately not called from ``__init__``: ``app.main`` starts it once
+        the real window is up, so startup speed never waits on the network and
+        the offscreen test windows (which never call this) stay silent.
+        """
+        if not self._automatic_check_allowed():
+            return False
+        QTimer.singleShot(delay_ms, self._run_automatic_update_check)
+        return True
+
+    def _automatic_check_allowed(self) -> bool:
+        """The three gates on the AUTOMATIC check: the environment kill switch,
+        the build kind (a source checkout checks manually from About), and the
+        once-a-day throttle."""
+        if updates.check_disabled():
+            return False
+        if updates.install_kind() == updates.DEV:
+            return False
+        return updates.check_due(self._settings.get(updates.LAST_CHECK_KEY))
+
+    def _run_automatic_update_check(self) -> None:
+        """Stamp the check and start it. The stamp is written UP FRONT so a feed
+        that hangs or fails can't make every launch retry it."""
+        if not self._automatic_check_allowed():
+            return
+        self._settings.set(updates.LAST_CHECK_KEY, updates.check_stamp())
+        self._update_checker.start()
+
+    def check_for_updates_now(self) -> bool:
+        """The MANUAL check (About dialog). Ignores the throttle and both
+        deferrals — a person who asked deserves the truth. False when a check is
+        already in flight."""
+        return self._update_checker.start()
+
+    def _on_update_found(self, info: updates.UpdateInfo) -> None:
+        self._update_info = info
+        self._update_error = None
+        self._update_checked = True
+        current = self._app_version()
+        if not updates.is_newer(current, info.version):
+            return
+        diagnostics.log_event(f"update available: {info.version} (running {current})")
+        if updates.should_notify(
+            current,
+            info.version,
+            skipped=self._settings.get(updates.SKIPPED_VERSION_KEY),
+            snooze_until=self._settings.get(updates.SNOOZE_UNTIL_KEY),
+        ):
+            self._present_update_banner(info)
+
+    def _present_update_banner(self, info: updates.UpdateInfo) -> None:
+        """Show the offer. The primary button upgrades in place only when this
+        build can replace itself AND the release actually carries an installer."""
+        can_update = updates.can_self_update() and bool(info.installer_url)
+        self._update_banner.present(info, self._app_version(), can_update=can_update)
+
+    def _on_update_check_failed(self, reason: str) -> None:
+        """A failed check is a non-event: the banner never appears, and only the
+        About dialog's status line mentions it."""
+        self._update_error = reason
+        self._update_checked = True
+
+    def _app_version(self) -> str:
+        from pdfapp import __version__
+
+        return __version__
+
+    def _snooze_update(self) -> None:
+        """ "Remind me in 7 days" — defer by TIME, so anything shipping inside
+        the week stays quiet too."""
+        self._settings.set(updates.SNOOZE_UNTIL_KEY, updates.snooze_date())
+
+    def _skip_update(self) -> None:
+        """ "Skip this version" — defer by VERSION, so the banner returns on its
+        own once something newer than this release ships."""
+        if self._update_info is not None:
+            self._settings.set(updates.SKIPPED_VERSION_KEY, self._update_info.version)
+
+    def _start_update(self) -> None:
+        """The primary button. UP4 replaces this with the download-and-install
+        flow; today it opens the release page, which is also the permanent
+        behaviour for the portable build."""
+        if self._update_info is not None:
+            QDesktopServices.openUrl(QUrl(self._update_info.page_url))
+
     # --- lifecycle ------------------------------------------------------
     def closeEvent(self, event) -> None:
         # Prompt for each dirty document before the window closes. Only when
@@ -2847,4 +2965,6 @@ class MainWindow(QMainWindow):
             # window's saveGeometry() is degenerate and would clobber the real
             # saved layout in the shared data dir.
             self._save_window_layout()
+        # A check still in flight must not deliver into a window that is going.
+        self._update_checker.abandon()
         event.accept()
