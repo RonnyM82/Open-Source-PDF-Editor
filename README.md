@@ -320,7 +320,8 @@ of the window offering **Update now**, **Remind me in 7 days**, and **Skip
 this version**. The two deferrals differ on purpose: skipping stays quiet
 until the version *after* the one you skipped ships, while the reminder stays
 quiet for a week no matter what comes out in between. Closing the strip with
-the cross just hides it until the next launch.
+the cross records nothing — it just hides it, and the offer comes back at the
+next check, which is at most a day away.
 
 **Update now** downloads the setup installer, closes the app (asking about any
 unsaved changes exactly as closing normally does), installs over the existing

@@ -142,7 +142,12 @@ outcome and hide the banner:
 - **Remind me in 7 days** writes `update_snooze_until` = today + 7 days.
 - **Skip this version** writes `update_skipped_version` = the offered
   version.
-- The close cross writes nothing, so the banner simply returns next launch.
+- The close cross writes nothing, so the offer returns at the next CHECK.
+  Note that with the once-a-day throttle in 3.1 this is not necessarily the
+  next launch: relaunching an hour later runs no check and raises no banner.
+  That is the right behaviour for a soft dismiss, but it is worth stating
+  plainly, because "hides it until next launch" is the obvious wrong
+  assumption to make about this control.
 
 On a portable build the first button reads **Open download page** instead
 and opens the release page in the browser (section 3.5 explains why the
@@ -303,18 +308,26 @@ exact byte count. Install the LOWER version, then launch it with
 `PDF_EDITOR_UPDATE_FEED` set to that file. No throwaway GitHub release is
 needed, and nothing touches the network.
 
+**The one thing that will waste your time if you don't know it.** The
+automatic check runs at most once every 24 hours, so a plain relaunch a minute
+later runs NO check and therefore shows NO banner — which looks exactly like a
+bug. Between every relaunch below, delete the `update_last_check` key from
+`settings.json` in `%LOCALAPPDATA%\PDF Editor` (the same file the skip and
+snooze keys live in). Deleting the whole file is fine too.
+
 Then walk these, in order:
 
 1. Launch and wait a few seconds. The banner appears naming the higher
    version.
-2. Press **Skip this version**. Close the app, launch again, and confirm the
-   banner stays away. Then edit the feed to name a version higher still and
-   confirm the banner comes back on the next launch. That is the skip
-   expiring on its own, which is the half of the spec most easily got wrong.
-3. Reset the skip (delete `update_skipped_version` from `settings.json` in
-   `%LOCALAPPDATA%\PDF Editor`), press **Remind me in 7 days**, relaunch, and
-   confirm silence. Wind the machine clock forward eight days, relaunch, and
-   confirm the banner returns.
+2. Press **Skip this version**. Clear `update_last_check`, launch again, and
+   confirm the banner stays away. Then edit the feed to name a version higher
+   still, clear `update_last_check` again, and confirm the banner comes back.
+   That is the skip expiring on its own, which is the half of the spec most
+   easily got wrong.
+3. Reset the skip (delete `update_skipped_version` from the same file), press
+   **Remind me in 7 days**, relaunch, and confirm silence. Wind the machine
+   clock forward eight days, relaunch, and confirm the banner returns. The
+   clock change also clears the check throttle for you.
 4. Open **Help → About PDF Editor** while a skip is active. The status line
    must still report the available version, and **Check for updates** must
    work. This is the "a person who asked deserves the truth" rule.

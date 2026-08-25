@@ -13,8 +13,9 @@ Four ways out, and the difference between them is the whole point:
   matter what ships in the meantime;
 - "Skip this version" defers by VERSION, so it stays quiet until something
   newer than the offered release ships, and then speaks up on its own;
-- the close cross writes nothing at all, so the banner simply returns at the
-  next launch.
+- the close cross writes nothing at all, so the banner returns at the next
+  check — which, because checking is throttled to once a day, is NOT
+  necessarily the next launch.
 
 Styled by ``theme.update_banner_qss``; MainWindow re-applies it on a theme
 switch.
@@ -66,7 +67,10 @@ class UpdateBanner(QFrame):
         layout.addWidget(self._skip, 0)
 
         self._close = QPushButton("✕")
-        self._close.setToolTip("Hide until the next launch")
+        # NOT "until the next launch": the check is throttled to once a day, so
+        # a relaunch an hour later runs no check and raises no banner. "For now"
+        # is the honest promise.
+        self._close.setToolTip("Hide for now")
         self._close.setFixedWidth(28)
         self._close.clicked.connect(self._on_close)
         layout.addWidget(self._close, 0)
