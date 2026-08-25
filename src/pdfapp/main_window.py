@@ -205,6 +205,7 @@ class MainWindow(QMainWindow):
         self._update_info: updates.UpdateInfo | None = None
         self._update_error: str | None = None
         self._update_checked = False
+        self._about_dialog = None  # the open About dialog, when there is one
         self._update_checker = UpdateChecker(self)
         self._update_checker.finished.connect(self._on_update_found)
         self._update_checker.failed.connect(self._on_update_check_failed)
@@ -2248,13 +2249,80 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         """Open the About dialog; returns it (exec'd only when on screen —
-        offscreen tests inspect the return)."""
+        offscreen tests inspect the return).
+
+        The dialog is short-lived and rebuilt each open, so the live update
+        state is pushed into it here and refreshed from the checker's signals
+        for as long as it is up.
+        """
         from pdfapp.about_dialog import AboutDialog
 
         dialog = AboutDialog(self)
+        dialog.checkRequested.connect(lambda: self._about_check(dialog))
+        dialog.updateRequested.connect(self._start_update)
+        # ONE reference, not a per-open signal connection: the checker's
+        # finished/failed handlers refresh whatever dialog is currently up.
+        # Connecting per open would stack a dead connection every time About was
+        # opened, each holding a closed dialog.
+        self._about_dialog = dialog
+        dialog.finished.connect(lambda _r: self._forget_about_dialog(dialog))
+        self._refresh_about(dialog)
         if self.isVisible():
             dialog.exec()
         return dialog
+
+    def _forget_about_dialog(self, dialog) -> None:
+        if self._about_dialog is dialog:
+            self._about_dialog = None
+
+    def _refresh_about_dialog(self) -> None:
+        """Push fresh update state into the About dialog, if one is open."""
+        if self._about_dialog is not None:
+            self._refresh_about(self._about_dialog)
+
+    def _about_check(self, dialog) -> None:
+        """The About dialog's Check button: a MANUAL check, so it ignores the
+        throttle and both deferrals — a person who asked deserves the truth."""
+        if self.check_for_updates_now():
+            self._settings.set(updates.LAST_CHECK_KEY, updates.check_stamp())
+        self._refresh_about(dialog)
+
+    def _refresh_about(self, dialog) -> None:
+        """Push the current update state into an open About dialog.
+
+        Wrapped because the checker outlives the dialog: a result arriving after
+        the box was closed would otherwise reach a deleted C++ object.
+        """
+        from pdfapp.about_dialog import update_status_text
+
+        try:
+            busy = self._update_checker.running
+            dialog.set_update_status(
+                update_status_text(
+                    self._app_version(),
+                    info=self._update_info,
+                    error=self._update_error,
+                    checked=self._update_checked,
+                    checking=busy,
+                ),
+                action=self._about_update_action(),
+                busy=busy,
+            )
+        except RuntimeError:  # the dialog was closed while a check ran
+            pass
+
+    def _about_update_action(self) -> str | None:
+        """Which action the About dialog offers, or None when there is nothing
+        to offer. Mirrors the banner: an in-place upgrade only when this build
+        can replace itself AND the release carries an installer."""
+        from pdfapp.update_banner import DOWNLOAD_PAGE, UPDATE_NOW
+
+        info = self._update_info
+        if info is None or not updates.is_newer(self._app_version(), info.version):
+            return None
+        if updates.can_self_update() and info.installer_url:
+            return UPDATE_NOW
+        return DOWNLOAD_PAGE
 
     def show_diagnostics_log(self) -> bool:
         """Help → reveal the diagnostics log so the user can send it back. If no
@@ -2902,6 +2970,7 @@ class MainWindow(QMainWindow):
         self._update_info = info
         self._update_error = None
         self._update_checked = True
+        self._refresh_about_dialog()
         current = self._app_version()
         if not updates.is_newer(current, info.version):
             return
@@ -2925,6 +2994,7 @@ class MainWindow(QMainWindow):
         About dialog's status line mentions it."""
         self._update_error = reason
         self._update_checked = True
+        self._refresh_about_dialog()
 
     def _app_version(self) -> str:
         from pdfapp import __version__

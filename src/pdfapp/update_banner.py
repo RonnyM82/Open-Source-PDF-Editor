@@ -26,15 +26,10 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
 from pdfapp import theme
-from pdfapp.updates import UpdateInfo
+from pdfapp.updates import UpdateInfo, available_message
 
 UPDATE_NOW = "Update now"
 DOWNLOAD_PAGE = "Open download page"
-
-
-def banner_message(current: str, latest: str) -> str:
-    """The banner's wording. Pure, so tests assert it without a widget."""
-    return f"Version {latest} is available. You have {current}."
 
 
 class UpdateBanner(QFrame):
@@ -97,7 +92,7 @@ class UpdateBanner(QFrame):
         """Offer ``info``. ``can_update`` False (portable / dev, or a release with
         no installer asset) swaps the primary button for the download page."""
         self._info = info
-        self._label.setText(banner_message(current, info.version))
+        self._label.setText(available_message(current, info.version))
         self._primary.setText(UPDATE_NOW if can_update else DOWNLOAD_PAGE)
         self.refresh_theme()
         self.show()

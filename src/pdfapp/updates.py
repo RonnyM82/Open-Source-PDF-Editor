@@ -239,6 +239,26 @@ def should_notify(
     return not snoozed(snooze_until, today)
 
 
+# --- wording ------------------------------------------------------------
+# The one source for the sentences BOTH update surfaces show — the banner and
+# the About dialog's status line — so they can never drift apart. Pure, so
+# tests assert the words without building a widget.
+def available_message(current: str, latest: str) -> str:
+    """The offer, shown by the banner and by the About dialog alike."""
+    return f"Version {latest} is available. You have {current}."
+
+
+def current_message(current: str) -> str:
+    """Said only after a check actually proved it — never assumed."""
+    return f"You're on the latest version ({current})."
+
+
+def unreachable_message() -> str:
+    """A check that could not reach the feed. Says what happened, and claims
+    nothing about whether an update exists."""
+    return "Couldn't reach github.com to check for updates."
+
+
 def snoozed(snooze_until: str | None, today: date | None = None) -> bool:
     """True while a "remind me in 7 days" deferral is still running.
 

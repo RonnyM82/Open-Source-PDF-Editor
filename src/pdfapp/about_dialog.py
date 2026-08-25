@@ -20,20 +20,23 @@ from __future__ import annotations
 
 import platform
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from pdfapp import __version__ as APP_VERSION
-from pdfapp import theme
+from pdfapp import theme, updates
 from pdfapp.resources import resource_path
+from pdfapp.update_banner import UPDATE_NOW
 
 APP_NAME = "PDF Editor"
 APP_TAGLINE = "Standalone PDF viewer + editor for Windows"
@@ -105,7 +108,48 @@ def about_html(mode: str | None = None) -> str:
     )
 
 
+NOT_CHECKED = "Updates haven't been checked yet."
+CHECKING = "Checking for updates…"
+
+
+def update_status_text(
+    current: str = APP_VERSION,
+    *,
+    info: updates.UpdateInfo | None = None,
+    error: str | None = None,
+    checked: bool = False,
+    checking: bool = False,
+) -> str:
+    """The Updates status line. Pure, so the wording is asserted without a window.
+
+    The line never claims more than the check proved: "you're on the latest
+    version" is said only after a check actually came back, an unreachable feed
+    says so plainly rather than implying either answer, and a build that has not
+    checked says that instead of guessing.
+    """
+    if checking:
+        return CHECKING
+    if error:
+        return updates.unreachable_message()
+    if info is not None and updates.is_newer(current, info.version):
+        return updates.available_message(current, info.version)
+    if info is not None or checked:
+        return updates.current_message(current)
+    return NOT_CHECKED
+
+
 class AboutDialog(QDialog):
+    """The About box, with a live Updates section.
+
+    Deliberately dumb about updating: it renders a status string and emits when
+    a button is pressed. MainWindow owns the checker and drives
+    :meth:`set_update_status`, which keeps the dialog short-lived and rebuildable
+    (its own long-standing convention) while the check outlives it.
+    """
+
+    checkRequested = Signal()
+    updateRequested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"About {APP_NAME}")
@@ -148,5 +192,56 @@ class AboutDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(body)
+        layout.addWidget(self._build_updates_row())
         layout.addWidget(buttons)
         self.setMinimumWidth(420)
+
+    # --- the Updates section --------------------------------------------
+    def _build_updates_row(self) -> QWidget:
+        """Status line, a Check button, and (when there is one) the action."""
+        frame = QFrame(self)
+        frame.setFrameShape(QFrame.Shape.HLine)  # a rule above the row
+        row_host = QWidget(self)
+        outer = QVBoxLayout(row_host)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        outer.addWidget(frame)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._status_label = QLabel(NOT_CHECKED, row_host)
+        self._status_label.setWordWrap(True)
+        row.addWidget(self._status_label, 1)
+
+        self._update_button = QPushButton(UPDATE_NOW, row_host)
+        self._update_button.clicked.connect(self.updateRequested)
+        self._update_button.hide()  # shown only when an update is actually there
+        row.addWidget(self._update_button, 0)
+
+        self._check_button = QPushButton("Check for updates", row_host)
+        self._check_button.clicked.connect(self.checkRequested)
+        row.addWidget(self._check_button, 0)
+
+        outer.addLayout(row)
+        return row_host
+
+    def update_status(self) -> str:
+        """What the status line currently reads (the tests' handle on it)."""
+        return self._status_label.text()
+
+    def update_action(self) -> str | None:
+        """The action button's text, or None while it is hidden."""
+        return self._update_button.text() if self._update_button.isVisibleTo(self) else None
+
+    def set_update_status(
+        self, text: str, *, action: str | None = None, busy: bool = False
+    ) -> None:
+        """Render one state. ``action`` None hides the action button; ``busy``
+        disables the Check button while a check is in flight."""
+        self._status_label.setText(text)
+        self._check_button.setEnabled(not busy)
+        if action:
+            self._update_button.setText(action)
+            self._update_button.show()
+        else:
+            self._update_button.hide()
