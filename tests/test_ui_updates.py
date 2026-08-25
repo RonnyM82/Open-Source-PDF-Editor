@@ -54,6 +54,21 @@ def _installed(monkeypatch):
     monkeypatch.setattr(mw.updates, "can_self_update", lambda *a: True)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_timers(monkeypatch):
+    """Never let this file arm a real QTimer.
+
+    ``schedule_update_check`` posts a 3-second single-shot. Left real, a timer
+    armed by one test fires during a LATER one — and if that later test still
+    has the build kind patched to "installed", the deferred check would sail
+    past its gates and make a live request to GitHub. Recording the call
+    instead keeps the suite deterministic and provably offline.
+    """
+    scheduled = []
+    monkeypatch.setattr(mw.QTimer, "singleShot", lambda ms, fn: scheduled.append((ms, fn)))
+    return scheduled
+
+
 # --- the checker bridge -------------------------------------------------
 def test_checker_emits_the_parsed_release(qapp, monkeypatch):
     monkeypatch.setattr(updates, "fetch_latest_release", lambda url=None: _payload("1.2.3"))
@@ -179,6 +194,22 @@ def test_automatic_check_is_throttled_to_once_a_day(qapp, monkeypatch):
         stale = datetime.now(UTC) - timedelta(hours=25)
         window._settings.set(updates.LAST_CHECK_KEY, updates.check_stamp(stale))
         assert window.schedule_update_check() is True
+    finally:
+        window.close()
+
+
+def test_scheduling_arms_a_deferred_check(qapp, monkeypatch, _no_real_timers):
+    """The check is deferred, not run inline: startup must never wait on the
+    network. The armed callback is the one that actually fetches."""
+    _installed(monkeypatch)
+    monkeypatch.delenv(updates.DISABLE_ENV, raising=False)
+    window = MainWindow()
+    try:
+        assert window.schedule_update_check() is True
+        assert len(_no_real_timers) == 1
+        delay, callback = _no_real_timers[0]
+        assert delay > 0
+        assert callback == window._run_automatic_update_check
     finally:
         window.close()
 
