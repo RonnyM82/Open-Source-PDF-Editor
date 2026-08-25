@@ -1,11 +1,26 @@
 # Update notification and in-place upgrade
 
-Status: **PLANNED** (2026-08-26). Nothing is built yet. Scott has approved the
-feature shape: the app checks GitHub for a newer release, tells the user with
-a banner, and can upgrade itself in place through the silent installer. The
-deferral options are his spec verbatim: skip a version entirely (quiet until
-the version after it ships), or skip for 7 days and be reminded again. The
-About dialog gains a "check for updates" button and an update status line.
+Status: **BUILT, suite green** (2026-08-26), on branch `feat/updates`. UP1
+through UP4 are committed; UP5 is this documentation plus Scott's hands-on
+pass, whose checklist is section 7. Scott approved the feature shape: the app
+checks GitHub for a newer release, tells the user with a banner, and can
+upgrade itself in place through the silent installer. The deferral options are
+his spec verbatim: skip a version entirely (quiet until the version after it
+ships), or skip for 7 days and be reminded again. The About dialog gains a
+"check for updates" button and an update status line.
+
+Two things changed from the plan as written, both recorded in place below. The
+Inno relaunch mechanism in section 3.5 was probed before UP4 was built and
+works exactly as hoped, so it is no longer an open question. Section 6's
+checksum question survives untouched.
+
+Everything else was built as planned. Three defects were caught by the work's
+own tests rather than by a user, and each is worth remembering because each
+was a case of correct-looking code failing in the WRONG direction: an
+unreadable skipped-version value silenced every future release instead of
+being ignored; opening the About dialog stacked a checker connection per open,
+each holding a closed dialog; and a result arriving after the dialog closed
+reached a deleted C++ object.
 
 ## 1. What this adds
 
@@ -172,9 +187,18 @@ The flow for an installed build, in order, because the order is the safety:
 4. The installer upgrades in place (stable AppId, same folder, stale
    `_internal` wiped as today) and relaunches the app via the new `[Run]`
    entry, which fires only when `/RELAUNCH=1` was passed, so a person
-   running the setup by hand sees exactly today's behaviour. The `{param:}`
-   check needs a small `[Code]` function; probing that syntax against our
-   Inno version is the first task of UP4.
+   running the setup by hand sees exactly today's behaviour.
+
+**The relaunch mechanism, probed and confirmed (2026-08-26).** The `[Run]`
+entry carries `Check: ShouldRelaunch`, and that function returns
+`ExpandConstant('{param:RELAUNCH|0}') = '1'`. A throwaway installer built
+against the installed Inno Setup 6 proved both directions: run with
+`/SILENT /NORESTART` the gated entry did NOT fire, and with
+`/SILENT /NORESTART /RELAUNCH=1` it did. The load-bearing detail is that the
+entry must NOT carry the usual `postinstall skipifsilent` flags, since those
+are precisely what suppresses a `[Run]` entry during a silent install. The
+real `installer/pdf-editor.iss` was then compiled end to end to confirm the
+new `[Code]` section is valid in place.
 
 Downloads come over HTTPS from the one hard-coded repo, and the asset is
 picked by its exact expected name. We do not publish checksums today; the
@@ -209,35 +233,26 @@ built installer.
 
 Each milestone is one commit at green, per the house rules.
 
-- **UP1 — the logic, no UI.** `pdfapp/updates.py`: tag parsing and version
-  compare, release-JSON to `UpdateInfo`, the should-notify decision, the
-  install-kind read (composing `sys.frozen` with `portable.is_portable()`),
-  and the settings keys. Tests cover the whole decision table in 3.2, the
-  malformed-tag and `"0.0.0"` guards, and a fixture pinned to the real API
-  response shape.
-- **UP2 — check and banner.** The background fetch bridge, the automatic
-  launch check with its 24 h throttle and kill switch, the banner widget
-  with its three buttons and cross, `theme.update_banner_qss()`, and the
-  diagnostics breadcrumb. Starts with one real API call by hand to confirm
-  the fixture matches reality. Offscreen tests drive a monkeypatched fetch;
-  no test touches the network.
-- **UP3 — the About dialog section.** Status label, Check for updates
-  button, the Update now / Open download page action per build kind, and
-  the `update_status_text` helper with wording tests.
-- **UP4 — the upgrade itself.** The download with progress and size check,
-  the close-then-launch ordering from 3.5, the portable download-page
-  branch, and the installer's gated relaunch entry (probe the `{param:}`
-  syntax first). Tests monkeypatch the process launch and assert the
-  argument list and the ordering; the download function is tested against a
-  local file served from disk.
-- **UP5 — docs and the hands-on pass.** CLAUDE.md section, PLAN.md
-  milestone entry, README note (what the app phones home for, which is one
-  version lookup, and how to turn it off). Then the frozen checklist: build
-  two versions locally, point `PDF_EDITOR_UPDATE_FEED` at a local feed
-  naming the newer one, install the older, and walk launch → banner →
-  Update now → silent upgrade → relaunch → About says current. Repeat the
-  banner path on the portable ZIP, confirm skip and snooze survive a
-  relaunch, and confirm SmartScreen stays out of the silent install.
+- **UP1 — the logic, no UI. DONE.** `pdfapp/updates.py`: tag parsing and
+  version compare, release-JSON to `UpdateInfo`, the should-notify decision,
+  the install-kind read (composing `sys.frozen` with
+  `portable.is_portable()`), and the settings keys. 74 tests cover the whole
+  decision table in 3.2, the malformed-tag and `"0.0.0"` guards, and a
+  payload pinned from the real API.
+- **UP2 — check and banner. DONE.** The background fetch bridge, the
+  automatic launch check with its 24 h throttle and kill switch, the banner
+  widget with its three buttons and cross, `theme.update_banner_qss()`, and
+  the diagnostics breadcrumb.
+- **UP3 — the About dialog section. DONE.** Status label, Check for updates
+  button, the Update now / Open download page action per build kind, and the
+  `update_status_text` helper with wording tests.
+- **UP4 — the upgrade itself. DONE.** The download with progress and size
+  check, the close-then-launch ordering from 3.5, the portable
+  download-page branch, and the installer's gated relaunch entry.
+- **UP5 — docs and the hands-on pass. Docs DONE, pass OUTSTANDING.**
+  CLAUDE.md section, this document, and the README's "Staying up to date"
+  section (what the app sends, and how to switch the check off). The
+  hands-on checklist is section 7.
 
 ## 5. Testing rules that hold across all milestones
 
@@ -248,7 +263,77 @@ gates with tests driving the dispatch methods directly. Anything that reads
 the clock takes it as a parameter so the snooze arithmetic is testable on
 fixed dates.
 
-## 6. Open questions
+## 6. Defects the build's own tests caught
+
+Recorded because all three were correct-looking code failing in the wrong
+direction, which is the kind of thing that survives a casual reread.
+
+**An unreadable skipped-version value silenced every future release.** The
+skip rule was written as "stay quiet unless the offered release is newer than
+the skipped one", and `is_newer` returns False for an unparseable input. So a
+corrupt `update_skipped_version` made every future release read as
+not-newer-than-the-skip, and the banner would never have appeared again. The
+fix is to apply the rule only when the stored value actually parses, which is
+what section 3.2's fail-open promise always meant.
+
+**Opening the About dialog stacked a signal connection each time.** The first
+cut connected the checker's `finished` and `failed` signals to a lambda
+holding that particular dialog, so every reopen added a connection that
+outlived its dialog. MainWindow now keeps one `_about_dialog` reference that
+the existing result handlers refresh.
+
+**A result arriving after the dialog closed reached a deleted C++ object.**
+The checker deliberately outlives the dialog, so this is reachable in normal
+use: open About, press Check, close the box before the answer arrives.
+`_refresh_about` swallows exactly that `RuntimeError`.
+
+## 7. The hands-on pass (outstanding)
+
+Everything below needs two real frozen builds, because the parts that cannot
+be tested from source are exactly the parts that matter: whether the running
+app can be replaced while it is closing, and whether Windows lets a silent
+install through without interrupting it.
+
+**Setting it up.** Build the current version, then bump `version` in
+`pyproject.toml` to something clearly higher, build again, and keep both
+installers. Write a small JSON file shaped like the API response naming the
+higher version, with its `browser_download_url` set to a `file:///` URL
+pointing at the newer installer on disk, and its `size` set to that file's
+exact byte count. Install the LOWER version, then launch it with
+`PDF_EDITOR_UPDATE_FEED` set to that file. No throwaway GitHub release is
+needed, and nothing touches the network.
+
+Then walk these, in order:
+
+1. Launch and wait a few seconds. The banner appears naming the higher
+   version.
+2. Press **Skip this version**. Close the app, launch again, and confirm the
+   banner stays away. Then edit the feed to name a version higher still and
+   confirm the banner comes back on the next launch. That is the skip
+   expiring on its own, which is the half of the spec most easily got wrong.
+3. Reset the skip (delete `update_skipped_version` from `settings.json` in
+   `%LOCALAPPDATA%\PDF Editor`), press **Remind me in 7 days**, relaunch, and
+   confirm silence. Wind the machine clock forward eight days, relaunch, and
+   confirm the banner returns.
+4. Open **Help → About PDF Editor** while a skip is active. The status line
+   must still report the available version, and **Check for updates** must
+   work. This is the "a person who asked deserves the truth" rule.
+5. With an unsaved edit open in a tab, press **Update now** and cancel at the
+   unsaved-changes prompt. Nothing should install, the app should stay open,
+   and the work should still be there.
+6. Press **Update now** again and let it run. Watch for: the download
+   progress dialog and its Cancel button; the app closing; the installer's
+   progress bar appearing; the app starting again by itself; and About then
+   reporting the new version. Note whether SmartScreen interrupts the silent
+   install — it should not, because the file was downloaded by the app rather
+   than by a browser, but that is reasoning, not something we have observed.
+7. Repeat step 1 on the **portable** ZIP build. The banner must appear with
+   **Open download page** rather than Update now, and pressing it must open
+   the browser and install nothing.
+8. Cancel a download midway and confirm no `.part` file survives in
+   `%TEMP%\PDF Editor Updates`, then start it again and let it finish.
+
+## 8. Open questions
 
 - Checksums. Publishing a SHA-256 beside each release asset would let the
   updater verify the download cryptographically instead of by size. It
@@ -257,7 +342,3 @@ fixed dates.
 - Whether the About dialog should also show when the last automatic check
   ran. Left out for now; the status is honest without it and the dialog
   stays uncluttered.
-- The relaunch after a silent upgrade rests on Inno's `{param:}` constant
-  and a `[Code]` check function. The mechanism is documented and our Inno
-  6.3+ floor covers it, but it is unprobed until UP4, which is why UP4
-  starts there.

@@ -305,6 +305,39 @@ Upload `dist\pdf-editor-portable-<version>.zip` **and**
 the portable and installer builds. `package.ps1` versions the zip and drops the
 portable marker into it automatically; the installer bundle stays marker-free.
 
+### Staying up to date
+
+PDF Editor checks for a newer release and offers to install it for you.
+
+**What it sends.** Once a day, a few seconds after launch, it asks GitHub's
+public releases API which release is newest — one request to
+`api.github.com`, with no account, no identifier, and nothing about you or
+your documents. If the machine is offline the check fails silently and you
+never see a thing.
+
+**What you get.** When a newer version exists, a strip appears across the top
+of the window offering **Update now**, **Remind me in 7 days**, and **Skip
+this version**. The two deferrals differ on purpose: skipping stays quiet
+until the version *after* the one you skipped ships, while the reminder stays
+quiet for a week no matter what comes out in between. Closing the strip with
+the cross just hides it until the next launch.
+
+**Update now** downloads the setup installer, closes the app (asking about any
+unsaved changes exactly as closing normally does), installs over the existing
+copy without an admin prompt, and starts the app again. Nothing is installed
+until you have agreed to close, so cancelling at the unsaved-changes prompt
+stops the whole thing safely.
+
+The **portable** build is never updated in place — an app cannot replace
+itself while it is running, and leaving the host machine untouched is the
+point of the portable copy. It shows the same notice, with a button that opens
+the download page so you can replace the folder yourself.
+
+**Help → About PDF Editor** has a **Check for updates** button and a status
+line, which always tell you the truth even about a version you have skipped.
+To turn the automatic check off entirely, set the environment variable
+`PDF_EDITOR_NO_UPDATE_CHECK=1`; the manual button in About keeps working.
+
 ### Set PDF Editor as your default PDF viewer
 
 Windows 10/11 do **not** let an app make itself the default PDF handler — that's
