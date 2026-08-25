@@ -118,3 +118,19 @@ Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgIds"; ValueType: string; V
 ; THIS app's page in Settings > Default apps (Win11; falls back to the generic
 ; page on older builds). Post-install checkbox, off in silent installs.
 Filename: "ms-settings:defaultapps?registeredAppUser=PDF%20Editor"; Description: "Set {#AppName} as the default PDF app"; Flags: shellexec nowait postinstall skipifsilent
+
+; In-app update relaunch: the app downloads this setup and runs it with
+; /SILENT /NORESTART /RELAUNCH=1, then exits. Without this entry a silent
+; install would finish with nothing on screen and the user would be left
+; wondering whether it worked. Gated purely on the parameter — NOT
+; "postinstall skipifsilent", which is exactly what suppresses a Run entry in a
+; silent install — so a person running this setup by hand sees no change at
+; all. Probe-verified against the installed Inno Setup 6 (2026-08-26): silent
+; with the parameter runs it, silent without it does not.
+Filename: "{app}\{#AppExeName}"; Flags: nowait; Check: ShouldRelaunch
+
+[Code]
+function ShouldRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;

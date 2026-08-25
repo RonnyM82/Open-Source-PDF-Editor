@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QSpinBox,
     QTabWidget,
     QToolBar,
@@ -3013,11 +3014,70 @@ class MainWindow(QMainWindow):
             self._settings.set(updates.SKIPPED_VERSION_KEY, self._update_info.version)
 
     def _start_update(self) -> None:
-        """The primary button. UP4 replaces this with the download-and-install
-        flow; today it opens the release page, which is also the permanent
-        behaviour for the portable build."""
-        if self._update_info is not None:
-            QDesktopServices.openUrl(QUrl(self._update_info.page_url))
+        """The primary button: upgrade in place, or open the download page.
+
+        The ORDER below is the safety, not a preference. Download first, then
+        ask the window to close (which runs the existing per-tab unsaved-changes
+        prompts), and only launch the installer once that close was accepted.
+        Cancelling at any point leaves nothing running and no work lost; the
+        downloaded file simply waits for next time.
+        """
+        info = self._update_info
+        if info is None:
+            return
+        if not (updates.can_self_update() and info.installer_url):
+            QDesktopServices.openUrl(QUrl(info.page_url))
+            return
+        installer = self._download_update(info)
+        if installer is None:
+            return  # cancelled, or failed and already reported
+        if not self.close():
+            return  # a document had unsaved changes and the user backed out
+        diagnostics.log_event(f"installing update {info.version}")
+        try:
+            updates.launch_installer(installer)
+        except OSError as exc:
+            self._report_update_failure(str(exc))
+
+    def _download_update(self, info: updates.UpdateInfo) -> Path | None:
+        """Fetch the installer behind a cancellable progress dialog.
+
+        None on cancel or failure. Follows the bulk-OCR convention: a
+        window-modal QProgressDialog polled on the main thread, so the download
+        cannot race the UI and the Cancel button is always live.
+        """
+        destination = updates.installer_destination(info)
+        progress = QProgressDialog(f"Downloading version {info.version}…", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.setValue(int(done * 100 / total) if total else 0)
+
+        try:
+            path = updates.download_installer(
+                info,
+                destination,
+                on_progress=on_progress if self.isVisible() else None,
+                should_cancel=progress.wasCanceled if self.isVisible() else None,
+            )
+        except updates.UpdateCancelled:
+            return None
+        except (OSError, ValueError) as exc:
+            self._report_update_failure(str(exc))
+            return None
+        finally:
+            progress.close()
+        return path
+
+    def _report_update_failure(self, reason: str) -> None:
+        """Say what went wrong in plain words. Offscreen tests get the status
+        bar instead of a modal box that would hang them."""
+        message = f"The update could not be downloaded. {reason}"
+        diagnostics.log_event(f"update download failed: {reason}")
+        self.statusBar().showMessage(message, 8000)
+        if self.isVisible():
+            QMessageBox.warning(self, "Update failed", message)
 
     # --- lifecycle ------------------------------------------------------
     def closeEvent(self, event) -> None:

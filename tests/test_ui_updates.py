@@ -308,6 +308,164 @@ def test_skipping_then_a_newer_release_offers_again(qapp, monkeypatch):
         window.close()
 
 
+# --- the in-place upgrade flow (UP4) ------------------------------------
+def _served(tmp_path, payload=b"setup"):
+    """An UpdateInfo whose installer is a real local file (a file:// download)."""
+    source = tmp_path / "pdf-editor-setup-99.0.0.exe"
+    source.write_bytes(payload)
+    return updates.UpdateInfo(
+        version="99.0.0",
+        page_url="https://example.com/v99",
+        installer_name="pdf-editor-setup-99.0.0.exe",
+        installer_url=source.as_uri(),
+        installer_size=len(payload),
+    )
+
+
+def test_update_downloads_then_closes_then_launches(qapp, monkeypatch, tmp_path):
+    """The ordering IS the safety: nothing is launched until the window has
+    actually agreed to close."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        order = []
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates,
+            "installer_destination",
+            lambda info, d=None: tmp_path / "downloaded.exe",
+        )
+        real_download = mw.updates.download_installer
+
+        def traced_download(info, dest, **kw):
+            order.append("download")
+            return real_download(info, dest, **kw)
+
+        monkeypatch.setattr(mw.updates, "download_installer", traced_download)
+        monkeypatch.setattr(MainWindow, "close", lambda self: order.append("close") or True)
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: order.append("launch"))
+        window._start_update()
+        assert order == ["download", "close", "launch"]
+    finally:
+        MainWindow.close = mw.QMainWindow.close
+        window.close()
+
+
+def test_cancelling_the_close_launches_nothing(qapp, monkeypatch, tmp_path):
+    """A document with unsaved changes the user backs out of stops the update
+    dead — and the downloaded file just waits for next time."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+        launched = []
+        monkeypatch.setattr(MainWindow, "close", lambda self: False)  # user cancelled
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: launched.append(p))
+        window._start_update()
+        assert launched == []
+        assert (tmp_path / "d.exe").exists()  # the download survives for next time
+    finally:
+        MainWindow.close = mw.QMainWindow.close
+        window.close()
+
+
+def test_a_failed_download_launches_nothing_and_says_why(qapp, monkeypatch, tmp_path):
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+
+        def boom(*a, **k):
+            raise OSError("the connection dropped")
+
+        monkeypatch.setattr(mw.updates, "download_installer", boom)
+        launched = []
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: launched.append(p))
+        window._start_update()
+        assert launched == []
+        assert "connection dropped" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+
+
+def test_a_cancelled_download_is_silent(qapp, monkeypatch, tmp_path):
+    """Cancelling is a choice, not a failure — nothing is reported."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+
+        def cancelled(*a, **k):
+            raise mw.updates.UpdateCancelled
+
+        monkeypatch.setattr(mw.updates, "download_installer", cancelled)
+        launched = []
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: launched.append(p))
+        window._start_update()
+        assert launched == []
+        # The idle status message is untouched — no failure was reported.
+        assert "could not be downloaded" not in window.statusBar().currentMessage()
+    finally:
+        window.close()
+
+
+def test_portable_build_opens_the_page_and_downloads_nothing(qapp, monkeypatch, tmp_path):
+    """The portable exe cannot replace itself while running, so it never tries."""
+    monkeypatch.setattr(mw.updates, "install_kind", lambda: updates.PORTABLE)
+    monkeypatch.setattr(mw.updates, "can_self_update", lambda *a: False)
+    window = MainWindow()
+    try:
+        window._update_info = _served(tmp_path)
+        downloads, opened = [], []
+        monkeypatch.setattr(mw.updates, "download_installer", lambda *a, **k: downloads.append(a))
+        monkeypatch.setattr(
+            mw.QDesktopServices, "openUrl", lambda url: opened.append(url.toString())
+        )
+        window._start_update()
+        assert downloads == []
+        assert opened == ["https://example.com/v99"]
+    finally:
+        window.close()
+
+
+def test_a_release_without_an_installer_opens_the_page(qapp, monkeypatch):
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._update_info = updates.UpdateInfo(
+            version="99.0.0", page_url="https://example.com/v99"
+        )
+        opened = []
+        monkeypatch.setattr(
+            mw.QDesktopServices, "openUrl", lambda url: opened.append(url.toString())
+        )
+        window._start_update()
+        assert opened == ["https://example.com/v99"]
+    finally:
+        window.close()
+
+
+def test_update_with_nothing_found_does_nothing(qapp, monkeypatch):
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        launched = []
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: launched.append(p))
+        window._start_update()  # no _update_info at all
+        assert launched == []
+    finally:
+        window.close()
+
+
 # --- the banner's place in the window -----------------------------------
 def test_banner_lives_above_the_tabs(qapp):
     """An available update is a fact about the app, not about one document."""

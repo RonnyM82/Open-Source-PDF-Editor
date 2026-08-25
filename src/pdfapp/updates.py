@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from dataclasses import dataclass
@@ -276,6 +277,137 @@ def snoozed(snooze_until: str | None, today: date | None = None) -> bool:
 def snooze_date(today: date | None = None, days: int = SNOOZE_DAYS) -> str:
     """The value to store for "remind me in 7 days" (an ISO date string)."""
     return ((today or date.today()) + timedelta(days=days)).isoformat()
+
+
+# --- downloading and running the installer ------------------------------
+# What the app passes the downloaded setup. /SILENT rather than /VERYSILENT is
+# deliberate: the user has just watched their app close, and the installer's
+# progress bar is the evidence that something is happening. /RELAUNCH=1 is our
+# own parameter, which the .iss reads via {param:RELAUNCH|0} to fire a [Run]
+# entry that starts the app again — a plain hand-run of the setup passes no such
+# parameter and behaves exactly as it always has.
+SILENT_FLAGS = ("/SILENT", "/NORESTART", "/RELAUNCH=1")
+
+_DOWNLOAD_DIRNAME = "PDF Editor Updates"
+_CHUNK = 256 * 1024
+
+
+class UpdateCancelled(Exception):
+    """The user cancelled the download. Not an error — nothing is reported."""
+
+
+def download_dir() -> Path:
+    """Where update downloads land: a folder of our own under the user's TEMP."""
+    base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    return Path(base) / _DOWNLOAD_DIRNAME
+
+
+def installer_destination(info: UpdateInfo, directory: Path | None = None) -> Path:
+    """The path the installer for ``info`` downloads to."""
+    name = info.installer_name or f"pdf-editor-setup-{info.version}.exe"
+    return (directory or download_dir()) / name
+
+
+def usable_download(dest: Path, expected_size: int) -> bool:
+    """True when a previous attempt already left a complete file here.
+
+    Only ever true for an exact size match, so a truncated download can never
+    be mistaken for a finished one. With no expected size (a release whose asset
+    carried none) this is always False: re-downloading beats running a file we
+    cannot vouch for.
+    """
+    if expected_size <= 0:
+        return False
+    try:
+        return dest.is_file() and dest.stat().st_size == expected_size
+    except OSError:
+        return False
+
+
+def download_installer(
+    info: UpdateInfo,
+    dest: Path,
+    *,
+    on_progress: Any = None,
+    should_cancel: Any = None,
+    timeout: float = FETCH_TIMEOUT,
+) -> Path:
+    """Download ``info``'s installer to ``dest`` and return the path.
+
+    Downloads to a ``.part`` file and renames only on success, so an interrupted
+    attempt can never be picked up later as a complete installer. ``on_progress``
+    is called with ``(bytes_done, total)``; ``should_cancel`` is polled each
+    chunk and raises :class:`UpdateCancelled` when it returns True.
+
+    Raises ValueError when the finished file's length does not match the size
+    the release feed reported — the honest limit of what we can verify without
+    published checksums (see docs/update-plan.md section 6).
+    """
+    if not info.installer_url:
+        raise ValueError("this release has no installer to download")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if usable_download(dest, info.installer_size):
+        return dest  # a previous attempt already finished this exact file
+
+    partial = dest.with_name(dest.name + ".part")
+    request = urllib.request.Request(
+        info.installer_url, headers={"User-Agent": f"PDFEditor/{_current_version()}"}
+    )
+    written = 0
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            total = info.installer_size or _content_length(response)
+            with open(partial, "wb") as handle:
+                while True:
+                    if should_cancel is not None and should_cancel():
+                        raise UpdateCancelled
+                    chunk = response.read(_CHUNK)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    written += len(chunk)
+                    if on_progress is not None:
+                        on_progress(written, total)
+    except BaseException:
+        partial.unlink(missing_ok=True)  # never leave a partial behind
+        raise
+
+    if info.installer_size > 0 and written != info.installer_size:
+        partial.unlink(missing_ok=True)
+        raise ValueError(
+            f"the download was {written} bytes but should have been {info.installer_size}"
+        )
+    os.replace(partial, dest)
+    return dest
+
+
+def _content_length(response: Any) -> int:
+    """The server's declared length, or 0 — only ever used to size a progress bar."""
+    try:
+        return int(response.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def installer_command(path: Path) -> list[str]:
+    """The exact command used to run a downloaded installer. Pure, so a test can
+    assert the flags without launching anything."""
+    return [str(path), *SILENT_FLAGS]
+
+
+def launch_installer(path: Path) -> None:
+    """Start the installer detached and return immediately.
+
+    Detached because this process is on its way out: the installer must outlive
+    it. The .iss keeps ``CloseApplications=yes`` as the safety net for the
+    moment between our exit and its first file copy.
+    """
+    creationflags = 0
+    if sys.platform == "win32":  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        creationflags = 0x00000008 | 0x00000200
+    subprocess.Popen(  # noqa: S603
+        installer_command(path), close_fds=True, creationflags=creationflags
+    )
 
 
 # --- the automatic-check throttle --------------------------------------

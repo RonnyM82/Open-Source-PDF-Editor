@@ -367,6 +367,123 @@ def test_naive_stamp_is_treated_as_utc():
     assert updates.check_due("2026-08-20T09:00:00", now) is True
 
 
+# --- downloading the installer ------------------------------------------
+def _local_release(tmp_path, payload: bytes) -> updates.UpdateInfo:
+    """An UpdateInfo whose installer is a real file on disk, served as a
+    file:// URL — a genuine download through urllib, with no network."""
+    source = tmp_path / "served" / "pdf-editor-setup-9.9.9.exe"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    return updates.UpdateInfo(
+        version="9.9.9",
+        page_url="https://example.com/v9",
+        installer_name="pdf-editor-setup-9.9.9.exe",
+        installer_url=source.as_uri(),
+        installer_size=len(payload),
+    )
+
+
+def test_download_writes_the_installer(tmp_path):
+    payload = b"setup bytes" * 500
+    info = _local_release(tmp_path, payload)
+    dest = tmp_path / "out" / "setup.exe"
+    assert updates.download_installer(info, dest) == dest
+    assert dest.read_bytes() == payload
+
+
+def test_download_reports_progress(tmp_path):
+    info = _local_release(tmp_path, b"x" * (600 * 1024))  # spans several chunks
+    seen = []
+    updates.download_installer(
+        info, tmp_path / "setup.exe", on_progress=lambda done, total: seen.append((done, total))
+    )
+    assert seen[-1] == (600 * 1024, 600 * 1024)
+    assert len(seen) > 1  # really chunked, not one lump
+
+
+def test_download_leaves_no_partial_file_when_cancelled(tmp_path):
+    """A cancelled attempt must leave nothing that a later run could mistake
+    for a finished installer."""
+    info = _local_release(tmp_path, b"y" * (600 * 1024))
+    dest = tmp_path / "setup.exe"
+    with pytest.raises(updates.UpdateCancelled):
+        updates.download_installer(info, dest, should_cancel=lambda: True)
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists()
+
+
+def test_download_refuses_a_wrong_length_file(tmp_path):
+    """The honest limit of verification without published checksums."""
+    payload = b"short"
+    info = _local_release(tmp_path, payload)
+    lying = updates.UpdateInfo(
+        version=info.version,
+        page_url=info.page_url,
+        installer_name=info.installer_name,
+        installer_url=info.installer_url,
+        installer_size=len(payload) + 100,  # the feed claims more than arrives
+    )
+    dest = tmp_path / "setup.exe"
+    with pytest.raises(ValueError, match="should have been"):
+        updates.download_installer(lying, dest)
+    assert not dest.exists()
+
+
+def test_download_reuses_a_complete_earlier_attempt(tmp_path):
+    """Same file already there at exactly the right size: don't fetch 95 MB again."""
+    payload = b"already here"
+    info = _local_release(tmp_path, payload)
+    dest = tmp_path / "setup.exe"
+    dest.write_bytes(payload)
+    calls = []
+    updates.download_installer(info, dest, on_progress=lambda *a: calls.append(a))
+    assert calls == []  # nothing was downloaded
+
+
+def test_a_truncated_leftover_is_not_reused(tmp_path):
+    payload = b"the full payload"
+    info = _local_release(tmp_path, payload)
+    dest = tmp_path / "setup.exe"
+    dest.write_bytes(payload[:4])  # a stale, truncated file
+    updates.download_installer(info, dest)
+    assert dest.read_bytes() == payload
+
+
+def test_usable_download_needs_an_expected_size(tmp_path):
+    """With no size to check against, re-download rather than run a file we
+    cannot vouch for."""
+    dest = tmp_path / "setup.exe"
+    dest.write_bytes(b"whatever")
+    assert updates.usable_download(dest, 0) is False
+    assert updates.usable_download(dest, 8) is True
+    assert updates.usable_download(dest, 9) is False
+
+
+def test_download_refuses_a_release_with_no_installer(tmp_path):
+    info = updates.UpdateInfo(version="9.9.9", page_url="https://example.com/v9")
+    with pytest.raises(ValueError, match="no installer"):
+        updates.download_installer(info, tmp_path / "setup.exe")
+
+
+def test_installer_destination_uses_the_asset_name(tmp_path):
+    info = updates.UpdateInfo(
+        version="9.9.9",
+        page_url="https://example.com/v9",
+        installer_name="pdf-editor-setup-9.9.9.exe",
+        installer_url="https://example.com/s.exe",
+    )
+    assert updates.installer_destination(info, tmp_path).name == "pdf-editor-setup-9.9.9.exe"
+
+
+# --- running the installer ----------------------------------------------
+def test_installer_command_is_silent_and_asks_for_the_relaunch():
+    """These exact flags are what the .iss Check function reads. /SILENT (not
+    /VERYSILENT) deliberately leaves a progress bar on screen."""
+    command = updates.installer_command("C:/tmp/setup.exe")
+    assert command[0] == "C:/tmp/setup.exe"
+    assert command[1:] == ["/SILENT", "/NORESTART", "/RELAUNCH=1"]
+
+
 # --- the kill switch ----------------------------------------------------
 def test_check_disabled_off_by_default(monkeypatch):
     monkeypatch.delenv(updates.DISABLE_ENV, raising=False)
