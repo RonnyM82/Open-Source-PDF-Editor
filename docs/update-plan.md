@@ -292,6 +292,53 @@ The checker deliberately outlives the dialog, so this is reachable in normal
 use: open About, press Check, close the box before the answer arrives.
 `_refresh_about` swallows exactly that `RuntimeError`.
 
+### Found by an adversarial review pass, after the milestones were committed
+
+Five more, all traced end to end before being fixed; two were serious.
+
+**A truncated installer could be downloaded and executed.** The length check
+read `if info.installer_size > 0`, so a release whose asset carried no usable
+size was verified against nothing at all: the `.part` file was renamed into
+place and run. A truncated HTTP body does not raise — `read()` returns empty
+and the loop ends normally — so this is reachable, not theoretical. The
+server's own `Content-Length` was already being read one line above and used
+for the progress bar, but never for verification. The download now verifies
+against the feed's size or the server's length, and REFUSES when it has
+neither, which matches what `usable_download` already did for the same case.
+
+**Starting the update from the About dialog did not end the app.**
+`_start_update` treated a successful `self.close()` as "we are on our way
+out". True from the banner, where the window is the only one. False from the
+About dialog, which is exec'd modal and survives the window closing: the
+process stayed alive holding its own exe and DLLs open while the installer
+copied over it, and the relaunched copy then lost the single-instance election
+to the old process, forwarded a bare launch to it, and made it re-show the
+PRE-update window. Only Inno's Restart Manager stood between that and a
+files-in-use failure invisible under `/SILENT`. The dialog is now dismissed
+and the app quit explicitly.
+
+**A skipped version of `0.0.0` silenced the banner forever.** The skip rule
+went through `is_newer`, which starts by refusing to treat `"0.0.0"` as a real
+version — a guard meant for OUR version, not for a stored skip. Every future
+release then read as not-newer-than-the-skip. It parses fine, so the
+fails-open guard above it never caught it. The comparison now works on the
+parsed tuples directly.
+
+**The checker cleared `running` after it emitted.** The emit is queued to the
+main thread, so a receiver could run before the assignment did, leaving the
+About dialog rendering "Checking for updates…" with the button disabled and
+nothing left to refresh it.
+
+**One exception family escaped the download handler.** `HTTPException` is
+neither `OSError` nor `ValueError`, so a captive portal answering with garbage
+(`BadStatusLine`) or a broken chunked body reached the user as nothing at all.
+
+Two smaller things went with them: a re-entrancy guard on `_start_update`,
+because the download pumps events to keep Cancel alive and that leaves the
+banner button clickable; and a test-teardown fix, since patching
+`MainWindow.close` meant the `finally: window.close()` called the patch and
+those windows were never really closed.
+
 ## 7. The hands-on pass (outstanding)
 
 Everything below needs two real frozen builds, because the parts that cannot

@@ -89,12 +89,24 @@ def parse_version(text: str | None) -> tuple[int, ...] | None:
     return tuple(int(p) for p in parts)
 
 
+def _greater(here: tuple[int, ...], there: tuple[int, ...]) -> bool:
+    """``there > here``, padded to equal length so (0, 12) == (0, 12, 0)."""
+    width = max(len(here), len(there))
+    return there + (0,) * (width - len(there)) > here + (0,) * (width - len(here))
+
+
 def is_newer(current: str | None, latest: str | None) -> bool:
     """True when ``latest`` is a strictly newer version than ``current``.
 
     False whenever either side is unparseable or ``current`` is the unknown
     fallback — a build that can't state its own version must never be told it
     is out of date.
+
+    That ``UNKNOWN_VERSION`` guard is about OUR OWN version specifically, which
+    is why :func:`should_notify` compares a skipped version with `_greater`
+    instead of calling this: a stored skip of ``"0.0.0"`` is an ordinary
+    version to compare against, and routing it through here made every future
+    release read as not-newer and silenced the banner permanently.
     """
     if current == UNKNOWN_VERSION:
         return False
@@ -102,9 +114,7 @@ def is_newer(current: str | None, latest: str | None) -> bool:
     there = parse_version(latest)
     if here is None or there is None:
         return False
-    # Pad to equal length so (0, 12) and (0, 12, 0) compare equal.
-    width = max(len(here), len(there))
-    return there + (0,) * (width - len(there)) > here + (0,) * (width - len(here))
+    return _greater(here, there)
 
 
 # --- the release feed ---------------------------------------------------
@@ -112,9 +122,11 @@ def is_newer(current: str | None, latest: str | None) -> bool:
 class UpdateInfo:
     """One release, reduced to what the updater needs.
 
-    ``installer_url`` / ``installer_size`` are None when the release carries no
-    setup asset — the banner then offers the download page instead of an
-    in-place upgrade, exactly as it does for a portable build.
+    ``installer_url`` is None (and ``installer_size`` 0) when the release
+    carries no setup asset — the banner then offers the download page instead
+    of an in-place upgrade, exactly as it does for a portable build. A size of
+    0 also means the feed gave no length to verify against, which
+    :func:`download_installer` falls back to the server's Content-Length for.
     """
 
     version: str
@@ -235,8 +247,14 @@ def should_notify(
     # version ships, at which point the skip is superseded on its own. The
     # parse guard is what makes corrupt state fail OPEN: an unreadable skip
     # value would otherwise silence the banner for every future release.
-    if parse_version(skipped) is not None and not is_newer(skipped, latest):
-        return False
+    # Compared with `_greater`, NOT `is_newer`: the latter refuses to treat
+    # "0.0.0" as a real version (that guard is about OUR version), so a skip
+    # stored as "0.0.0" would have silenced every release from then on.
+    skipped_parts = parse_version(skipped)
+    latest_parts = parse_version(latest)
+    if skipped_parts is not None and latest_parts is not None:
+        if not _greater(skipped_parts, latest_parts):
+            return False
     return not snoozed(snooze_until, today)
 
 
@@ -339,9 +357,14 @@ def download_installer(
     is called with ``(bytes_done, total)``; ``should_cancel`` is polled each
     chunk and raises :class:`UpdateCancelled` when it returns True.
 
-    Raises ValueError when the finished file's length does not match the size
-    the release feed reported — the honest limit of what we can verify without
-    published checksums (see docs/update-plan.md section 6).
+    Raises ValueError when the finished file's length does not match the
+    expected size, and ALSO when no expected size can be established at all.
+    That second refusal matters: this file gets EXECUTED, and a truncated HTTP
+    body does not raise — ``read()`` simply returns empty and the loop ends
+    normally — so without a length to check against, a half-downloaded
+    installer would be renamed into place and run. Length is the honest limit
+    of what we can verify without published checksums (docs/update-plan.md
+    section 8); having none at all is not a licence to skip verifying.
     """
     if not info.installer_url:
         raise ValueError("this release has no installer to download")
@@ -356,7 +379,13 @@ def download_installer(
     written = 0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            total = info.installer_size or _content_length(response)
+            # The release feed's size when we have one, else what the server
+            # declares. Either is a real check; neither means we refuse.
+            expected = info.installer_size or _content_length(response)
+            if expected <= 0:
+                raise ValueError(
+                    "the download size could not be determined, so the installer cannot be verified"
+                )
             with open(partial, "wb") as handle:
                 while True:
                     if should_cancel is not None and should_cancel():
@@ -367,16 +396,14 @@ def download_installer(
                     handle.write(chunk)
                     written += len(chunk)
                     if on_progress is not None:
-                        on_progress(written, total)
+                        on_progress(written, expected)
     except BaseException:
         partial.unlink(missing_ok=True)  # never leave a partial behind
         raise
 
-    if info.installer_size > 0 and written != info.installer_size:
+    if written != expected:
         partial.unlink(missing_ok=True)
-        raise ValueError(
-            f"the download was {written} bytes but should have been {info.installer_size}"
-        )
+        raise ValueError(f"the download was {written} bytes but should have been {expected}")
     os.replace(partial, dest)
     return dest
 

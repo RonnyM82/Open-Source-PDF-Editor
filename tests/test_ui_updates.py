@@ -355,9 +355,10 @@ def _served(tmp_path, payload=b"setup"):
 
 def test_update_downloads_then_closes_then_launches(qapp, monkeypatch, tmp_path):
     """The ordering IS the safety: nothing is launched until the window has
-    actually agreed to close."""
+    actually agreed to close, and the app is quit once it has."""
     _installed(monkeypatch)
     window = MainWindow()
+    real_close = MainWindow.close  # for the teardown, past the patch below
     try:
         order = []
         window._update_info = _served(tmp_path)
@@ -375,10 +376,42 @@ def test_update_downloads_then_closes_then_launches(qapp, monkeypatch, tmp_path)
         monkeypatch.setattr(mw.updates, "download_installer", traced_download)
         monkeypatch.setattr(MainWindow, "close", lambda self: order.append("close") or True)
         monkeypatch.setattr(mw.updates, "launch_installer", lambda p: order.append("launch"))
+        monkeypatch.setattr(mw.QApplication, "quit", lambda: order.append("quit"))
         window._start_update()
-        assert order == ["download", "close", "launch"]
+        assert order == ["download", "close", "launch", "quit"]
     finally:
-        window.close()
+        real_close(window)
+
+
+def test_update_from_about_dismisses_the_dialog_and_quits(qapp, monkeypatch, tmp_path):
+    """Closing the WINDOW is not ending the APP. The About dialog is exec'd
+    modal and survives the window closing, which would leave the process alive
+    holding its own exe open while the installer copied over it — and the
+    relaunched copy would then lose the single-instance election and merely
+    re-show the pre-update window."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    real_close = MainWindow.close
+    try:
+        window._update_info = _served(tmp_path)
+        dialog = window.show_about()  # offscreen: returned, not exec'd
+        assert window._about_dialog is dialog
+        dialog.show()  # stand in for the modal exec() a real user would have
+        assert dialog.isVisible() is True
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+        quits = []
+        # close() patched to succeed WITHOUT closing anything, which is exactly
+        # the real situation: closing the main window leaves this dialog up.
+        monkeypatch.setattr(MainWindow, "close", lambda self: True)
+        monkeypatch.setattr(mw.updates, "launch_installer", lambda p: None)
+        monkeypatch.setattr(mw.QApplication, "quit", lambda: quits.append(True))
+        window._start_update()
+        assert dialog.isVisible() is False  # dismissed, so its exec() unwinds
+        assert quits == [True]
+    finally:
+        real_close(window)
 
 
 def test_cancelling_the_close_launches_nothing(qapp, monkeypatch, tmp_path):
@@ -386,19 +419,49 @@ def test_cancelling_the_close_launches_nothing(qapp, monkeypatch, tmp_path):
     dead — and the downloaded file just waits for next time."""
     _installed(monkeypatch)
     window = MainWindow()
+    real_close = MainWindow.close
     try:
         window._update_info = _served(tmp_path)
         monkeypatch.setattr(
             mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
         )
-        launched = []
+        launched, quits = [], []
         monkeypatch.setattr(MainWindow, "close", lambda self: False)  # user cancelled
         monkeypatch.setattr(mw.updates, "launch_installer", lambda p: launched.append(p))
+        monkeypatch.setattr(mw.QApplication, "quit", lambda: quits.append(True))
         window._start_update()
         assert launched == []
+        assert quits == []  # the app must stay running
         assert (tmp_path / "d.exe").exists()  # the download survives for next time
     finally:
-        window.close()
+        real_close(window)
+
+
+def test_a_second_click_while_updating_is_ignored(qapp, monkeypatch, tmp_path):
+    """The download pumps events to keep Cancel alive, which leaves the banner
+    button clickable; a re-entrant run would download into the same .part."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    real_close = MainWindow.close
+    try:
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+        starts = []
+
+        def reentrant(info, dest, **kw):
+            starts.append(1)
+            window._start_update()  # the user clicks again mid-download
+            return dest
+
+        monkeypatch.setattr(mw.updates, "download_installer", reentrant)
+        monkeypatch.setattr(MainWindow, "close", lambda self: False)
+        monkeypatch.setattr(mw.QApplication, "quit", lambda: None)
+        window._start_update()
+        assert starts == [1]  # the nested click did nothing
+    finally:
+        real_close(window)
 
 
 def test_a_failed_download_launches_nothing_and_says_why(qapp, monkeypatch, tmp_path):
@@ -447,12 +510,13 @@ def test_a_cancelled_download_is_silent(qapp, monkeypatch, tmp_path):
         window.close()
 
 
-def test_progress_stays_cancellable_when_the_size_is_unknown(qapp, monkeypatch, tmp_path):
-    """QProgressDialog only pumps events when the value CHANGES, so an unknown
-    total must not repeat setValue(0) — that leaves Cancel dead for the whole
-    download. An unknown total switches the bar to indeterminate instead."""
+def test_progress_advances_so_cancel_stays_alive(qapp, monkeypatch, tmp_path):
+    """QProgressDialog pumps events from setValue only when the value CHANGES,
+    which is what keeps Cancel responsive. The engine guarantees a real total
+    (it refuses a download it cannot size), so the bar is a true percentage."""
     _installed(monkeypatch)
     window = MainWindow()
+    real_close = MainWindow.close
     try:
         window._update_info = _served(tmp_path)
         monkeypatch.setattr(
@@ -460,13 +524,8 @@ def test_progress_stays_cancellable_when_the_size_is_unknown(qapp, monkeypatch, 
         )
         monkeypatch.setattr(MainWindow, "isVisible", lambda self: True)
         monkeypatch.setattr(MainWindow, "close", lambda self: False)  # stop before launching
-        seen = {}
-
-        def capture(info, dest, *, on_progress=None, should_cancel=None):
-            on_progress(10, 0)  # a chunk arrived, total unknown
-            seen["range"] = (progress_ref[0].minimum(), progress_ref[0].maximum())
-            return dest
-
+        monkeypatch.setattr(mw.QApplication, "quit", lambda: None)
+        values = []
         progress_ref = []
         real_dialog = mw.QProgressDialog
 
@@ -475,12 +534,20 @@ def test_progress_stays_cancellable_when_the_size_is_unknown(qapp, monkeypatch, 
             progress_ref.append(dialog)
             return dialog
 
+        def capture(info, dest, *, on_progress=None, should_cancel=None):
+            # Stop short of 100: reaching the maximum makes QProgressDialog
+            # auto-reset to -1, which would say nothing about pumping.
+            for done in (25, 50, 75):
+                on_progress(done, 100)
+                values.append(progress_ref[0].value())
+            return dest
+
         monkeypatch.setattr(mw, "QProgressDialog", spy_dialog)
         monkeypatch.setattr(mw.updates, "download_installer", capture)
         window._start_update()
-        assert seen["range"] == (0, 0)  # indeterminate, so events keep flowing
+        assert values == [25, 50, 75]  # a changing value is what pumps events
     finally:
-        window.close()
+        real_close(window)
 
 
 def test_portable_build_opens_the_page_and_downloads_nothing(qapp, monkeypatch, tmp_path):

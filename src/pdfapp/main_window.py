@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from http.client import HTTPException
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, QTimer, QUrl
@@ -207,6 +208,7 @@ class MainWindow(QMainWindow):
         self._update_error: str | None = None
         self._update_checked = False
         self._about_dialog = None  # the open About dialog, when there is one
+        self._updating = False  # an upgrade is mid-flight (re-entrancy guard)
         self._update_checker = UpdateChecker(self)
         self._update_checker.finished.connect(self._on_update_found)
         self._update_checker.failed.connect(self._on_update_check_failed)
@@ -3021,23 +3023,41 @@ class MainWindow(QMainWindow):
         prompts), and only launch the installer once that close was accepted.
         Cancelling at any point leaves nothing running and no work lost; the
         downloaded file simply waits for next time.
+
+        Closing the WINDOW is not the same as ending the APP, which is the trap
+        here. Started from the banner it is, because the window is the only one.
+        Started from the About dialog it is not: that dialog is exec'd modal, it
+        survives the window closing, and the process stays alive holding its own
+        exe and DLLs open. The installer would then copy over a running program,
+        and the relaunched copy would lose the single-instance election to the
+        old process and merely re-show the PRE-update window. So the dialog is
+        dismissed and the app is quit explicitly.
         """
+        if self._updating:
+            return  # a second click while the first is still running
         info = self._update_info
         if info is None:
             return
         if not (updates.can_self_update() and info.installer_url):
             QDesktopServices.openUrl(QUrl(info.page_url))
             return
-        installer = self._download_update(info)
-        if installer is None:
-            return  # cancelled, or failed and already reported
-        if not self.close():
-            return  # a document had unsaved changes and the user backed out
+        self._updating = True
+        try:
+            installer = self._download_update(info)
+            if installer is None:
+                return  # cancelled, or failed and already reported
+            if not self.close():
+                return  # a document had unsaved changes and the user backed out
+        finally:
+            self._updating = False
+        if self._about_dialog is not None:
+            self._about_dialog.accept()  # let its modal exec() unwind
         diagnostics.log_event(f"installing update {info.version}")
         try:
             updates.launch_installer(installer)
         except OSError as exc:
-            self._report_update_failure(str(exc))
+            diagnostics.log_event(f"update launch failed: {exc}")
+        QApplication.quit()
 
     def _download_update(self, info: updates.UpdateInfo) -> Path | None:
         """Fetch the installer behind a cancellable progress dialog.
@@ -3052,16 +3072,12 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(400)
 
         def on_progress(done: int, total: int) -> None:
-            # QProgressDialog pumps events from setValue ONLY when the value
-            # actually CHANGES, so an unknown total (a release carrying no size,
-            # served by something that sends no Content-Length) would repeat
-            # setValue(0), never process an event, and leave Cancel dead for the
-            # whole download. Fall back to an indeterminate bar and pump directly.
-            if total:
-                progress.setValue(int(done * 100 / total))
-            else:
-                progress.setRange(0, 0)
-                QApplication.processEvents()
+            # `total` is always a real size: download_installer refuses to run
+            # at all when it cannot establish one, precisely so the file it
+            # hands back has been verified. That also keeps this a genuine
+            # percentage, which is what makes setValue pump events and keeps
+            # Cancel alive (it only pumps when the value CHANGES).
+            progress.setValue(int(done * 100 / total))
 
         try:
             path = updates.download_installer(
@@ -3072,7 +3088,11 @@ class MainWindow(QMainWindow):
             )
         except updates.UpdateCancelled:
             return None
-        except (OSError, ValueError) as exc:
+        # HTTPException is neither OSError nor ValueError: a proxy or captive
+        # portal answering with garbage raises BadStatusLine, and a broken
+        # chunked body raises IncompleteRead. Without it those escaped as an
+        # unhandled exception in a Qt slot and the user was told nothing.
+        except (OSError, ValueError, HTTPException) as exc:
             self._report_update_failure(str(exc))
             return None
         finally:

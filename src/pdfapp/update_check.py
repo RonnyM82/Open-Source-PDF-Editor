@@ -69,19 +69,30 @@ class UpdateChecker(QObject):
         Never raises: a check that cannot reach the feed is a non-event for the
         user (the automatic check says nothing at all; the manual one reports
         that it could not reach the server).
+
+        ``_running`` is cleared BEFORE anything is emitted, and that ordering is
+        load-bearing. The emit is queued to the main thread, so a receiver can
+        run while this thread is still between statements; clearing afterwards
+        let the About dialog read ``running`` as True inside its own refresh and
+        latch on "Checking for updates…" with the button disabled, with nothing
+        left to refresh it.
         """
         self._running = True
+        failure: str | None = None
+        info: updates.UpdateInfo | None = None
         try:
             data = updates.fetch_latest_release(url)
             info = updates.release_to_info(data)
             if info is None:
-                self._emit_failed("the release feed could not be read")
-            else:
-                self._emit_finished(info)
+                failure = "the release feed could not be read"
         except Exception as exc:  # noqa: BLE001 - every failure is reported, not raised
-            self._emit_failed(str(exc) or exc.__class__.__name__)
+            failure = str(exc) or exc.__class__.__name__
         finally:
             self._running = False
+        if failure is not None:
+            self._emit_failed(failure)
+        else:
+            self._emit_finished(info)
 
     # --- delivery -------------------------------------------------------
     def _emit_finished(self, info: updates.UpdateInfo) -> None:

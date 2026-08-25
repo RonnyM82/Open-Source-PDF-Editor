@@ -152,8 +152,9 @@ def test_release_asset_without_a_url_is_ignored():
 
 
 def test_release_asset_with_a_junk_size_reads_as_unknown():
-    """Size 0 means "can't verify the download by length" — UP4 skips the
-    check rather than refusing a download over a missing field."""
+    """Size 0 means "the feed gave us no length to check against". The download
+    then falls back to the server's Content-Length, and refuses outright if
+    there is none either — see test_an_unsizeable_download_is_refused_not_run."""
     payload = dict(LATEST_RELEASE_PAYLOAD)
     payload["assets"] = [
         {
@@ -256,6 +257,15 @@ def test_skip_is_superseded_by_the_next_release():
     ships, then the banner returns on its own."""
     assert (
         updates.should_notify("0.11.0", "0.13.0", skipped="0.12.0", kind=updates.INSTALLED) is True
+    )
+
+
+def test_a_skipped_version_of_zero_does_not_silence_everything():
+    """`is_newer` refuses to treat "0.0.0" as a real version, but that guard is
+    about OUR OWN version. Routing the skip comparison through it made every
+    future release read as not-newer and silenced the banner permanently."""
+    assert (
+        updates.should_notify("0.11.0", "0.12.0", skipped="0.0.0", kind=updates.INSTALLED) is True
     )
 
 
@@ -446,6 +456,46 @@ def test_a_truncated_leftover_is_not_reused(tmp_path):
     dest = tmp_path / "setup.exe"
     dest.write_bytes(payload[:4])  # a stale, truncated file
     updates.download_installer(info, dest)
+    assert dest.read_bytes() == payload
+
+
+def test_an_unsizeable_download_is_refused_not_run(tmp_path, monkeypatch):
+    """This file gets EXECUTED. A truncated HTTP body does not raise — read()
+    just returns empty and the loop ends — so with no length to check against,
+    a half-downloaded installer would be renamed into place and run. Refuse
+    instead."""
+    payload = b"setup bytes"
+    info = _local_release(tmp_path, payload)
+    sizeless = updates.UpdateInfo(
+        version=info.version,
+        page_url=info.page_url,
+        installer_name=info.installer_name,
+        installer_url=info.installer_url,
+        installer_size=0,  # the feed carried no usable size
+    )
+    dest = tmp_path / "setup.exe"
+    # Serve it with no Content-Length either, so nothing can vouch for it.
+    monkeypatch.setattr(updates, "_content_length", lambda response: 0)
+    with pytest.raises(ValueError, match="could not be determined"):
+        updates.download_installer(sizeless, dest)
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists()
+
+
+def test_the_servers_declared_length_is_used_when_the_feed_has_none(tmp_path):
+    """A release with no size is still updatable when the server declares a
+    length — that is a real check, so it is allowed."""
+    payload = b"setup bytes" * 40
+    info = _local_release(tmp_path, payload)
+    sizeless = updates.UpdateInfo(
+        version=info.version,
+        page_url=info.page_url,
+        installer_name=info.installer_name,
+        installer_url=info.installer_url,
+        installer_size=0,
+    )
+    dest = tmp_path / "setup.exe"
+    assert updates.download_installer(sizeless, dest) == dest
     assert dest.read_bytes() == payload
 
 
