@@ -3052,7 +3052,16 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(400)
 
         def on_progress(done: int, total: int) -> None:
-            progress.setValue(int(done * 100 / total) if total else 0)
+            # QProgressDialog pumps events from setValue ONLY when the value
+            # actually CHANGES, so an unknown total (a release carrying no size,
+            # served by something that sends no Content-Length) would repeat
+            # setValue(0), never process an event, and leave Cancel dead for the
+            # whole download. Fall back to an indeterminate bar and pump directly.
+            if total:
+                progress.setValue(int(done * 100 / total))
+            else:
+                progress.setRange(0, 0)
+                QApplication.processEvents()
 
         try:
             path = updates.download_installer(

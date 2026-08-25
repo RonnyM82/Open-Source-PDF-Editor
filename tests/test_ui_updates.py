@@ -378,7 +378,6 @@ def test_update_downloads_then_closes_then_launches(qapp, monkeypatch, tmp_path)
         window._start_update()
         assert order == ["download", "close", "launch"]
     finally:
-        MainWindow.close = mw.QMainWindow.close
         window.close()
 
 
@@ -399,7 +398,6 @@ def test_cancelling_the_close_launches_nothing(qapp, monkeypatch, tmp_path):
         assert launched == []
         assert (tmp_path / "d.exe").exists()  # the download survives for next time
     finally:
-        MainWindow.close = mw.QMainWindow.close
         window.close()
 
 
@@ -445,6 +443,42 @@ def test_a_cancelled_download_is_silent(qapp, monkeypatch, tmp_path):
         assert launched == []
         # The idle status message is untouched — no failure was reported.
         assert "could not be downloaded" not in window.statusBar().currentMessage()
+    finally:
+        window.close()
+
+
+def test_progress_stays_cancellable_when_the_size_is_unknown(qapp, monkeypatch, tmp_path):
+    """QProgressDialog only pumps events when the value CHANGES, so an unknown
+    total must not repeat setValue(0) — that leaves Cancel dead for the whole
+    download. An unknown total switches the bar to indeterminate instead."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._update_info = _served(tmp_path)
+        monkeypatch.setattr(
+            mw.updates, "installer_destination", lambda info, d=None: tmp_path / "d.exe"
+        )
+        monkeypatch.setattr(MainWindow, "isVisible", lambda self: True)
+        monkeypatch.setattr(MainWindow, "close", lambda self: False)  # stop before launching
+        seen = {}
+
+        def capture(info, dest, *, on_progress=None, should_cancel=None):
+            on_progress(10, 0)  # a chunk arrived, total unknown
+            seen["range"] = (progress_ref[0].minimum(), progress_ref[0].maximum())
+            return dest
+
+        progress_ref = []
+        real_dialog = mw.QProgressDialog
+
+        def spy_dialog(*a, **k):
+            dialog = real_dialog(*a, **k)
+            progress_ref.append(dialog)
+            return dialog
+
+        monkeypatch.setattr(mw, "QProgressDialog", spy_dialog)
+        monkeypatch.setattr(mw.updates, "download_installer", capture)
+        window._start_update()
+        assert seen["range"] == (0, 0)  # indeterminate, so events keep flowing
     finally:
         window.close()
 
