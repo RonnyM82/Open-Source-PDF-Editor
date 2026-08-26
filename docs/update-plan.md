@@ -368,14 +368,25 @@ be tested from source are exactly the parts that matter: whether the running
 app can be replaced while it is closing, and whether Windows lets a silent
 install through without interrupting it.
 
-**Setting it up.** Build the current version, then bump `version` in
-`pyproject.toml` to something clearly higher, build again, and keep both
-installers. Write a small JSON file shaped like the API response naming the
-higher version, with its `browser_download_url` set to a `file:///` URL
-pointing at the newer installer on disk, and its `size` set to that file's
-exact byte count. Install the LOWER version, then launch it with
-`PDF_EDITOR_UPDATE_FEED` set to that file. No throwaway GitHub release is
-needed, and nothing touches the network.
+**Setting it up.** `scripts/make_update_feed.ps1` writes the feed file for you
+from an installer in `dist\`, so none of this needs a throwaway GitHub release
+and none of it touches the network. Two ways to run the pass:
+
+- **One build (covers everything except the version number changing).** Build
+  once, install it, and point the feed at that same installer while claiming a
+  much higher version. The app genuinely downloads it, verifies its length,
+  closes, installs, and relaunches; it just lands back on the version it
+  started from, so the banner returns afterwards. Every mechanism below is
+  exercised. This is the cheap pass, and it is the one to do first.
+- **Two builds (adds the version actually changing).** Build, bump `version`
+  in `pyproject.toml`, build again, install the LOWER one, and point the feed
+  at the higher installer with `-Version` matching it. About then reports the
+  new version afterwards and the banner stays away, which the one-build pass
+  cannot show.
+
+Either way, launch the INSTALLED app from a shell with
+`PDF_EDITOR_UPDATE_FEED` set to the feed file; the script prints the exact
+commands when it finishes.
 
 **One thing to know before you start.** The app asks GitHub at most once every
 24 hours, but it remembers what the last check found, so a relaunch inside
