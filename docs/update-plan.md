@@ -1,8 +1,8 @@
 # Update notification and in-place upgrade
 
-Status: **BUILT, suite green** (2026-08-26), on branch `feat/updates`. UP1
-through UP4 are committed; UP5 is this documentation plus Scott's hands-on
-pass, whose checklist is section 7. Scott approved the feature shape: the app
+Status: **SHIPPED in v0.12.0** (2026-08-26). All five milestones are done,
+Scott's hands-on pass passed on real frozen builds, and the branch is merged
+to main and released. Scott approved the feature shape: the app
 checks GitHub for a newer release, tells the user with a banner, and can
 upgrade itself in place through the silent installer. The deferral options are
 his spec verbatim: skip a version entirely (quiet until the version after it
@@ -361,7 +361,21 @@ ever revisited: the API allows 60 unauthenticated requests per hour PER IP, and
 an office full of people behind one address shares that budget, so checking on
 every launch is not as free as it looks for an internally distributed tool.
 
-## 7. The hands-on pass (outstanding)
+## 7. The hands-on pass (DONE, 2026-08-26)
+
+Passed on real frozen builds before release: 0.11.0 was installed, pointed at
+a local feed serving the 0.12.0 installer, and upgraded itself in place with
+the app relaunching on the new version. Keep this checklist for the next time
+the update path is touched.
+
+**The trap worth remembering.** The first attempt pointed a fake-higher
+version at the SAME installer that was already installed. That exercises the
+whole mechanism, but it cannot tell a successful install from a failed one:
+both end with About reporting the version it started on. Scott spotted it
+straight away ("I can't actually test the update process itself though can
+I?"). Two builds at different versions is the only setup where the evidence is
+unambiguous, which is why the second option below is the one that actually
+signed this off.
 
 Everything below needs two real frozen builds, because the parts that cannot
 be tested from source are exactly the parts that matter: whether the running
