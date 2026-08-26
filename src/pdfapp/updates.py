@@ -55,6 +55,11 @@ UNKNOWN_VERSION = "0.0.0"
 LAST_CHECK_KEY = "update_last_check"
 SKIPPED_VERSION_KEY = "update_skipped_version"
 SNOOZE_UNTIL_KEY = "update_snooze_until"
+# The last release a check actually found, remembered so a launch whose check
+# is throttled can still make the offer. Without it the 24 h throttle silenced
+# the BANNER as well as the network request: close the app after seeing the
+# offer, reopen it that afternoon, and the app had forgotten entirely.
+LAST_RELEASE_KEY = "update_last_release"
 
 SNOOZE_DAYS = 7
 CHECK_INTERVAL_HOURS = 24
@@ -173,6 +178,53 @@ def release_to_info(data: Any) -> UpdateInfo | None:
                 installer_size=size if isinstance(size, int) and size > 0 else 0,
             )
     return UpdateInfo(version=version, page_url=page_url)
+
+
+def info_to_json(info: UpdateInfo) -> str:
+    """Serialise a release for the settings store.
+
+    A JSON STRING rather than a nested dict on purpose: the store is documented
+    as holding scalars only, and one opaque string honours that exactly.
+    """
+    return json.dumps(
+        {
+            "version": info.version,
+            "page_url": info.page_url,
+            "installer_name": info.installer_name,
+            "installer_url": info.installer_url,
+            "installer_size": info.installer_size,
+        }
+    )
+
+
+def info_from_json(text: Any) -> UpdateInfo | None:
+    """Read back what :func:`info_to_json` wrote; None for anything unreadable.
+
+    Degrades like every other setting: a hand-edited or truncated value simply
+    means "nothing remembered", never an exception on the launch path.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    version = data.get("version")
+    page_url = data.get("page_url")
+    if not isinstance(version, str) or parse_version(version) is None:
+        return None
+    size = data.get("installer_size")
+    url = data.get("installer_url")
+    name = data.get("installer_name")
+    return UpdateInfo(
+        version=version,
+        page_url=page_url if isinstance(page_url, str) and page_url else RELEASES_PAGE_URL,
+        installer_name=name if isinstance(name, str) else None,
+        installer_url=url if isinstance(url, str) and url else None,
+        installer_size=size if isinstance(size, int) and size > 0 else 0,
+    )
 
 
 def fetch_latest_release(url: str | None = None, timeout: float = FETCH_TIMEOUT) -> Any:

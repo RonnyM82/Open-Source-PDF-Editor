@@ -198,6 +198,80 @@ def test_automatic_check_is_throttled_to_once_a_day(qapp, monkeypatch):
         window.close()
 
 
+def test_a_throttled_launch_still_offers_a_known_update(qapp, monkeypatch):
+    """THE point of remembering: the 24 h throttle limits how often we bother
+    GitHub, not how often we tell the user. Before this, seeing the offer,
+    closing the app, and reopening it that afternoon meant the app had
+    forgotten an update existed — no skip, no snooze, just silence."""
+    _installed(monkeypatch)
+    monkeypatch.delenv(updates.DISABLE_ENV, raising=False)
+    first = MainWindow()
+    try:
+        first._on_update_found(NEWER)  # a real check, banner shown
+        assert first._settings.get(updates.LAST_RELEASE_KEY)
+        first._settings.set(updates.LAST_CHECK_KEY, updates.check_stamp())
+    finally:
+        first.close()
+
+    second = MainWindow()  # relaunch the same afternoon
+    try:
+        assert second.schedule_update_check() is False  # no check: throttled
+        assert second._update_banner.info is not None  # ...but still offered
+        assert second._update_banner.info.version == "99.0.0"
+        assert second._update_info is not None  # and About can act on it
+    finally:
+        second.close()
+
+
+def test_a_remembered_update_still_honours_skip_and_snooze(qapp, monkeypatch):
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._settings.set(updates.LAST_RELEASE_KEY, updates.info_to_json(NEWER))
+        window._settings.set(updates.SKIPPED_VERSION_KEY, NEWER.version)
+        window._offer_remembered_update()
+        assert window._update_banner.info is None
+    finally:
+        window.close()
+
+
+def test_a_remembered_update_we_already_installed_is_ignored(qapp, monkeypatch):
+    """Never let a memory stand in for a check: if the remembered release is no
+    longer newer than us, say nothing rather than vouching for being current."""
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        stale = updates.UpdateInfo(version="0.0.1", page_url="https://example.com/old")
+        window._settings.set(updates.LAST_RELEASE_KEY, updates.info_to_json(stale))
+        window._offer_remembered_update()
+        assert window._update_banner.info is None
+        assert window._update_info is None  # About still says "not checked yet"
+    finally:
+        window.close()
+
+
+def test_a_corrupt_memory_does_not_break_launch(qapp, monkeypatch):
+    _installed(monkeypatch)
+    window = MainWindow()
+    try:
+        window._settings.set(updates.LAST_RELEASE_KEY, "{ mangled")
+        window._offer_remembered_update()  # must not raise
+        assert window._update_banner.info is None
+    finally:
+        window.close()
+
+
+def test_a_dev_build_never_offers_from_memory(qapp, monkeypatch):
+    monkeypatch.setattr(mw.updates, "install_kind", lambda: updates.DEV)
+    window = MainWindow()
+    try:
+        window._settings.set(updates.LAST_RELEASE_KEY, updates.info_to_json(NEWER))
+        window._offer_remembered_update()
+        assert window._update_banner.info is None
+    finally:
+        window.close()
+
+
 def test_scheduling_arms_a_deferred_check(qapp, monkeypatch, _no_real_timers):
     """The check is deferred, not run inline: startup must never wait on the
     network. The armed callback is the one that actually fetches."""

@@ -2934,16 +2934,45 @@ class MainWindow(QMainWindow):
 
     # --- updates --------------------------------------------------------
     def schedule_update_check(self, delay_ms: int = 3000) -> bool:
-        """Queue the automatic launch check. False when it will not run.
+        """Make any remembered offer, then queue the automatic launch check.
+        Returns whether a CHECK was queued (the offer needs no network).
 
         Deliberately not called from ``__init__``: ``app.main`` starts it once
         the real window is up, so startup speed never waits on the network and
         the offscreen test windows (which never call this) stay silent.
         """
+        self._offer_remembered_update()
         if not self._automatic_check_allowed():
             return False
         QTimer.singleShot(delay_ms, self._run_automatic_update_check)
         return True
+
+    def _offer_remembered_update(self) -> None:
+        """Re-offer the release the last check found, with no network at all.
+
+        The 24 h throttle is there to limit how often we bother GitHub, NOT how
+        often we tell the user. Without this the two were the same thing: see
+        the offer, close the app without deciding, reopen it that afternoon, and
+        the app had forgotten an update existed — no skip, no snooze, just
+        silence until tomorrow.
+
+        A remembered release that is no longer newer than us is ignored rather
+        than reported, so the About dialog never says "you're on the latest
+        version" on the strength of a memory instead of a check.
+        """
+        if updates.install_kind() == updates.DEV:
+            return
+        info = updates.info_from_json(self._settings.get(updates.LAST_RELEASE_KEY))
+        if info is None or not updates.is_newer(self._app_version(), info.version):
+            return
+        self._update_info = info
+        if updates.should_notify(
+            self._app_version(),
+            info.version,
+            skipped=self._settings.get(updates.SKIPPED_VERSION_KEY),
+            snooze_until=self._settings.get(updates.SNOOZE_UNTIL_KEY),
+        ):
+            self._present_update_banner(info)
 
     def _automatic_check_allowed(self) -> bool:
         """The three gates on the AUTOMATIC check: the environment kill switch,
@@ -2973,6 +3002,8 @@ class MainWindow(QMainWindow):
         self._update_info = info
         self._update_error = None
         self._update_checked = True
+        # Remember it so a launch whose check is throttled can still offer it.
+        self._settings.set(updates.LAST_RELEASE_KEY, updates.info_to_json(info))
         self._refresh_about_dialog()
         current = self._app_version()
         if not updates.is_newer(current, info.version):

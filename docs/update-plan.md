@@ -339,6 +339,28 @@ banner button clickable; and a test-teardown fix, since patching
 `MainWindow.close` meant the `finally: window.close()` called the patch and
 those windows were never really closed.
 
+### The throttle silenced the banner as well as the network request
+
+Found while explaining the hands-on checklist to Scott, which is a good sign
+that the checklist was describing a defect as if it were a quirk to work
+around. The 24 hour throttle existed to limit how often we ask GitHub, but the
+banner was only ever raised BY a check, so the two were the same thing. Seeing
+the offer, closing the app without deciding, and reopening it that afternoon
+meant the app had forgotten an update existed: no skip, no snooze, just
+silence until the next day.
+
+Every successful check now writes what it found to `update_last_release`, and
+`schedule_update_check` re-offers it with no network before deciding whether a
+check is due. Two guards keep it honest. A remembered release that is no
+longer newer than us is ignored rather than reported, so the About dialog
+never says "you're on the latest version" on the strength of a memory instead
+of a check; and an unreadable value is simply nothing remembered.
+
+The rate limit reasoning behind the throttle is worth keeping in mind if it is
+ever revisited: the API allows 60 unauthenticated requests per hour PER IP, and
+an office full of people behind one address shares that budget, so checking on
+every launch is not as free as it looks for an internally distributed tool.
+
 ## 7. The hands-on pass (outstanding)
 
 Everything below needs two real frozen builds, because the parts that cannot
@@ -355,43 +377,51 @@ exact byte count. Install the LOWER version, then launch it with
 `PDF_EDITOR_UPDATE_FEED` set to that file. No throwaway GitHub release is
 needed, and nothing touches the network.
 
-**The one thing that will waste your time if you don't know it.** The
-automatic check runs at most once every 24 hours, so a plain relaunch a minute
-later runs NO check and therefore shows NO banner — which looks exactly like a
-bug. Between every relaunch below, delete the `update_last_check` key from
-`settings.json` in `%LOCALAPPDATA%\PDF Editor` (the same file the skip and
-snooze keys live in). Deleting the whole file is fine too.
+**One thing to know before you start.** The app asks GitHub at most once every
+24 hours, but it remembers what the last check found, so a relaunch inside
+that window still shows the banner from memory. That is deliberate (see
+`_offer_remembered_update`). What it means for testing is that changing the
+FEED has no visible effect until a real check runs again: to force one, delete
+`update_last_check` from `settings.json` in `%LOCALAPPDATA%\PDF Editor`. The
+steps below say when that matters. All the update settings live in that one
+file, and deleting the whole file is a clean reset.
 
 Then walk these, in order:
 
 1. Launch and wait a few seconds. The banner appears naming the higher
    version.
-2. Press **Skip this version**. Clear `update_last_check`, launch again, and
-   confirm the banner stays away. Then edit the feed to name a version higher
-   still, clear `update_last_check` again, and confirm the banner comes back.
-   That is the skip expiring on its own, which is the half of the spec most
-   easily got wrong.
-3. Reset the skip (delete `update_skipped_version` from the same file), press
+2. Close the app without touching the banner and launch it again. The banner
+   must come back immediately, with no check needed. This is the
+   silent-forgetting bug that the memory fixes.
+3. Press **Skip this version**, relaunch, and confirm the banner stays away.
+   Then edit the feed to name a version higher still, delete
+   `update_last_check` so a real check runs, and confirm the banner comes
+   back. That is the skip expiring on its own, which is the half of the spec
+   most easily got wrong.
+4. Reset the skip (delete `update_skipped_version` from the same file), press
    **Remind me in 7 days**, relaunch, and confirm silence. Wind the machine
-   clock forward eight days, relaunch, and confirm the banner returns. The
-   clock change also clears the check throttle for you.
-4. Open **Help → About PDF Editor** while a skip is active. The status line
+   clock forward eight days, relaunch, and confirm the banner returns.
+5. Open **Help → About PDF Editor** while a skip is active. The status line
    must still report the available version, and **Check for updates** must
    work. This is the "a person who asked deserves the truth" rule.
-5. With an unsaved edit open in a tab, press **Update now** and cancel at the
+6. With an unsaved edit open in a tab, press **Update now** and cancel at the
    unsaved-changes prompt. Nothing should install, the app should stay open,
    and the work should still be there.
-6. Press **Update now** again and let it run. Watch for: the download
+7. Press **Update now** again and let it run. Watch for: the download
    progress dialog and its Cancel button; the app closing; the installer's
    progress bar appearing; the app starting again by itself; and About then
    reporting the new version. Note whether SmartScreen interrupts the silent
    install — it should not, because the file was downloaded by the app rather
    than by a browser, but that is reasoning, not something we have observed.
-7. Repeat step 1 on the **portable** ZIP build. The banner must appear with
+8. Do step 7 again, but start it from **About → Update now** rather than the
+   banner, with the About box still open. The app must actually exit — if the
+   old window reappears afterwards still showing the old version, the dialog
+   kept the process alive and the upgrade landed on a running program.
+9. Repeat step 1 on the **portable** ZIP build. The banner must appear with
    **Open download page** rather than Update now, and pressing it must open
    the browser and install nothing.
-8. Cancel a download midway and confirm no `.part` file survives in
-   `%TEMP%\PDF Editor Updates`, then start it again and let it finish.
+10. Cancel a download midway and confirm no `.part` file survives in
+    `%TEMP%\PDF Editor Updates`, then start it again and let it finish.
 
 ## 8. Open questions
 

@@ -199,6 +199,49 @@ def test_fetch_reads_a_local_feed_file(tmp_path, monkeypatch):
     assert updates.release_to_info(updates.fetch_latest_release()).version == "0.11.0"
 
 
+# --- remembering the last found release ---------------------------------
+def test_release_round_trips_through_settings():
+    info = updates.release_to_info(LATEST_RELEASE_PAYLOAD)
+    assert updates.info_from_json(updates.info_to_json(info)) == info
+
+
+def test_remembered_release_is_one_scalar_string():
+    """The settings store is documented as scalars only, so this rides as one
+    opaque JSON string rather than a nested dict."""
+    text = updates.info_to_json(updates.release_to_info(LATEST_RELEASE_PAYLOAD))
+    assert isinstance(text, str)
+    assert json.loads(text)["version"] == "0.11.0"
+
+
+def test_a_release_with_no_installer_round_trips_too():
+    info = updates.UpdateInfo(version="1.0.0", page_url="https://example.com/v1")
+    assert updates.info_from_json(updates.info_to_json(info)) == info
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "not json",
+        "[]",
+        "42",
+        '{"version": "nightly"}',  # unparseable version
+        '{"page_url": "https://x"}',  # no version at all
+    ],
+)
+def test_unreadable_memory_is_simply_nothing_remembered(text):
+    """Degrades like every other setting — a hand-edited value must never raise
+    on the launch path."""
+    assert updates.info_from_json(text) is None
+
+
+def test_memory_missing_a_page_url_falls_back_to_the_releases_page():
+    info = updates.info_from_json('{"version": "1.2.3"}')
+    assert info.version == "1.2.3"
+    assert info.page_url == updates.RELEASES_PAGE_URL
+
+
 # --- which build is running ---------------------------------------------
 def test_install_kind_dev_when_not_frozen(monkeypatch):
     monkeypatch.delattr(sys, "frozen", raising=False)
