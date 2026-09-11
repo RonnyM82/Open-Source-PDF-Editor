@@ -7,6 +7,7 @@ its bboxes live in the same space as span bboxes).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +65,70 @@ def insert_image(
     page.insert_image(target, filename=str(path), rotate=page.rotation % 360)
 
 
+def _placements_with_xref(doc: pymupdf.Document, xref: int) -> list[tuple[int, dict]]:
+    """All displayed placements of one image object in the document."""
+    found: list[tuple[int, dict]] = []
+    for page_index in range(doc.page_count):
+        for info in doc[page_index].get_image_info(xrefs=True):
+            if int(info.get("xref", 0)) == xref:
+                found.append((page_index, info))
+    return found
+
+
+def _unique_target_placement(
+    doc: pymupdf.Document, page_index: int, target: ImageInfo
+) -> dict | None:
+    """Return the live placement when ``target`` is a unique image object.
+
+    Removing an image drawing command is precise, but changing a Form XObject
+    stream can affect every place that form is used.  Requiring one displayed
+    use in the whole document makes that rewrite safe.  A small tolerance is
+    intentional: UI geometry may have passed through a render/cache roundtrip.
+    """
+    if target.xref <= 0:
+        return None
+    placements = _placements_with_xref(doc, target.xref)
+    if len(placements) != 1 or placements[0][0] != page_index:
+        return None
+    info = placements[0][1]
+    if any(abs(a - b) > 0.05 for a, b in zip(info["bbox"], target.bbox, strict=True)):
+        return None
+    return info
+
+
+def _remove_unique_placement(doc: pymupdf.Document, page_index: int, target: ImageInfo) -> bool:
+    """Remove only ``target``'s ``Do`` operator; return whether it succeeded.
+
+    PyMuPDF redaction removes *all* images intersecting a rectangle.  That is
+    wrong for ordinary designs with a photo background and logos / QR codes on
+    top.  For a uniquely used image object, its resource name and containing
+    content stream let us delete precisely its drawing operator instead.
+    """
+    if _unique_target_placement(doc, page_index, target) is None:
+        return False
+
+    page = doc[page_index]
+    references = [row for row in page.get_images(full=True) if int(row[0]) == target.xref]
+    if not references:
+        return False
+
+    changed = False
+    for row in references:
+        resource_name = str(row[7]).encode("latin-1")
+        owner_xref = int(row[9])
+        stream_xrefs = [owner_xref] if owner_xref else list(page.get_contents())
+        # PDF names cannot contain raw whitespace.  Match only this resource's
+        # painting operator and leave its surrounding q/cm/Q transform intact.
+        operator = re.compile(rb"/" + re.escape(resource_name) + rb"[\x00\x09-\x0c\x20]+Do\b")
+        for stream_xref in stream_xrefs:
+            stream = doc.xref_stream(stream_xref)
+            rewritten, count = operator.subn(b"", stream)
+            if count:
+                doc.update_stream(stream_xref, rewritten)
+                changed = True
+    return changed
+
+
 def _remove_image(
     doc: pymupdf.Document,
     page_index: int,
@@ -87,13 +152,17 @@ def _remove_image(
     x0, y0, x1, y1 = target.bbox
     inset = min(0.5, (x1 - x0) / 4, (y1 - y0) / 4)
     redact_rect = pymupdf.Rect(x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+    comment_guard = comments_module.guard(doc, page_index, moved=moved)
+    link_guard = links_module.guard(doc, page_index, moved=moved)
+    if _remove_unique_placement(doc, page_index, target):
+        comment_guard.restore()
+        link_guard.restore()
+        return
     for other in images_on_page(doc, page_index):
         if other.bbox == target.bbox:
             continue
         if redact_rect.intersects(pymupdf.Rect(other.bbox)):
             raise ValueError(f"Another image overlaps this one — {verb} it would destroy both.")
-    comment_guard = comments_module.guard(doc, page_index, moved=moved)
-    link_guard = links_module.guard(doc, page_index, moved=moved)
     page.add_redact_annot(redact_rect)
     page.apply_redactions(
         images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
@@ -118,6 +187,11 @@ def replace_image(
     path = Path(image_path)
     if not path.is_file():
         raise ValueError(f"image file not found: {path}")
+    if _unique_target_placement(doc, page_index, target) is not None:
+        # Replacing the unique object in place preserves its transform and
+        # stacking order, even when other images overlap its rectangle.
+        doc[page_index].replace_image(target.xref, filename=str(path))
+        return
     _remove_image(doc, page_index, target, "replacing")
     page = doc[page_index]
     page.insert_image(pymupdf.Rect(target.bbox), filename=str(path), rotate=page.rotation % 360)

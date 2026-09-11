@@ -116,6 +116,35 @@ def test_replace_image_refuses_when_another_image_overlaps(sample_png, tmp_path)
         assert len(pdoc.images(0)) == 2  # nothing was destroyed
 
 
+def _unique_overlapping_images_pdf(tmp_path):
+    """Two overlapping placements backed by different image objects."""
+    src = tmp_path / "unique_overlap.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    background = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 30))
+    background.clear_with(180)
+    foreground = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 31, 31))
+    foreground.clear_with(30)
+    page.insert_image(pymupdf.Rect(100, 100, 300, 300), pixmap=background)
+    page.insert_image(pymupdf.Rect(220, 220, 280, 280), pixmap=foreground)
+    doc.save(str(src))
+    doc.close()
+    return src
+
+
+def test_replace_unique_image_allows_overlap_and_preserves_neighbour(sample_png, tmp_path):
+    src = _unique_overlapping_images_pdf(tmp_path)
+    with PdfDocument.open(src) as doc:
+        images = doc.images(0)
+        foreground = min(images, key=lambda i: i.bbox[2] - i.bbox[0])
+        background_xref = max(images, key=lambda i: i.bbox[2] - i.bbox[0]).xref
+        doc.replace_image(0, foreground, sample_png)
+        after = doc.images(0)
+
+    assert len(after) == 2
+    assert background_xref in {image.xref for image in after}
+
+
 # --- delete + move (E9.2) ----------------------------------------------------
 
 
@@ -395,6 +424,25 @@ def test_move_image_refuses_on_overlap(sample_png, tmp_path):
         with pytest.raises(ValueError, match="overlaps"):
             pdoc.move_image(0, target, (10.0, 10.0))
         assert len(pdoc.images(0)) == 2  # nothing destroyed
+
+
+def test_move_unique_image_allows_overlap_and_preserves_neighbour(tmp_path):
+    src = _unique_overlapping_images_pdf(tmp_path)
+    out = tmp_path / "unique_moved.pdf"
+    with PdfDocument.open(src) as doc:
+        images = doc.images(0)
+        foreground = min(images, key=lambda i: i.bbox[2] - i.bbox[0])
+        background_xref = max(images, key=lambda i: i.bbox[2] - i.bbox[0]).xref
+        doc.move_image(0, foreground, (100.0, 100.0))
+        doc.save(out)
+
+    after = _images(out)
+    assert len(after) == 2
+    assert background_xref in {int(image["xref"]) for image in after}
+    moved = next(image for image in after if int(image["xref"]) != background_xref)
+    assert moved["bbox"][0] == pytest.approx(foreground.bbox[0] + 100.0, abs=1.0)
+    # The old foreground area now reveals the still-intact background.
+    assert all(150 <= channel <= 210 for channel in _pixel(out, 250, 250))
 
 
 def test_insert_image_upright_on_rotated_page(tmp_path):
